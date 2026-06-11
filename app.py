@@ -51,7 +51,7 @@ VENV_PYTHON = _find_venv_python()
 # ── Orientation helpers ───────────────────────────────────────────────────────
 
 def _rotation_to_y_axis(v: np.ndarray) -> np.ndarray:
-    """3×3 rotation matrix that maps unit vector v to +Y = [0,1,0]."""
+    """3x3 rotation matrix that maps unit vector v to +Y = [0,1,0]."""
     v = v / np.linalg.norm(v)
     up = np.array([0.0, 1.0, 0.0])
     if np.allclose(v, up):
@@ -76,25 +76,87 @@ def _describe_axis(v: np.ndarray) -> str:
     return max(candidates, key=lambda kv: np.dot(v, kv[1]))[0]
 
 
-def _auto_orient(verts: np.ndarray) -> tuple[np.ndarray, str]:
+def _extract_image_up_signal(image_path: Path) -> tuple:
+    """Analyze the input image for a sky-up / ground-down visual gradient.
+
+    Compares mean luminance of the top third vs bottom third of the image.
+    For typical real-world photos the sky (top) is brighter than the ground
+    (bottom), giving a positive confidence score.
+
+    Returns (tier, confidence):
+      tier:       'strong' | 'weak' | 'none'
+      confidence: float in [-1, +1]
+                  positive  -> top of image is brighter (sky-like, up is up)
+                  negative  -> bottom is brighter (unusual / flipped shot)
+                  near zero -> ambiguous, no useful signal
+
+    Uses only PIL/numpy; no opencv required.
+    """
+    try:
+        with Image.open(image_path) as img:
+            # Composite transparent images onto neutral gray so transparent
+            # areas don't falsely drag luminance toward black.
+            if img.mode == "RGBA":
+                bg = Image.new("RGBA", img.size, (128, 128, 128, 255))
+                img = Image.alpha_composite(bg, img)
+            gray = img.convert("L").resize((64, 64), Image.LANCZOS)
+
+        arr = np.array(gray, dtype=float)
+        h = arr.shape[0]
+        top_mean = arr[: h // 3].mean()
+        bot_mean = arr[2 * h // 3 :].mean()
+        total = top_mean + bot_mean
+        if total < 1.0:
+            return "none", 0.0
+
+        # Normalized difference in [-1, +1]
+        confidence = (top_mean - bot_mean) / total
+
+        if abs(confidence) >= 0.08:
+            return "strong", float(confidence)
+        if abs(confidence) >= 0.03:
+            return "weak", float(confidence)
+        return "none", float(confidence)
+    except Exception:
+        return "none", 0.0
+
+
+def _auto_orient(verts: np.ndarray, image_path: Path = None) -> tuple:
     """Rotate verts so the natural 'up' axis aligns with +Y.
 
-    Scores each of the six ±principal-component candidates as:
-      score = planarity / xz_b²
+    Scores each of the six +/-principal-component candidates as:
+      score = planarity / xz_b^2
 
     where planarity = smallest singular value of the bottom-20% cluster
     (lower = flatter) and xz_b = XZ bounding-box area of that cluster
-    (larger = wider ground contact).  Squaring xz_b heavily rewards wide
-    ground contacts, correctly disambiguating e.g. wide roots (correct ↓)
-    from a compact spherical crown (wrong ↓) or a car undercarriage (flat
-    and wide) from a narrow bumper end.  Minimise the score.
+    (larger = wider ground contact).  Minimise the score.
+
+    Three-tier image-hint supplement (does not replace the geometry loop):
+      strong signal -> image may override geometry among candidates within 3x
+                       of the best geometry score
+      weak signal   -> image breaks near-ties (scores within 20% of best)
+      no signal     -> pure geometry scoring, identical to original behaviour
+
+    The image hint assumes InstantMesh outputs meshes with the input image's
+    vertical axis corresponding to the raw mesh's +Y axis.  A positive
+    confidence (top-of-image brighter) is taken as evidence that the raw
+    +Y direction is the correct "up".
+
+    Returns (rotated_verts, raw_up_axis_name, orient_tier_label).
     """
+    img_tier, img_conf = (
+        _extract_image_up_signal(image_path) if image_path is not None else ("none", 0.0)
+    )
+
     centered = verts - verts.mean(axis=0)
     _, _, Vt = np.linalg.svd(centered, full_matrices=False)
 
-    best_score = np.inf
-    best_R = np.eye(3)
-    best_pc = Vt[0]
+    best_score   = np.inf
+    best_R       = np.eye(3)
+    best_pc      = Vt[0]
+    second_score = np.inf
+    second_R     = np.eye(3)
+    second_pc    = Vt[0]
 
     for pc in Vt:
         for candidate in (pc, -pc):
@@ -117,21 +179,59 @@ def _auto_orient(verts: np.ndarray) -> tuple[np.ndarray, str]:
             score = planarity / (xz_b ** 2 + 1e-9)
 
             if score < best_score:
-                best_score = score
-                best_R = R
-                best_pc = candidate
+                second_score, second_R, second_pc = best_score, best_R, best_pc
+                best_score, best_R, best_pc = score, R, candidate
+            elif score < second_score:
+                second_score, second_R, second_pc = score, R, candidate
 
-    return verts @ best_R.T, _describe_axis(best_pc)
+    # ── Apply image hint ───────────────────────────────────────────────────────
+    # sign: +1 -> top of image brighter -> raw +Y should be "up"
+    #        -1 -> bottom of image brighter -> raw -Y should be "up" (unusual)
+    orient_tier = "geometry"
+
+    if img_tier == "strong":
+        # Image gives a confident sky-up signal.  Among candidates within 3x
+        # of the best geometry score, pick whichever aligns best with image up.
+        sign = 1.0 if img_conf > 0 else -1.0
+        cands = [(best_score, best_R, best_pc)]
+        if second_score <= best_score * 3.0:
+            cands.append((second_score, second_R, second_pc))
+        winner = max(
+            cands,
+            key=lambda x: float(np.dot(x[2], [0.0, 1.0, 0.0])) * sign,
+        )
+        best_R, best_pc = winner[1], winner[2]
+        orient_tier = "image-direct (conf={:+.2f})".format(img_conf)
+
+    elif img_tier == "weak" and second_score <= best_score * 1.2:
+        # Geometry is nearly tied; image breaks the deadlock.
+        sign = 1.0 if img_conf > 0 else -1.0
+        cands = [
+            (best_score, best_R, best_pc),
+            (second_score, second_R, second_pc),
+        ]
+        winner = max(
+            cands,
+            key=lambda x: float(np.dot(x[2], [0.0, 1.0, 0.0])) * sign,
+        )
+        best_R, best_pc = winner[1], winner[2]
+        orient_tier = "image-tiebreak (conf={:+.2f})".format(img_conf)
+
+    return verts @ best_R.T, _describe_axis(best_pc), orient_tier
 
 
 # ── Mesh normalization ────────────────────────────────────────────────────────
-def normalize_mesh(obj_path: Path) -> tuple[Path, dict]:
+def normalize_mesh(obj_path: Path, image_path: Path = None) -> tuple:
     """Normalize a raw InstantMesh OBJ to Minecraft block coordinates.
 
     Steps (applied in order):
-      1. Ground placement — 5th-percentile Y -> Y=0
+      1. Ground placement -- 5th-percentile Y -> Y=0
       2. Center on XZ bounding box
       3. Scale: 1 raw unit (metre) -> 1/0.9 block units  (1 block = 0.9 m)
+
+    image_path, if provided, is forwarded to _auto_orient so the vertical
+    brightness gradient in the original input photo can supplement the PCA
+    geometry scoring when geometry alone is ambiguous.
 
     Returns (norm_path, info_dict). The raw file is not modified.
     """
@@ -146,7 +246,7 @@ def normalize_mesh(obj_path: Path) -> tuple[Path, dict]:
     faces = np.asarray(mesh.faces, dtype=np.int32)
 
     # 0. Orient upright: rotate so the natural 'up' axis aligns with +Y
-    verts, raw_up = _auto_orient(verts)
+    verts, raw_up, orient_tier = _auto_orient(verts, image_path)
 
     # 1. Ground placement: translate so 5th-percentile Y becomes 0
     # (using 5th percentile rather than min to ignore stray artifact vertices)
@@ -161,7 +261,7 @@ def normalize_mesh(obj_path: Path) -> tuple[Path, dict]:
     verts *= 1.0 / 0.9
 
     norm_mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
-    norm_path = obj_path.parent / f"{obj_path.stem}_normalized.obj"
+    norm_path = obj_path.parent / "{}_normalized.obj".format(obj_path.stem)
     norm_mesh.export(str(norm_path))
 
     W = float(verts[:, 0].max() - verts[:, 0].min())
@@ -174,6 +274,7 @@ def normalize_mesh(obj_path: Path) -> tuple[Path, dict]:
         "y_floor_raw": y_floor,
         "W": W, "D": D, "H": H,
         "raw_up": raw_up,
+        "orient_tier": orient_tier,
     }
 
 
@@ -225,7 +326,7 @@ def show_diagnostic(norm_path: Path, info: dict):
     ax.plot([x_min, x_max], [0, 0], [2, 2],
             color="red", lw=1.5, label="Steve = 2 blocks")
 
-    # +Y (UP) arrow at origin — plotted in plot-Z direction since mesh Y → plt Z
+    # +Y (UP) arrow at origin -- plotted in plot-Z direction since mesh Y -> plt Z
     h_up = float(verts[:, 1].max()) * 0.25
     h_up = max(h_up, 0.5)
     ax.quiver(0, 0, 0, 0, 0, h_up,
@@ -253,11 +354,19 @@ def show_diagnostic(norm_path: Path, info: dict):
     ax.set_ylabel("Z")
     ax.set_zlabel("Y (height in blocks)")
     raw_up = info.get("raw_up", "?")
+    orient_tier = info.get("orient_tier", "geometry")
     ax.set_title(
-        f"{info['name']}  |  {info['face_count']:,} faces\n"
-        f"Bounds: {info['W']:.1f} × {info['D']:.1f} × {info['H']:.1f} blocks  "
-        f"|  Y-floor subtracted: {info['y_floor_raw']:.4f} m\n"
-        f"raw up: {raw_up} → corrected to +Y"
+        "{name}  |  {fc:,} faces\n"
+        "Bounds: {W:.1f} x {D:.1f} x {H:.1f} blocks  "
+        "|  Y-floor: {yf:.4f} m\n"
+        "raw up: {raw_up} -> corrected to +Y  |  orient: {tier}".format(
+            name=info["name"],
+            fc=info["face_count"],
+            W=info["W"], D=info["D"], H=info["H"],
+            yf=info["y_floor_raw"],
+            raw_up=raw_up,
+            tier=orient_tier,
+        )
     )
     ax.legend()
     plt.tight_layout()
@@ -291,7 +400,7 @@ class App:
             font=("Segoe UI", 14, "bold"),
         ).pack(pady=(18, 2))
         tk.Label(
-            ctrl, text="Image  →  3D Mesh",
+            ctrl, text="Image  ->  3D Mesh",
             bg="#161b22", fg="#8b949e",
             font=("Segoe UI", 9),
         ).pack(pady=(0, 14))
@@ -345,7 +454,7 @@ class App:
         # env info label
         tk.Label(
             ctrl,
-            text=f"Python: {Path(VENV_PYTHON).name}\n{VENV_PYTHON}",
+            text="Python: {}\n{}".format(Path(VENV_PYTHON).name, VENV_PYTHON),
             bg="#161b22", fg="#30363d",
             font=("Consolas", 7),
             wraplength=270,
@@ -353,7 +462,7 @@ class App:
         ).pack(side=tk.BOTTOM, pady=4, padx=8, anchor="w")
 
         # ── status bar ───────────────────────────────────────────────────────
-        self.status_var = tk.StringVar(value="Ready — select an image to begin")
+        self.status_var = tk.StringVar(value="Ready -- select an image to begin")
         tk.Label(
             self.root,
             textvariable=self.status_var,
@@ -377,7 +486,7 @@ class App:
         self.image_path = Path(path)
         self._show_preview(path)
         self.generate_btn.config(state=tk.NORMAL)
-        self._set_status(f"Image: {self.image_path.name}")
+        self._set_status("Image: {}".format(self.image_path.name))
 
     def _show_preview(self, path: str):
         img = Image.open(path).convert("RGBA")
@@ -403,16 +512,22 @@ class App:
             messagebox.showerror("File not found", str(self.image_path))
             return
         self.is_generating = True
-        self.generate_btn.config(state=tk.DISABLED, text="Generating…")
+        self.generate_btn.config(state=tk.DISABLED, text="Generating...")
         self.progress.start(12)
-        self._set_status("Launching InstantMesh…")
+        self._set_status("Launching InstantMesh...")
         threading.Thread(target=self._run_instantmesh, daemon=True).start()
 
     # ── InstantMesh pipeline ──────────────────────────────────────────────────
 
     def _run_instantmesh(self):
         try:
-            # Detect pre-existing alpha — skip rembg if image already has transparency
+            # Extract image up-signal from the original photo before InstantMesh
+            # consumes / background-removes it, so we always analyse the source image.
+            img_tier, img_conf = _extract_image_up_signal(self.image_path)
+            hint_msg = img_tier + (" (conf={:+.2f})".format(img_conf) if img_tier != "none" else "")
+            self._set_status("Image hint: {}".format(hint_msg))
+
+            # Detect pre-existing alpha -- skip rembg if image already has transparency
             img = Image.open(self.image_path)
             skip_rembg = img.mode == "RGBA" and np.array(img)[:, :, 3].min() < 255
 
@@ -432,7 +547,7 @@ class App:
             # Make sure InstantMesh's internal imports resolve correctly
             env["PYTHONPATH"] = str(INSTANTMESH_DIR)
 
-            self._set_status("Running InstantMesh — loading models (first run downloads weights)…")
+            self._set_status("Running InstantMesh -- loading models (first run downloads weights)...")
 
             proc = subprocess.Popen(
                 cmd,
@@ -452,27 +567,28 @@ class App:
                 # Route status messages to the status bar
                 ll = line.lower()
                 if "loading diffusion" in ll:
-                    self._set_status("Loading diffusion model…")
+                    self._set_status("Loading diffusion model...")
                 elif "loading custom" in ll or "unet" in ll:
-                    self._set_status("Loading custom UNet…")
+                    self._set_status("Loading custom UNet...")
                 elif "loading reconstruction" in ll:
-                    self._set_status("Loading reconstruction model…")
+                    self._set_status("Loading reconstruction model...")
                 elif "rembg" in ll or "background" in ll:
-                    self._set_status("Removing background…")
+                    self._set_status("Removing background...")
                 elif "imagin" in ll or "multiview" in ll or "novel view" in ll:
-                    self._set_status("Generating multi-view images…")
+                    self._set_status("Generating multi-view images...")
                 elif "reconstruct" in ll or "flexicubes" in ll:
-                    self._set_status("Reconstructing 3-D mesh…")
+                    self._set_status("Reconstructing 3-D mesh...")
                 elif "saving" in ll or "export" in ll:
-                    self._set_status("Saving mesh…")
+                    self._set_status("Saving mesh...")
 
             proc.wait()
 
             if proc.returncode != 0:
                 tail = "\n".join(log_lines[-30:])
                 raise RuntimeError(
-                    f"InstantMesh exited with code {proc.returncode}.\n\n"
-                    f"Last output:\n{tail}"
+                    "InstantMesh exited with code {}.\n\nLast output:\n{}".format(
+                        proc.returncode, tail
+                    )
                 )
 
             # Find the newest raw .obj in outputs/ (exclude _normalized.obj from previous runs)
@@ -489,8 +605,8 @@ class App:
                 )
 
             obj_path = obj_files[0]
-            self._set_status("Normalizing mesh…")
-            norm_path, norm_info = normalize_mesh(obj_path)
+            self._set_status("Normalizing mesh...")
+            norm_path, norm_info = normalize_mesh(obj_path, image_path=self.image_path)
             self.root.after(0, self._on_mesh_ready, str(obj_path), str(norm_path), norm_info)
 
         except Exception as exc:
@@ -502,14 +618,14 @@ class App:
         self._reset_controls()
         name, W, D, H = info["name"], info["W"], info["D"], info["H"]
         self._set_status(
-            f"Normalization complete — {name}_normalized.obj  |  "
-            f"{W:.1f} × {D:.1f} × {H:.1f} blocks"
+            "Normalization complete -- {}_normalized.obj  |  "
+            "{:.1f} x {:.1f} x {:.1f} blocks".format(name, W, D, H)
         )
         show_diagnostic(Path(norm_path), info)
 
     def _on_error(self, msg: str):
         self._reset_controls()
-        self._set_status(f"Error: {msg[:100]}")
+        self._set_status("Error: {}".format(msg[:100]))
         messagebox.showerror("Generation failed", msg)
 
     def _reset_controls(self):
