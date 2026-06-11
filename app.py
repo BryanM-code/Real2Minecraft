@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Real2Minecraft v2 — Photo to 3D Mesh
-Image in → InstantMesh → interactive 3D viewer
+Image in -> InstantMesh -> mesh normalization -> diagnostic view
 """
 
 import os
@@ -16,31 +16,10 @@ from tkinter import ttk, filedialog, messagebox
 import numpy as np
 from PIL import Image, ImageTk
 
-
-def _rotation_from_to(a: np.ndarray, b: np.ndarray) -> np.ndarray:
-    """Return a 3×3 rotation matrix that rotates unit vector a onto unit vector b."""
-    a = np.asarray(a, dtype=np.float64)
-    b = np.asarray(b, dtype=np.float64)
-    a /= np.linalg.norm(a)
-    b /= np.linalg.norm(b)
-    c = float(np.dot(a, b))
-    if c > 1.0 - 1e-8:
-        return np.eye(3, dtype=np.float32)
-    if c < -1.0 + 1e-8:
-        perp = np.array([1.0, 0.0, 0.0]) if abs(a[0]) < 0.9 else np.array([0.0, 1.0, 0.0])
-        axis = np.cross(a, perp)
-        axis /= np.linalg.norm(axis)
-        return (2.0 * np.outer(axis, axis) - np.eye(3)).astype(np.float32)
-    v = np.cross(a, b)
-    s = np.linalg.norm(v)
-    kmat = np.array([[0, -v[2], v[1]], [v[2], 0, -v[0]], [-v[1], v[0], 0]], dtype=np.float64)
-    return (np.eye(3) + kmat + kmat @ kmat * (1.0 - c) / (s * s)).astype(np.float32)
-
 import matplotlib
 matplotlib.use("TkAgg")
-from matplotlib.figure import Figure
-from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+import matplotlib.pyplot as plt
+
 import trimesh
 
 # ── Paths ─────────────────────────────────────────────────────────────────────
@@ -69,316 +48,220 @@ def _find_venv_python() -> str:
 VENV_PYTHON = _find_venv_python()
 
 
-# ── 3-D Mesh Viewer ───────────────────────────────────────────────────────────
-class MeshViewer(tk.Frame):
-    """Matplotlib-based interactive 3-D mesh viewer embedded in Tkinter."""
+# ── Orientation helpers ───────────────────────────────────────────────────────
 
-    MAX_FACES = 8_000  # decimate above this for smooth interaction
+def _rotation_to_y_axis(v: np.ndarray) -> np.ndarray:
+    """3×3 rotation matrix that maps unit vector v to +Y = [0,1,0]."""
+    v = v / np.linalg.norm(v)
+    up = np.array([0.0, 1.0, 0.0])
+    if np.allclose(v, up):
+        return np.eye(3)
+    if np.allclose(v, -up):
+        return np.diag([1.0, -1.0, -1.0])
+    axis = np.cross(v, up)
+    axis /= np.linalg.norm(axis)
+    angle = np.arccos(np.clip(np.dot(v, up), -1.0, 1.0))
+    K = np.array([[0, -axis[2], axis[1]],
+                  [axis[2], 0, -axis[0]],
+                  [-axis[1], axis[0], 0]])
+    return np.eye(3) + np.sin(angle) * K + (1 - np.cos(angle)) * (K @ K)
 
-    def __init__(self, parent, **kwargs):
-        super().__init__(parent, bg="#0d1117", **kwargs)
 
-        self.fig = Figure(figsize=(5.5, 5.5), dpi=96, facecolor="#0d1117")
-        self.ax = self.fig.add_subplot(111, projection="3d")
-        self.ax.set_facecolor("#0d1117")
-        self.fig.subplots_adjust(left=0, right=1, top=1, bottom=0)
+def _describe_axis(v: np.ndarray) -> str:
+    """Name of the closest cardinal axis to unit vector v (e.g. '+Z', '-X')."""
+    v = v / np.linalg.norm(v)
+    candidates = [('+X', [1,0,0]), ('-X', [-1,0,0]),
+                  ('+Y', [0,1,0]), ('-Y', [0,-1,0]),
+                  ('+Z', [0,0,1]), ('-Z', [0,0,-1])]
+    return max(candidates, key=lambda kv: np.dot(v, kv[1]))[0]
 
-        self.canvas = FigureCanvasTkAgg(self.fig, master=self)
-        self.canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
 
-        # Toolbar below the 3-D canvas
-        btn_bar = tk.Frame(self, bg="#161b22")
-        btn_bar.pack(side=tk.BOTTOM, fill=tk.X)
+def _auto_orient(verts: np.ndarray) -> tuple[np.ndarray, str]:
+    """Rotate verts so the natural 'up' axis aligns with +Y.
 
-        _btn_cfg = dict(
-            bg="#21262d", fg="#8b949e",
-            relief=tk.FLAT, bd=0, padx=8, pady=4,
-            font=("Segoe UI", 8), cursor="hand2",
-            activebackground="#30363d", activeforeground="white",
-            state=tk.DISABLED,
-        )
-        self._rot_btns: list[tk.Button] = []
-        for label, axis, deg in [
-            ("Flip ↕", 0, 180),
-            ("Turn ←", 2, 90), ("Turn →", 2, -90),
-            ("Tilt ↑", 0, 90),  ("Tilt ↓", 0, -90),
-        ]:
-            b = tk.Button(btn_bar, text=label,
-                          command=lambda a=axis, d=deg: self._rotate(a, d),
-                          **_btn_cfg)
-            b.pack(side=tk.LEFT, padx=2, pady=3)
-            self._rot_btns.append(b)
+    Scores each of the six ±principal-component candidates as:
+      score = planarity / xz_b²
 
-        reset_b = tk.Button(btn_bar, text="Reset orient.",
-                            command=self._reset_rot, **_btn_cfg)
-        reset_b.pack(side=tk.RIGHT, padx=6, pady=3)
-        self._rot_btns.append(reset_b)
+    where planarity = smallest singular value of the bottom-20% cluster
+    (lower = flatter) and xz_b = XZ bounding-box area of that cluster
+    (larger = wider ground contact).  Squaring xz_b heavily rewards wide
+    ground contacts, correctly disambiguating e.g. wide roots (correct ↓)
+    from a compact spherical crown (wrong ↓) or a car undercarriage (flat
+    and wide) from a narrow bumper end.  Minimise the score.
+    """
+    centered = verts - verts.mean(axis=0)
+    _, _, Vt = np.linalg.svd(centered, full_matrices=False)
 
-        # Stored mesh state (set by load_mesh, used by _do_render)
-        self._stored_verts: np.ndarray | None = None
-        self._stored_faces: np.ndarray | None = None
-        self._stored_vc: np.ndarray | None = None
-        self._manual_rot: np.ndarray = np.eye(3, dtype=np.float32)
+    best_score = np.inf
+    best_R = np.eye(3)
+    best_pc = Vt[0]
 
-        # Drag rotation state
-        self._drag_xy: tuple[int, int] | None = None
-        self._drag_base_elev: float = 30.0
-        self._drag_base_azim: float = -60.0
-        self._view_elev: float = 30.0
-        self._view_azim: float = -60.0
-        self.ax.view_init(elev=self._view_elev, azim=self._view_azim)
-        self.canvas.mpl_connect("button_press_event",   self._on_drag_press)
-        self.canvas.mpl_connect("motion_notify_event",  self._on_drag_move)
-        self.canvas.mpl_connect("button_release_event", self._on_drag_release)
+    for pc in Vt:
+        for candidate in (pc, -pc):
+            R = _rotation_to_y_axis(candidate)
+            rotated = verts @ R.T
 
-        self._placeholder()
+            bot_thresh = np.percentile(rotated[:, 1], 20)
+            bottom = rotated[rotated[:, 1] <= bot_thresh]
 
-    # ── public API ────────────────────────────────────────────────────────────
-
-    def show_placeholder(self):
-        self._stored_verts = None
-        for b in self._rot_btns:
-            b.config(state=tk.DISABLED)
-        self._placeholder()
-
-    def load_mesh(self, obj_path: str):
-        # force="mesh" merges all geometry and keeps vertex colours intact
-        mesh = trimesh.load(obj_path, force="mesh")
-        if isinstance(mesh, trimesh.Scene):
-            geoms = list(mesh.geometry.values())
-            if not geoms:
-                raise ValueError("OBJ contains no geometry")
-            mesh = trimesh.util.concatenate(geoms)
-
-        # Read vertex colours (ColorVisuals has .vertex_colors directly)
-        vc_raw = None
-        try:
-            raw = mesh.visual.vertex_colors
-            if raw is not None and len(raw) == len(mesh.vertices):
-                vc_raw = np.asarray(raw, dtype=np.uint8)[:, :3]
-        except Exception:
-            pass
-
-        # Rebuild mesh with colours attached so they survive decimation
-        mesh = trimesh.Trimesh(
-            vertices=np.asarray(mesh.vertices, dtype=np.float32),
-            faces=mesh.faces,
-            vertex_colors=vc_raw,
-            process=False,
-        )
-
-        if len(mesh.faces) > self.MAX_FACES:
-            saved_vc = None
-            try:
-                saved_vc = mesh.visual.vertex_colors
-            except Exception:
-                pass
-            orig_verts = np.asarray(mesh.vertices, dtype=np.float32)
-            try:
-                mesh = mesh.simplify_quadric_decimation(face_count=self.MAX_FACES)
-                # QEM drops colors; restore via nearest-original-vertex lookup
-                if saved_vc is not None:
-                    from scipy.spatial import cKDTree
-                    tree = cKDTree(orig_verts)
-                    _, idx = tree.query(np.asarray(mesh.vertices, dtype=np.float32), k=1)
-                    mesh = trimesh.Trimesh(
-                        vertices=mesh.vertices,
-                        faces=mesh.faces,
-                        vertex_colors=np.asarray(saved_vc, dtype=np.uint8)[idx],
-                        process=False,
-                    )
-            except Exception:
-                step = max(1, len(mesh.faces) // self.MAX_FACES)
-                mesh = trimesh.Trimesh(
-                    vertices=mesh.vertices,
-                    faces=mesh.faces[::step],
-                    vertex_colors=saved_vc,
-                    process=False,
-                )
-
-        # Re-read colours after potential decimation
-        vc = None
-        try:
-            raw = mesh.visual.vertex_colors
-            if raw is not None and len(raw) == len(mesh.vertices):
-                vc = np.asarray(raw, dtype=np.float32)[:, :3] / 255.0
-        except Exception:
-            pass
-
-        verts = np.asarray(mesh.vertices, dtype=np.float32)
-        faces = np.asarray(mesh.faces, dtype=np.int32)
-
-        # Auto-orient: SVD ground-plane fit → rotate so ground is at bottom (Z-up)
-        verts = self._auto_orient(verts)
-
-        self._manual_rot = np.eye(3, dtype=np.float32)
-        self._stored_verts = verts
-        self._stored_faces = faces
-        self._stored_vc = vc
-        for b in self._rot_btns:
-            b.config(state=tk.NORMAL)
-        self._do_render()
-
-    # ── private helpers ───────────────────────────────────────────────────────
-
-    @staticmethod
-    def _auto_orient(verts: np.ndarray) -> np.ndarray:
-        """Rotate mesh so the flattest face is the floor (Z-up).
-
-        Tries all 6 cardinal directions as "up" candidates, picks the one
-        whose bottom-25% cluster is most planar, then ensures the centroid
-        is in the upper half so the model isn't upside-down.
-        """
-        zup = np.array([0.0, 0.0, 1.0])
-        candidates = [
-            np.array([ 1., 0., 0.]), np.array([-1., 0., 0.]),
-            np.array([ 0., 1., 0.]), np.array([ 0.,-1., 0.]),
-            np.array([ 0., 0., 1.]), np.array([ 0., 0.,-1.]),
-        ]
-        best_rot = np.eye(3, dtype=np.float32)
-        best_score = np.inf
-        for up in candidates:
-            proj = verts @ up
-            p_range = float(proj.max() - proj.min())
-            if p_range < 1e-6:
+            if len(bottom) < 3:
                 continue
-            bottom = verts[proj <= proj.min() + 0.25 * p_range]
-            if len(bottom) < 4:
-                continue
-            c = bottom.mean(axis=0)
-            _, sv, _ = np.linalg.svd(bottom - c, full_matrices=False)
-            score = float(sv[-1])  # smallest singular value = most planar
+
+            c = bottom - bottom.mean(axis=0)
+            _, s, _ = np.linalg.svd(c, full_matrices=False)
+            planarity = float(s[-1])
+
+            xz_b = ((bottom[:, 0].max() - bottom[:, 0].min()) *
+                    (bottom[:, 2].max() - bottom[:, 2].min()))
+
+            score = planarity / (xz_b ** 2 + 1e-9)
+
             if score < best_score:
                 best_score = score
-                best_rot = _rotation_from_to(up, zup)
-        v2 = (verts @ best_rot.T).astype(np.float32)
-        # Flip upside-down: centroid should be above the Z midpoint
-        z2 = v2[:, 2]
-        if float(v2[:, 2].mean()) < (float(z2.min()) + float(z2.max())) / 2.0:
-            flip = np.array([[1,0,0],[0,-1,0],[0,0,-1]], dtype=np.float32)
-            v2 = (v2 @ flip.T).astype(np.float32)
-        return v2
+                best_R = R
+                best_pc = candidate
 
-    def _rotate(self, axis: int, deg: float):
-        """Accumulate a 90° rotation around the chosen axis and re-render."""
-        if self._stored_verts is None:
-            return
-        angle = np.radians(deg)
-        c, s = float(np.cos(angle)), float(np.sin(angle))
-        if axis == 0:
-            R = np.array([[1, 0, 0], [0, c, -s], [0, s, c]], dtype=np.float32)
-        elif axis == 1:
-            R = np.array([[c, 0, s], [0, 1, 0], [-s, 0, c]], dtype=np.float32)
-        else:
-            R = np.array([[c, -s, 0], [s, c, 0], [0, 0, 1]], dtype=np.float32)
-        self._manual_rot = R @ self._manual_rot
-        self._do_render()
+    return verts @ best_R.T, _describe_axis(best_pc)
 
-    def _reset_rot(self):
-        """Undo all manual rotation, keeping only the auto-orient result."""
-        self._manual_rot = np.eye(3, dtype=np.float32)
-        self._view_elev = 30.0
-        self._view_azim = -60.0
-        self._do_render()
 
-    # ── drag-to-rotate handlers ───────────────────────────────────────────────
+# ── Mesh normalization ────────────────────────────────────────────────────────
+def normalize_mesh(obj_path: Path) -> tuple[Path, dict]:
+    """Normalize a raw InstantMesh OBJ to Minecraft block coordinates.
 
-    def _on_drag_press(self, event):
-        if event.button != 1 or event.inaxes is not self.ax:
-            return
-        self._drag_xy = (event.x, event.y)
-        self._drag_base_elev = self._view_elev
-        self._drag_base_azim = self._view_azim
+    Steps (applied in order):
+      1. Ground placement — 5th-percentile Y -> Y=0
+      2. Center on XZ bounding box
+      3. Scale: 1 raw unit (metre) -> 1/0.9 block units  (1 block = 0.9 m)
 
-    def _on_drag_move(self, event):
-        if self._drag_xy is None or event.button != 1:
-            return
-        dx = event.x - self._drag_xy[0]
-        dy = event.y - self._drag_xy[1]
-        self._view_elev = float(np.clip(self._drag_base_elev - dy * 0.4, -90, 90))
-        self._view_azim = self._drag_base_azim - dx * 0.4
-        self.ax.view_init(elev=self._view_elev, azim=self._view_azim)
-        self.canvas.draw_idle()
+    Returns (norm_path, info_dict). The raw file is not modified.
+    """
+    mesh = trimesh.load(str(obj_path), force="mesh")
+    if isinstance(mesh, trimesh.Scene):
+        geoms = list(mesh.geometry.values())
+        if not geoms:
+            raise ValueError("OBJ contains no geometry")
+        mesh = trimesh.util.concatenate(geoms)
 
-    def _on_drag_release(self, event):
-        if self._drag_xy is None or event.button != 1:
-            return
-        self._drag_xy = None
-        # _view_elev / _view_azim already hold the final camera position from
-        # _on_drag_move — nothing to bake, no jerk.
+    verts = np.asarray(mesh.vertices, dtype=np.float64).copy()
+    faces = np.asarray(mesh.faces, dtype=np.int32)
 
-    def _do_render(self):
-        if self._stored_verts is None:
-            return
-        verts = (self._stored_verts @ self._manual_rot.T).astype(np.float32)
-        self._render(verts, self._stored_faces, self._stored_vc)
-        # ax.cla() inside _render resets the view angles; restore them.
-        self.ax.view_init(elev=self._view_elev, azim=self._view_azim)
-        self.canvas.draw_idle()
+    # 0. Orient upright: rotate so the natural 'up' axis aligns with +Y
+    verts, raw_up = _auto_orient(verts)
 
-    def _placeholder(self):
-        self.ax.cla()
-        self.ax.set_axis_off()
-        self.ax.text2D(
-            0.5, 0.5,
-            "No mesh loaded\n\nGenerate a 3-D model\nto view it here",
-            ha="center", va="center",
-            color="#4a5568", fontsize=11,
-            transform=self.ax.transAxes,
-        )
-        self.canvas.draw_idle()
+    # 1. Ground placement: translate so 5th-percentile Y becomes 0
+    # (using 5th percentile rather than min to ignore stray artifact vertices)
+    y_floor = float(np.percentile(verts[:, 1], 5))
+    verts[:, 1] -= y_floor
 
-    def _render(self, verts: np.ndarray, faces: np.ndarray, vc: np.ndarray | None = None):
-        tris = verts[faces]  # (F, 3, 3)
+    # 2. Center on XZ bounding box
+    verts[:, 0] -= (verts[:, 0].min() + verts[:, 0].max()) / 2.0
+    verts[:, 2] -= (verts[:, 2].min() + verts[:, 2].max()) / 2.0
 
-        # Phong diffuse — always computed so we can use it for shading
-        e1, e2 = tris[:, 1] - tris[:, 0], tris[:, 2] - tris[:, 0]
-        normals = np.cross(e1, e2)
-        lens = np.linalg.norm(normals, axis=1, keepdims=True)
-        lens[lens == 0] = 1.0
-        normals /= lens
+    # 3. Scale to Minecraft blocks (Steve = 2 blocks = 1.8 m => 1 block = 0.9 m)
+    verts *= 1.0 / 0.9
 
-        light = np.array([0.4, 0.6, 1.0], dtype=np.float32)
-        light /= np.linalg.norm(light)
-        diffuse = np.clip(normals @ light, 0.15, 1.0)  # (F,) — min 0.15 so dark faces stay visible
+    norm_mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+    norm_path = obj_path.parent / f"{obj_path.stem}_normalized.obj"
+    norm_mesh.export(str(norm_path))
 
-        if vc is not None and len(vc) == len(verts):
-            # Average vertex colours per face, then brighten and apply diffuse lighting
-            face_rgb = vc[faces].mean(axis=1)               # (F, 3)
-            # Normalise: stretch the colour range so the brightest face = 1.0
-            max_val = face_rgb.max()
-            if max_val > 0.01:
-                face_rgb = face_rgb / max_val               # normalise to full range
-            face_rgb = np.clip(face_rgb * diffuse[:, None] * 1.2, 0, 1)
-            face_colors = np.column_stack([face_rgb, np.ones(len(faces))])
-        else:
-            # Phong-only fallback (cool-blue tint)
-            r = diffuse * 0.35
-            g = diffuse * 0.55
-            b = diffuse * 0.80
-            face_colors = np.stack([r, g, b, np.ones_like(diffuse)], axis=1)
+    W = float(verts[:, 0].max() - verts[:, 0].min())
+    D = float(verts[:, 2].max() - verts[:, 2].min())
+    H = float(verts[:, 1].max() - verts[:, 1].min())
 
-        self.ax.cla()
-        self.ax.set_axis_off()
-        self.ax.set_facecolor("#0d1117")
+    return norm_path, {
+        "name": obj_path.stem,
+        "face_count": len(faces),
+        "y_floor_raw": y_floor,
+        "W": W, "D": D, "H": H,
+        "raw_up": raw_up,
+    }
 
-        poly = Poly3DCollection(tris, zsort="average")
-        poly.set_facecolor(face_colors)
-        poly.set_edgecolor("none")
-        self.ax.add_collection3d(poly)
 
-        # Centre and scale axes
-        centre = verts.mean(axis=0)
-        half = max(np.abs(verts - centre).max(), 1e-6)
-        self.ax.set_xlim(centre[0] - half, centre[0] + half)
-        self.ax.set_ylim(centre[1] - half, centre[1] + half)
-        self.ax.set_zlim(centre[2] - half, centre[2] + half)
+# ── Diagnostic window ─────────────────────────────────────────────────────────
+def show_diagnostic(norm_path: Path, info: dict):
+    """Open a standalone matplotlib window to verify the normalized mesh.
 
-        self.ax.set_title(
-            "Drag to rotate  •  Use buttons below to fix orientation",
-            color="#8b949e", fontsize=8, pad=4,
-        )
-        self.canvas.draw_idle()
+    Shows a 3D scatter of vertices on a 1-block XZ grid, with a Steve
+    reference line at Y=2 for scale. Blocking (plt.show()).
+    """
+    mesh = trimesh.load(str(norm_path), force="mesh")
+    if isinstance(mesh, trimesh.Scene):
+        geoms = list(mesh.geometry.values())
+        mesh = trimesh.util.concatenate(geoms)
+
+    verts = np.asarray(mesh.vertices, dtype=np.float32)
+
+    # Subsample for performance
+    if len(verts) > 5000:
+        idx = np.random.default_rng(0).choice(len(verts), 5000, replace=False)
+        pts = verts[idx]
+    else:
+        pts = verts
+
+    fig = plt.figure(figsize=(9, 7))
+    ax = fig.add_subplot(111, projection="3d")
+
+    # Axis mapping: mesh X -> plt X, mesh Z -> plt Y, mesh Y (height) -> plt Z
+    # This keeps height visually upward in the default matplotlib 3D view.
+    ax.scatter(pts[:, 0], pts[:, 2], pts[:, 1],
+               s=0.8, c=pts[:, 1], cmap="viridis", alpha=0.6)
+
+    # XZ grid at mesh Y=0 (plt Z=0), lines every 1 block
+    x_min = float(verts[:, 0].min())
+    x_max = float(verts[:, 0].max())
+    z_min = float(verts[:, 2].min())
+    z_max = float(verts[:, 2].max())
+    pad = 0.5
+    gx = np.arange(np.floor(x_min - pad), np.ceil(x_max + pad) + 1)
+    gz = np.arange(np.floor(z_min - pad), np.ceil(z_max + pad) + 1)
+    for xv in gx:
+        ax.plot([xv, xv], [gz[0], gz[-1]], [0, 0],
+                color="#888888", lw=0.5, alpha=0.4)
+    for zv in gz:
+        ax.plot([gx[0], gx[-1]], [zv, zv], [0, 0],
+                color="#888888", lw=0.5, alpha=0.4)
+
+    # Steve reference line at mesh Y=2 (plt Z=2)
+    ax.plot([x_min, x_max], [0, 0], [2, 2],
+            color="red", lw=1.5, label="Steve = 2 blocks")
+
+    # +Y (UP) arrow at origin — plotted in plot-Z direction since mesh Y → plt Z
+    h_up = float(verts[:, 1].max()) * 0.25
+    h_up = max(h_up, 0.5)
+    ax.quiver(0, 0, 0, 0, 0, h_up,
+              color="cyan", arrow_length_ratio=0.3, linewidth=1.5, label="+Y (UP)")
+
+    # Bounding box wireframe
+    bx0, bx1 = float(verts[:, 0].min()), float(verts[:, 0].max())
+    bz0, bz1 = float(verts[:, 2].min()), float(verts[:, 2].max())
+    by0, by1 = float(verts[:, 1].min()), float(verts[:, 1].max())
+    # corners in plot coords: (plot_x, plot_y, plot_z) = (mesh_x, mesh_z, mesh_y)
+    bbox_corners = np.array([
+        [bx0, bz0, by0], [bx1, bz0, by0], [bx0, bz1, by0], [bx1, bz1, by0],
+        [bx0, bz0, by1], [bx1, bz0, by1], [bx0, bz1, by1], [bx1, bz1, by1],
+    ])
+    bbox_edges = [(0,1),(2,3),(4,5),(6,7),
+                  (0,2),(1,3),(4,6),(5,7),
+                  (0,4),(1,5),(2,6),(3,7)]
+    for i, j in bbox_edges:
+        ax.plot([bbox_corners[i,0], bbox_corners[j,0]],
+                [bbox_corners[i,1], bbox_corners[j,1]],
+                [bbox_corners[i,2], bbox_corners[j,2]],
+                color="orange", lw=0.8, alpha=0.8)
+
+    ax.set_xlabel("X")
+    ax.set_ylabel("Z")
+    ax.set_zlabel("Y (height in blocks)")
+    raw_up = info.get("raw_up", "?")
+    ax.set_title(
+        f"{info['name']}  |  {info['face_count']:,} faces\n"
+        f"Bounds: {info['W']:.1f} × {info['D']:.1f} × {info['H']:.1f} blocks  "
+        f"|  Y-floor subtracted: {info['y_floor_raw']:.4f} m\n"
+        f"raw up: {raw_up} → corrected to +Y"
+    )
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
 
 
 # ── Main Application ──────────────────────────────────────────────────────────
@@ -387,8 +270,8 @@ class App:
         self.root = root
         self.root.title("Real2Minecraft v2")
         self.root.configure(bg="#0d1117")
-        self.root.geometry("1150x680")
-        self.root.minsize(900, 560)
+        self.root.geometry("500x480")
+        self.root.minsize(420, 400)
 
         self.image_path: Path | None = None
         self.is_generating = False
@@ -399,31 +282,23 @@ class App:
     # ── UI construction ───────────────────────────────────────────────────────
 
     def _build_ui(self):
-        # ── top-level split ──────────────────────────────────────────────────
-        paned = tk.PanedWindow(
-            self.root, orient=tk.HORIZONTAL,
-            bg="#0d1117", sashwidth=5, sashrelief=tk.FLAT,
-        )
-        paned.pack(fill=tk.BOTH, expand=True, padx=6, pady=(6, 0))
-
-        # ── left control panel ───────────────────────────────────────────────
-        left = tk.Frame(paned, bg="#161b22", width=300)
-        paned.add(left, minsize=260)
+        ctrl = tk.Frame(self.root, bg="#161b22")
+        ctrl.pack(fill=tk.BOTH, expand=True, padx=6, pady=(6, 0))
 
         tk.Label(
-            left, text="Real2Minecraft v2",
+            ctrl, text="Real2Minecraft v2",
             bg="#161b22", fg="#58a6ff",
             font=("Segoe UI", 14, "bold"),
         ).pack(pady=(18, 2))
         tk.Label(
-            left, text="Image  →  3D Mesh",
+            ctrl, text="Image  →  3D Mesh",
             bg="#161b22", fg="#8b949e",
             font=("Segoe UI", 9),
         ).pack(pady=(0, 14))
 
         # preview canvas
         self.preview_canvas = tk.Canvas(
-            left, width=260, height=260,
+            ctrl, width=260, height=260,
             bg="#0d1117", highlightthickness=1,
             highlightbackground="#30363d",
         )
@@ -434,7 +309,7 @@ class App:
             fill="#4a5568", font=("Segoe UI", 9),
         )
 
-        btn_frame = tk.Frame(left, bg="#161b22")
+        btn_frame = tk.Frame(ctrl, bg="#161b22")
         btn_frame.pack(fill=tk.X, padx=16, pady=6)
 
         self._btn_style = dict(
@@ -469,20 +344,13 @@ class App:
 
         # env info label
         tk.Label(
-            left,
+            ctrl,
             text=f"Python: {Path(VENV_PYTHON).name}\n{VENV_PYTHON}",
             bg="#161b22", fg="#30363d",
             font=("Consolas", 7),
             wraplength=270,
             justify=tk.LEFT,
         ).pack(side=tk.BOTTOM, pady=4, padx=8, anchor="w")
-
-        # ── right 3-D viewer ─────────────────────────────────────────────────
-        right = tk.Frame(paned, bg="#0d1117")
-        paned.add(right, minsize=500)
-
-        self.viewer = MeshViewer(right)
-        self.viewer.pack(fill=tk.BOTH, expand=True)
 
         # ── status bar ───────────────────────────────────────────────────────
         self.status_var = tk.StringVar(value="Ready — select an image to begin")
@@ -607,9 +475,10 @@ class App:
                     f"Last output:\n{tail}"
                 )
 
-            # Find the newest .obj in outputs/
+            # Find the newest raw .obj in outputs/ (exclude _normalized.obj from previous runs)
             obj_files = sorted(
-                OUTPUTS_DIR.rglob("*.obj"),
+                (p for p in OUTPUTS_DIR.rglob("*.obj")
+                 if not p.name.endswith("_normalized.obj")),
                 key=lambda p: p.stat().st_mtime,
                 reverse=True,
             )
@@ -620,28 +489,23 @@ class App:
                 )
 
             obj_path = obj_files[0]
-            self._set_status(f"Mesh ready — loading viewer…  ({obj_path.name})")
-            self.root.after(0, self._on_mesh_ready, str(obj_path))
+            self._set_status("Normalizing mesh…")
+            norm_path, norm_info = normalize_mesh(obj_path)
+            self.root.after(0, self._on_mesh_ready, str(obj_path), str(norm_path), norm_info)
 
         except Exception as exc:
             self.root.after(0, self._on_error, str(exc))
 
     # ── post-generation callbacks (must run on main thread) ───────────────────
 
-    def _on_mesh_ready(self, obj_path: str):
+    def _on_mesh_ready(self, raw_path: str, norm_path: str, info: dict):
         self._reset_controls()
-        self._set_status("Loading mesh into 3-D viewer…")
-        try:
-            self.viewer.load_mesh(obj_path)
-            self._set_status(
-                f"Done  ✓  Drag to rotate • Scroll to zoom   [{obj_path}]"
-            )
-        except Exception as exc:
-            self._set_status(f"Mesh generated but viewer error: {exc}")
-            messagebox.showwarning(
-                "Viewer error",
-                f"The mesh was generated at:\n{obj_path}\n\nBut the viewer raised:\n{exc}",
-            )
+        name, W, D, H = info["name"], info["W"], info["D"], info["H"]
+        self._set_status(
+            f"Normalization complete — {name}_normalized.obj  |  "
+            f"{W:.1f} × {D:.1f} × {H:.1f} blocks"
+        )
+        show_diagnostic(Path(norm_path), info)
 
     def _on_error(self, msg: str):
         self._reset_controls()
