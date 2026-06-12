@@ -31,6 +31,32 @@ OUTPUTS_DIR.mkdir(exist_ok=True)
 # Large config gives the best quality; use instant-mesh-base for faster runs.
 IM_CONFIG = INSTANTMESH_DIR / "configs" / "instant-mesh-large.yaml"
 
+# ── YOLO semantic lookup tables ────────────────────────────────────────────────
+YOLO_CONF_THRESHOLD = 0.6
+
+VERTICAL_CLASSES = {
+    "person", "bottle", "fire hydrant", "traffic light", "parking meter",
+    "clock", "potted plant",
+}
+
+HORIZONTAL_CLASSES = {
+    "car", "truck", "bus", "boat", "airplane", "bicycle", "motorcycle",
+    "bench", "couch", "dining table", "bed", "train",
+    "horse", "cow", "sheep", "dog", "cat", "elephant",
+}
+
+REAL_WORLD_HEIGHTS = {
+    "person": 1.8,  "car": 1.5,   "truck": 3.5,  "bus": 3.2,
+    "bicycle": 1.0, "motorcycle": 1.1, "airplane": 5.0, "boat": 2.5,
+    "bottle": 0.25, "fire hydrant": 0.6, "bench": 0.9,
+    "traffic light": 3.0, "potted plant": 0.5, "parking meter": 1.2,
+    "horse": 1.6,   "cow": 1.4,   "elephant": 3.3, "dog": 0.6, "cat": 0.3,
+    "couch": 0.9,   "dining table": 0.75, "bed": 0.6, "train": 3.8,
+    "skateboard": 0.15, "surfboard": 0.3, "sheep": 1.0, "clock": 0.3,
+}
+
+_yolo_model = None  # loaded once per session on first use
+
 # ── Resolve the Python interpreter to use for InstantMesh ─────────────────────
 def _find_venv_python() -> str:
     """Return the Python executable that has InstantMesh's dependencies."""
@@ -46,6 +72,35 @@ def _find_venv_python() -> str:
 
 
 VENV_PYTHON = _find_venv_python()
+
+
+# ── YOLO inference ────────────────────────────────────────────────────────────
+
+def _run_yolo(image_path: Path) -> tuple:
+    """Run YOLOv8n on image_path. Returns (label, confidence, bbox_xyxy) or ("", 0.0, None).
+
+    Picks the highest-confidence detection. Falls back silently if ultralytics
+    is not installed or inference fails. Downloads yolov8n.pt on first call.
+    """
+    global _yolo_model
+    try:
+        from ultralytics import YOLO as _YOLO
+    except ImportError:
+        return "", 0.0, None
+    try:
+        if _yolo_model is None:
+            _yolo_model = _YOLO("yolov8n.pt")
+        results = _yolo_model(str(image_path), verbose=False)
+        if not results or not results[0].boxes or len(results[0].boxes) == 0:
+            return "", 0.0, None
+        boxes = results[0].boxes
+        best  = int(boxes.conf.argmax())
+        label = results[0].names[int(boxes.cls[best])]
+        conf  = float(boxes.conf[best])
+        bbox  = boxes.xyxy[best].tolist()
+        return label, conf, bbox
+    except Exception:
+        return "", 0.0, None
 
 
 # ── Orientation helpers ───────────────────────────────────────────────────────
@@ -235,17 +290,18 @@ def _auto_orient(verts: np.ndarray, image_path: Path = None) -> tuple:
 
 
 # ── Mesh normalization ────────────────────────────────────────────────────────
-def normalize_mesh(obj_path: Path, image_path: Path = None) -> tuple:
+def normalize_mesh(obj_path: Path, image_path: Path = None, yolo_info: dict = None) -> tuple:
     """Normalize a raw InstantMesh OBJ to Minecraft block coordinates.
 
     Steps (applied in order):
+      0. Orient upright (YOLO direct rotation OR PCA + image-hint fallback)
       1. Ground placement -- min Y -> Y=0
       2. Center on XZ bounding box
-      3. Scale: 1 raw unit (metre) -> 1/0.9 block units  (1 block = 0.9 m)
+      3. Scale: YOLO real-world height OR default 1 raw unit = 1/0.9 blocks
 
-    image_path, if provided, is forwarded to _auto_orient so the vertical
-    brightness gradient in the original input photo can supplement the PCA
-    geometry scoring when geometry alone is ambiguous.
+    yolo_info, if provided, should contain keys: label, conf, orient_type,
+    real_height_m.  When conf >= YOLO_CONF_THRESHOLD and orient_type is set,
+    PCA is skipped and the known InstantMesh -Z-up rotation is applied directly.
 
     Returns (norm_path, info_dict). The raw file is not modified.
     """
@@ -259,8 +315,24 @@ def normalize_mesh(obj_path: Path, image_path: Path = None) -> tuple:
     verts = np.asarray(mesh.vertices, dtype=np.float64).copy()
     faces = np.asarray(mesh.faces, dtype=np.int32)
 
-    # 0. Orient upright: rotate so the natural 'up' axis aligns with +Y
-    verts, raw_up, orient_tier = _auto_orient(verts, image_path)
+    # 0. Orient upright
+    yolo_fired = (
+        yolo_info is not None
+        and yolo_info.get("conf", 0.0) >= YOLO_CONF_THRESHOLD
+        and yolo_info.get("orient_type") is not None
+    )
+
+    if yolo_fired:
+        # InstantMesh always outputs with -Z as up (save_obj negates Z).
+        # YOLO tells us what the object is, so we can apply this rotation directly.
+        R_yolo = _rotation_to_y_axis(np.array([0.0, 0.0, -1.0]))
+        verts = verts @ R_yolo.T
+        raw_up = "-Z"
+        orient_tier = "yolo-{} ({}, conf={:.2f})".format(
+            yolo_info["orient_type"], yolo_info["label"], yolo_info["conf"]
+        )
+    else:
+        verts, raw_up, orient_tier = _auto_orient(verts, image_path)
 
     # 1. Ground placement: translate so the lowest vertex sits at Y=0.
     # Using min ensures no geometry ends up underground.
@@ -271,8 +343,16 @@ def normalize_mesh(obj_path: Path, image_path: Path = None) -> tuple:
     verts[:, 0] -= (verts[:, 0].min() + verts[:, 0].max()) / 2.0
     verts[:, 2] -= (verts[:, 2].min() + verts[:, 2].max()) / 2.0
 
-    # 3. Scale to Minecraft blocks (Steve = 2 blocks = 1.8 m => 1 block = 0.9 m)
-    verts *= 1.0 / 0.9
+    # 3. Scale to Minecraft blocks (1 block = 0.9 m)
+    yolo_h = yolo_info.get("real_height_m") if yolo_fired else None
+    if yolo_h is not None:
+        raw_h = float(verts[:, 1].max() - verts[:, 1].min())
+        scale = yolo_h / (raw_h * 0.9) if raw_h > 1e-6 else 1.0 / 0.9
+        scale_source = "yolo"
+    else:
+        scale = 1.0 / 0.9
+        scale_source = "default"
+    verts *= scale
 
     norm_mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
     norm_path = obj_path.parent / "{}_normalized.obj".format(obj_path.stem)
@@ -289,6 +369,10 @@ def normalize_mesh(obj_path: Path, image_path: Path = None) -> tuple:
         "W": W, "D": D, "H": H,
         "raw_up": raw_up,
         "orient_tier": orient_tier,
+        "yolo_label":    yolo_info.get("label")         if yolo_info else None,
+        "yolo_conf":     yolo_info.get("conf")          if yolo_info else None,
+        "yolo_height_m": yolo_info.get("real_height_m") if yolo_info else None,
+        "scale_source":  scale_source,
     }
 
 
@@ -327,8 +411,19 @@ def show_diagnostic(norm_path: Path, info: dict):
     z_min = float(verts[:, 2].min())
     z_max = float(verts[:, 2].max())
     pad = 0.5
-    gx = np.arange(np.floor(x_min - pad), np.ceil(x_max + pad) + 1)
-    gz = np.arange(np.floor(z_min - pad), np.ceil(z_max + pad) + 1)
+    W_blk = x_max - x_min
+    D_blk = z_max - z_min
+    H_blk = float(verts[:, 1].max()) - float(verts[:, 1].min())
+    # Equal-cube display: all axes span the same range so object shape reads as
+    # how much of the cube it fills (car = flat slab, tower = tall column).
+    # Always reach at least Steve's height so the reference line stays visible.
+    view_size = max(W_blk, D_blk, H_blk, 2.2) * 1.08
+    cx = (x_min + x_max) / 2.0
+    cz = (z_min + z_max) / 2.0
+    max_dim = max(W_blk, D_blk, H_blk)
+    grid_step = 10.0 if max_dim > 50 else 5.0 if max_dim > 20 else 2.0 if max_dim > 5 else 1.0
+    gx = np.arange(np.floor(x_min - pad), np.ceil(x_max + pad) + grid_step, grid_step)
+    gz = np.arange(np.floor(z_min - pad), np.ceil(z_max + pad) + grid_step, grid_step)
     for xv in gx:
         ax.plot([xv, xv], [gz[0], gz[-1]], [0, 0],
                 color="#888888", lw=0.5, alpha=0.4)
@@ -364,22 +459,38 @@ def show_diagnostic(norm_path: Path, info: dict):
                 [bbox_corners[i,2], bbox_corners[j,2]],
                 color="orange", lw=0.8, alpha=0.8)
 
+    ax.set_xlim(cx - view_size / 2, cx + view_size / 2)
+    ax.set_ylim(cz - view_size / 2, cz + view_size / 2)
+    ax.set_zlim(0, view_size)
+
     ax.set_xlabel("X")
     ax.set_ylabel("Z")
     ax.set_zlabel("Y (height in blocks)")
     raw_up = info.get("raw_up", "?")
     orient_tier = info.get("orient_tier", "geometry")
+    yolo_label = info.get("yolo_label")
+    yolo_line = ""
+    if yolo_label:
+        scale_str = (
+            "{:.2f}m real-world".format(info["yolo_height_m"])
+            if info.get("yolo_height_m") else "default scale"
+        )
+        yolo_line = "\nYOLO: {} (conf={:.2f})  |  scale: {} ({})".format(
+            yolo_label, info["yolo_conf"], info.get("scale_source", "default"), scale_str
+        )
     ax.set_title(
         "{name}  |  {fc:,} faces\n"
         "Bounds: {W:.1f} x {D:.1f} x {H:.1f} blocks  "
         "|  Y-floor: {yf:.4f} m\n"
-        "raw up: {raw_up} -> corrected to +Y  |  orient: {tier}".format(
+        "raw up: {raw_up} -> +Y  |  orient: {tier}"
+        "{yolo_line}".format(
             name=info["name"],
             fc=info["face_count"],
             W=info["W"], D=info["D"], H=info["H"],
             yf=info["y_floor_raw"],
             raw_up=raw_up,
             tier=orient_tier,
+            yolo_line=yolo_line,
         )
     )
     ax.legend()
@@ -541,6 +652,35 @@ class App:
             hint_msg = img_tier + (" (conf={:+.2f})".format(img_conf) if img_tier != "none" else "")
             self._set_status("Image hint: {}".format(hint_msg))
 
+            # YOLO object detection on the original photo
+            self._set_status("Running YOLO object detection...")
+            yolo_label, yolo_conf, _ = _run_yolo(self.image_path)
+
+            orient_type   = None
+            real_height_m = None
+            if yolo_label:
+                if yolo_label in VERTICAL_CLASSES:
+                    orient_type = "vertical"
+                elif yolo_label in HORIZONTAL_CLASSES:
+                    orient_type = "horizontal"
+                real_height_m = REAL_WORLD_HEIGHTS.get(yolo_label)
+                height_str = "{:.2f}m".format(real_height_m) if real_height_m else "unknown height"
+                yolo_status = "YOLO: {} (conf={:.2f}) → {}, {}".format(
+                    yolo_label, yolo_conf,
+                    orient_type or "unrecognized class",
+                    height_str,
+                )
+            else:
+                yolo_status = "YOLO: no detection"
+            self._set_status(yolo_status)
+
+            yolo_info = {
+                "label":         yolo_label,
+                "conf":          yolo_conf,
+                "orient_type":   orient_type,
+                "real_height_m": real_height_m,
+            }
+
             # Detect pre-existing alpha -- skip rembg if image already has transparency
             img = Image.open(self.image_path)
             skip_rembg = img.mode == "RGBA" and np.array(img)[:, :, 3].min() < 255
@@ -620,7 +760,7 @@ class App:
 
             obj_path = obj_files[0]
             self._set_status("Normalizing mesh...")
-            norm_path, norm_info = normalize_mesh(obj_path, image_path=self.image_path)
+            norm_path, norm_info = normalize_mesh(obj_path, image_path=self.image_path, yolo_info=yolo_info)
             self.root.after(0, self._on_mesh_ready, str(obj_path), str(norm_path), norm_info)
 
         except Exception as exc:
