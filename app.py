@@ -138,9 +138,12 @@ def _auto_orient(verts: np.ndarray, image_path: Path = None) -> tuple:
       no signal     -> pure geometry scoring, identical to original behaviour
 
     The image hint assumes InstantMesh outputs meshes with the input image's
-    vertical axis corresponding to the raw mesh's +Y axis.  A positive
-    confidence (top-of-image brighter) is taken as evidence that the raw
-    +Y direction is the correct "up".
+    vertical axis corresponding to the raw mesh's -Z axis.  Internally
+    InstantMesh uses Z+ as world up (camera_util.py: up_world=[0,0,1]), but
+    save_obj in mesh_util.py negates Z on export, so the saved OBJ has -Z as
+    the object's up direction.
+    A positive confidence (top-of-image brighter) is taken as evidence that
+    the raw -Z direction is the correct "up".
 
     Returns (rotated_verts, raw_up_axis_name, orient_tier_label).
     """
@@ -157,6 +160,7 @@ def _auto_orient(verts: np.ndarray, image_path: Path = None) -> tuple:
     second_score = np.inf
     second_R     = np.eye(3)
     second_pc    = Vt[0]
+    all_cands    = []
 
     for pc in Vt:
         for candidate in (pc, -pc):
@@ -176,7 +180,19 @@ def _auto_orient(verts: np.ndarray, image_path: Path = None) -> tuple:
             xz_b = ((bottom[:, 0].max() - bottom[:, 0].min()) *
                     (bottom[:, 2].max() - bottom[:, 2].min()))
 
-            score = planarity / (xz_b ** 2 + 1e-9)
+            # Reward orientations where the mesh is taller than it is wide.
+            # For a tower lying on its side h_after << max(w,d), so bonus = 1
+            # (no effect). For a tower standing upright h_after >> max(w,d),
+            # bonus is large and the score shrinks, making upright strongly
+            # preferred. Flat/wide objects also get bonus = 1 (h < max(w,d)).
+            h_after = rotated[:, 1].max() - rotated[:, 1].min()
+            w_after = rotated[:, 0].max() - rotated[:, 0].min()
+            d_after = rotated[:, 2].max() - rotated[:, 2].min()
+            aspect_bonus = max(1.0, h_after / (max(w_after, d_after) + 1e-9)) ** 2
+
+            score = planarity / ((xz_b ** 2 + 1e-9) * aspect_bonus)
+
+            all_cands.append((score, R, candidate))
 
             if score < best_score:
                 second_score, second_R, second_pc = best_score, best_R, best_pc
@@ -185,20 +201,18 @@ def _auto_orient(verts: np.ndarray, image_path: Path = None) -> tuple:
                 second_score, second_R, second_pc = score, R, candidate
 
     # ── Apply image hint ───────────────────────────────────────────────────────
-    # sign: +1 -> top of image brighter -> raw +Y should be "up"
-    #        -1 -> bottom of image brighter -> raw -Y should be "up" (unusual)
+    # sign: +1 -> top of image brighter -> raw -Z should be "up" (save_obj negates Z)
+    #        -1 -> bottom of image brighter -> raw +Z should be "up" (unusual)
     orient_tier = "geometry"
 
     if img_tier == "strong":
-        # Image gives a confident sky-up signal.  Among candidates within 3x
-        # of the best geometry score, pick whichever aligns best with image up.
+        # Image gives a confident sky-up signal.  Consider ALL six geometry
+        # candidates so the correct orientation is never excluded by a score
+        # window (geometry can be 100-500x wrong for thin upright objects).
         sign = 1.0 if img_conf > 0 else -1.0
-        cands = [(best_score, best_R, best_pc)]
-        if second_score <= best_score * 3.0:
-            cands.append((second_score, second_R, second_pc))
         winner = max(
-            cands,
-            key=lambda x: float(np.dot(x[2], [0.0, 1.0, 0.0])) * sign,
+            all_cands,
+            key=lambda x: float(np.dot(x[2], [0.0, 0.0, -1.0])) * sign,
         )
         best_R, best_pc = winner[1], winner[2]
         orient_tier = "image-direct (conf={:+.2f})".format(img_conf)
@@ -212,7 +226,7 @@ def _auto_orient(verts: np.ndarray, image_path: Path = None) -> tuple:
         ]
         winner = max(
             cands,
-            key=lambda x: float(np.dot(x[2], [0.0, 1.0, 0.0])) * sign,
+            key=lambda x: float(np.dot(x[2], [0.0, 0.0, -1.0])) * sign,
         )
         best_R, best_pc = winner[1], winner[2]
         orient_tier = "image-tiebreak (conf={:+.2f})".format(img_conf)
@@ -225,7 +239,7 @@ def normalize_mesh(obj_path: Path, image_path: Path = None) -> tuple:
     """Normalize a raw InstantMesh OBJ to Minecraft block coordinates.
 
     Steps (applied in order):
-      1. Ground placement -- 5th-percentile Y -> Y=0
+      1. Ground placement -- min Y -> Y=0
       2. Center on XZ bounding box
       3. Scale: 1 raw unit (metre) -> 1/0.9 block units  (1 block = 0.9 m)
 
@@ -248,9 +262,9 @@ def normalize_mesh(obj_path: Path, image_path: Path = None) -> tuple:
     # 0. Orient upright: rotate so the natural 'up' axis aligns with +Y
     verts, raw_up, orient_tier = _auto_orient(verts, image_path)
 
-    # 1. Ground placement: translate so 5th-percentile Y becomes 0
-    # (using 5th percentile rather than min to ignore stray artifact vertices)
-    y_floor = float(np.percentile(verts[:, 1], 5))
+    # 1. Ground placement: translate so the lowest vertex sits at Y=0.
+    # Using min ensures no geometry ends up underground.
+    y_floor = float(verts[:, 1].min())
     verts[:, 1] -= y_floor
 
     # 2. Center on XZ bounding box
