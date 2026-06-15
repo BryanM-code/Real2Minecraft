@@ -6,6 +6,7 @@ Image in -> InstantMesh -> mesh normalization -> diagnostic view
 
 import os
 import sys
+import time
 import threading
 import subprocess
 from pathlib import Path
@@ -31,31 +32,15 @@ OUTPUTS_DIR.mkdir(exist_ok=True)
 # Large config gives the best quality; use instant-mesh-base for faster runs.
 IM_CONFIG = INSTANTMESH_DIR / "configs" / "instant-mesh-large.yaml"
 
-# ── YOLO semantic lookup tables ────────────────────────────────────────────────
-YOLO_CONF_THRESHOLD = 0.6
+OLLAMA_URL = "http://localhost:11434"
 
-VERTICAL_CLASSES = {
-    "person", "bottle", "fire hydrant", "traffic light", "parking meter",
-    "clock", "potted plant",
-}
+# Voxel grid resolution: fit the longest axis to this many voxels for a
+# detailed, MagicaVoxel-like result (decoupled from real-world metres).
+VOXEL_TARGET_RES = 64
 
-HORIZONTAL_CLASSES = {
-    "car", "truck", "bus", "boat", "airplane", "bicycle", "motorcycle",
-    "bench", "couch", "dining table", "bed", "train",
-    "horse", "cow", "sheep", "dog", "cat", "elephant",
-}
-
-REAL_WORLD_HEIGHTS = {
-    "person": 1.8,  "car": 1.5,   "truck": 3.5,  "bus": 3.2,
-    "bicycle": 1.0, "motorcycle": 1.1, "airplane": 5.0, "boat": 2.5,
-    "bottle": 0.25, "fire hydrant": 0.6, "bench": 0.9,
-    "traffic light": 3.0, "potted plant": 0.5, "parking meter": 1.2,
-    "horse": 1.6,   "cow": 1.4,   "elephant": 3.3, "dog": 0.6, "cat": 0.3,
-    "couch": 0.9,   "dining table": 0.75, "bed": 0.6, "train": 3.8,
-    "skateboard": 0.15, "surfboard": 0.3, "sheep": 1.0, "clock": 0.3,
-}
-
-_yolo_model = None  # loaded once per session on first use
+# Minecraft scale: one block represents one cubic metre of the real object.
+# Used only for the LLaVA height -> block-count status display.
+METERS_PER_BLOCK = 1.0
 
 # ── Resolve the Python interpreter to use for InstantMesh ─────────────────────
 def _find_venv_python() -> str:
@@ -74,33 +59,74 @@ def _find_venv_python() -> str:
 VENV_PYTHON = _find_venv_python()
 
 
-# ── YOLO inference ────────────────────────────────────────────────────────────
+# ── LLaVA via Ollama ──────────────────────────────────────────────────────────
 
-def _run_yolo(image_path: Path) -> tuple:
-    """Run YOLOv8n on image_path. Returns (label, confidence, bbox_xyxy) or ("", 0.0, None).
+def _run_llava(image_path: Path) -> dict | None:
+    """Query LLaVA via Ollama for object label, orientation, and real-world height.
 
-    Picks the highest-confidence detection. Falls back silently if ultralytics
-    is not installed or inference fails. Downloads yolov8n.pt on first call.
+    Returns dict with keys: object (str), orientation ('vertical'|'horizontal'|None),
+    height_metres (float|None).  Returns None on any failure so callers fall back
+    to geometry-only mode.
     """
-    global _yolo_model
+    import base64
+    import json
     try:
-        from ultralytics import YOLO as _YOLO
+        import requests
     except ImportError:
-        return "", 0.0, None
+        return None
     try:
-        if _yolo_model is None:
-            _yolo_model = _YOLO("yolov8n.pt")
-        results = _yolo_model(str(image_path), verbose=False)
-        if not results or not results[0].boxes or len(results[0].boxes) == 0:
-            return "", 0.0, None
-        boxes = results[0].boxes
-        best  = int(boxes.conf.argmax())
-        label = results[0].names[int(boxes.cls[best])]
-        conf  = float(boxes.conf[best])
-        bbox  = boxes.xyxy[best].tolist()
-        return label, conf, bbox
+        with open(image_path, "rb") as f:
+            img_b64 = base64.b64encode(f.read()).decode()
     except Exception:
-        return "", 0.0, None
+        return None
+
+    prompt = (
+        "What is the main object in this image? "
+        "Reply ONLY with a JSON object (no markdown, no extra text) with these fields:\n"
+        '"object": short label (e.g. "castle tower", "car", "oak tree")\n'
+        '"orientation": "vertical" if the object stands upright and is taller than wide, '
+        'or "horizontal" if it is wider or longer than it is tall\n'
+        '"height_metres": your best estimate of the real-world height of this object '
+        "in metres as a plain number (e.g. 1.8 for a person, 15 for a building)"
+    )
+
+    try:
+        resp = requests.post(
+            OLLAMA_URL + "/api/generate",
+            json={
+                "model": "llava",
+                "prompt": prompt,
+                "images": [img_b64],
+                "stream": False,
+                "options": {"temperature": 0.1},
+            },
+            timeout=60,
+        )
+        resp.raise_for_status()
+        raw = resp.json().get("response", "")
+        text = raw.strip()
+        if "```" in text:
+            parts = text.split("```")
+            text = parts[1] if len(parts) > 1 else text
+            if text.startswith("json"):
+                text = text[4:]
+        start = text.find("{")
+        end   = text.rfind("}") + 1
+        if start < 0 or end <= start:
+            return None
+        data = json.loads(text[start:end])
+        orient = str(data.get("orientation", "")).strip().lower()
+        result = {
+            "object":        str(data.get("object", "")).strip(),
+            "orientation":   orient if orient in ("vertical", "horizontal") else None,
+            "height_metres": None,
+        }
+        h = data.get("height_metres")
+        if h is not None:
+            result["height_metres"] = float(h)
+        return result
+    except Exception:
+        return None
 
 
 # ── Orientation helpers ───────────────────────────────────────────────────────
@@ -131,52 +157,8 @@ def _describe_axis(v: np.ndarray) -> str:
     return max(candidates, key=lambda kv: np.dot(v, kv[1]))[0]
 
 
-def _extract_image_up_signal(image_path: Path) -> tuple:
-    """Analyze the input image for a sky-up / ground-down visual gradient.
 
-    Compares mean luminance of the top third vs bottom third of the image.
-    For typical real-world photos the sky (top) is brighter than the ground
-    (bottom), giving a positive confidence score.
-
-    Returns (tier, confidence):
-      tier:       'strong' | 'weak' | 'none'
-      confidence: float in [-1, +1]
-                  positive  -> top of image is brighter (sky-like, up is up)
-                  negative  -> bottom is brighter (unusual / flipped shot)
-                  near zero -> ambiguous, no useful signal
-
-    Uses only PIL/numpy; no opencv required.
-    """
-    try:
-        with Image.open(image_path) as img:
-            # Composite transparent images onto neutral gray so transparent
-            # areas don't falsely drag luminance toward black.
-            if img.mode == "RGBA":
-                bg = Image.new("RGBA", img.size, (128, 128, 128, 255))
-                img = Image.alpha_composite(bg, img)
-            gray = img.convert("L").resize((64, 64), Image.LANCZOS)
-
-        arr = np.array(gray, dtype=float)
-        h = arr.shape[0]
-        top_mean = arr[: h // 3].mean()
-        bot_mean = arr[2 * h // 3 :].mean()
-        total = top_mean + bot_mean
-        if total < 1.0:
-            return "none", 0.0
-
-        # Normalized difference in [-1, +1]
-        confidence = (top_mean - bot_mean) / total
-
-        if abs(confidence) >= 0.08:
-            return "strong", float(confidence)
-        if abs(confidence) >= 0.03:
-            return "weak", float(confidence)
-        return "none", float(confidence)
-    except Exception:
-        return "none", 0.0
-
-
-def _auto_orient(verts: np.ndarray, image_path: Path = None) -> tuple:
+def _auto_orient(verts: np.ndarray, llava_hint: dict = None) -> tuple:
     """Rotate verts so the natural 'up' axis aligns with +Y.
 
     Scores each of the six +/-principal-component candidates as:
@@ -186,25 +168,19 @@ def _auto_orient(verts: np.ndarray, image_path: Path = None) -> tuple:
     (lower = flatter) and xz_b = XZ bounding-box area of that cluster
     (larger = wider ground contact).  Minimise the score.
 
-    Three-tier image-hint supplement (does not replace the geometry loop):
-      strong signal -> image may override geometry among candidates within 3x
-                       of the best geometry score
-      weak signal   -> image breaks near-ties (scores within 20% of best)
-      no signal     -> pure geometry scoring, identical to original behaviour
-
-    The image hint assumes InstantMesh outputs meshes with the input image's
-    vertical axis corresponding to the raw mesh's -Z axis.  Internally
-    InstantMesh uses Z+ as world up (camera_util.py: up_world=[0,0,1]), but
-    save_obj in mesh_util.py negates Z on export, so the saved OBJ has -Z as
-    the object's up direction.
-    A positive confidence (top-of-image brighter) is taken as evidence that
-    the raw -Z direction is the correct "up".
+    LLaVA hint supplement (does not replace the geometry loop):
+      'vertical' or 'horizontal' -> selects the candidate most aligned with -Z,
+        because InstantMesh save_obj negates Z so the OBJ's up is always -Z.
+      None / absent              -> pure geometry scoring.
 
     Returns (rotated_verts, raw_up_axis_name, orient_tier_label).
     """
-    img_tier, img_conf = (
-        _extract_image_up_signal(image_path) if image_path is not None else ("none", 0.0)
-    )
+    # Both "vertical" and "horizontal" map to sign=+1 (select the -Z-up candidate).
+    # InstantMesh save_obj negates Z, so -Z is always the object's up in the OBJ.
+    if llava_hint and llava_hint.get("orientation") in ("vertical", "horizontal"):
+        img_tier, img_conf = "strong", 1.0
+    else:
+        img_tier, img_conf = "none", 0.0
 
     centered = verts - verts.mean(axis=0)
     _, _, Vt = np.linalg.svd(centered, full_matrices=False)
@@ -270,7 +246,10 @@ def _auto_orient(verts: np.ndarray, image_path: Path = None) -> tuple:
             key=lambda x: float(np.dot(x[2], [0.0, 0.0, -1.0])) * sign,
         )
         best_R, best_pc = winner[1], winner[2]
-        orient_tier = "image-direct (conf={:+.2f})".format(img_conf)
+        orient_tier = "llava-{} ({})".format(
+            llava_hint.get("orientation", "?") if llava_hint else "?",
+            llava_hint.get("object", "?")      if llava_hint else "?",
+        )
 
     elif img_tier == "weak" and second_score <= best_score * 1.2:
         # Geometry is nearly tied; image breaks the deadlock.
@@ -284,24 +263,23 @@ def _auto_orient(verts: np.ndarray, image_path: Path = None) -> tuple:
             key=lambda x: float(np.dot(x[2], [0.0, 0.0, -1.0])) * sign,
         )
         best_R, best_pc = winner[1], winner[2]
-        orient_tier = "image-tiebreak (conf={:+.2f})".format(img_conf)
+        orient_tier = "geometry-tiebreak"
 
     return verts @ best_R.T, _describe_axis(best_pc), orient_tier
 
 
 # ── Mesh normalization ────────────────────────────────────────────────────────
-def normalize_mesh(obj_path: Path, image_path: Path = None, yolo_info: dict = None) -> tuple:
+def normalize_mesh(obj_path: Path, llava_info: dict = None) -> tuple:
     """Normalize a raw InstantMesh OBJ to Minecraft block coordinates.
 
     Steps (applied in order):
-      0. Orient upright (YOLO direct rotation OR PCA + image-hint fallback)
+      0. Orient upright via PCA (LLaVA hint guides candidate selection)
       1. Ground placement -- min Y -> Y=0
       2. Center on XZ bounding box
-      3. Scale: YOLO real-world height OR default 1 raw unit = 1/0.9 blocks
+      3. Scale: LLaVA real-world height (1 block = 1 m) OR default 1 raw unit = 1 block
 
-    yolo_info, if provided, should contain keys: label, conf, orient_type,
-    real_height_m.  When conf >= YOLO_CONF_THRESHOLD and orient_type is set,
-    PCA is skipped and the known InstantMesh -Z-up rotation is applied directly.
+    llava_info, if provided, should contain keys: object, orientation,
+    height_metres.
 
     Returns (norm_path, info_dict). The raw file is not modified.
     """
@@ -315,24 +293,18 @@ def normalize_mesh(obj_path: Path, image_path: Path = None, yolo_info: dict = No
     verts = np.asarray(mesh.vertices, dtype=np.float64).copy()
     faces = np.asarray(mesh.faces, dtype=np.int32)
 
-    # 0. Orient upright
-    yolo_fired = (
-        yolo_info is not None
-        and yolo_info.get("conf", 0.0) >= YOLO_CONF_THRESHOLD
-        and yolo_info.get("orient_type") is not None
-    )
+    # Preserve per-vertex colors (raw InstantMesh OBJs carry `v x y z r g b`) so the
+    # voxelizer can color blocks by the real object.  Captured before any processing
+    # so it stays aligned 1:1 with `verts`.
+    try:
+        vcolors = np.asarray(mesh.visual.vertex_colors, dtype=np.uint8).copy()
+        if len(vcolors) != len(verts):
+            vcolors = None
+    except Exception:
+        vcolors = None
 
-    if yolo_fired:
-        # InstantMesh always outputs with -Z as up (save_obj negates Z).
-        # YOLO tells us what the object is, so we can apply this rotation directly.
-        R_yolo = _rotation_to_y_axis(np.array([0.0, 0.0, -1.0]))
-        verts = verts @ R_yolo.T
-        raw_up = "-Z"
-        orient_tier = "yolo-{} ({}, conf={:.2f})".format(
-            yolo_info["orient_type"], yolo_info["label"], yolo_info["conf"]
-        )
-    else:
-        verts, raw_up, orient_tier = _auto_orient(verts, image_path)
+    # 0. Orient upright — PCA always runs; LLaVA hint guides candidate selection.
+    verts, raw_up, orient_tier = _auto_orient(verts, llava_hint=llava_info)
 
     # 1. Ground placement: translate so the lowest vertex sits at Y=0.
     # Using min ensures no geometry ends up underground.
@@ -343,18 +315,21 @@ def normalize_mesh(obj_path: Path, image_path: Path = None, yolo_info: dict = No
     verts[:, 0] -= (verts[:, 0].min() + verts[:, 0].max()) / 2.0
     verts[:, 2] -= (verts[:, 2].min() + verts[:, 2].max()) / 2.0
 
-    # 3. Scale to Minecraft blocks (1 block = 0.9 m)
-    yolo_h = yolo_info.get("real_height_m") if yolo_fired else None
-    if yolo_h is not None:
+    # 3. Scale to Minecraft blocks (1 block = METERS_PER_BLOCK metres)
+    llava_h = llava_info.get("height_metres") if llava_info else None
+    if llava_h is not None:
         raw_h = float(verts[:, 1].max() - verts[:, 1].min())
-        scale = yolo_h / (raw_h * 0.9) if raw_h > 1e-6 else 1.0 / 0.9
-        scale_source = "yolo"
+        # Make the normalized height equal the real-world metres, then 1 block = 1 m.
+        scale = (llava_h / METERS_PER_BLOCK) / raw_h if raw_h > 1e-6 else 1.0
+        scale_source = "llava"
     else:
-        scale = 1.0 / 0.9
+        scale = 1.0
         scale_source = "default"
     verts *= scale
 
-    norm_mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+    norm_mesh = trimesh.Trimesh(
+        vertices=verts, faces=faces, vertex_colors=vcolors, process=False
+    )
     norm_path = obj_path.parent / "{}_normalized.obj".format(obj_path.stem)
     norm_mesh.export(str(norm_path))
 
@@ -369,133 +344,280 @@ def normalize_mesh(obj_path: Path, image_path: Path = None, yolo_info: dict = No
         "W": W, "D": D, "H": H,
         "raw_up": raw_up,
         "orient_tier": orient_tier,
-        "yolo_label":    yolo_info.get("label")         if yolo_info else None,
-        "yolo_conf":     yolo_info.get("conf")          if yolo_info else None,
-        "yolo_height_m": yolo_info.get("real_height_m") if yolo_info else None,
-        "scale_source":  scale_source,
+        "llava_object":      llava_info.get("object")        if llava_info else None,
+        "llava_orientation": llava_info.get("orientation")   if llava_info else None,
+        "llava_height_m":    llava_info.get("height_metres") if llava_info else None,
+        "scale_source":      scale_source,
     }
 
 
-# ── Diagnostic window ─────────────────────────────────────────────────────────
-def show_diagnostic(norm_path: Path, info: dict):
-    """Open a standalone matplotlib window to verify the normalized mesh.
+# ── Voxelization ─────────────────────────────────────────────────────────────
+def _sample_voxel_colors(pts, verts, faces, vcolors):
+    """RGB color per voxel center, sampled from the colored mesh surface.
 
-    Shows a 3D scatter of vertices on a 1-block XZ grid, with a Steve
-    reference line at Y=2 for scale. Blocking (plt.show()).
+    For each voxel center, find the closest point on the mesh surface and
+    barycentric-blend the three vertex colors of that triangle.  This is more
+    accurate than nearest-vertex (which can grab a color from the wrong side of
+    a thin feature).  Falls back to nearest-vertex, then to None.
+
+    `verts`/`faces`/`vcolors` describe the colored mesh already scaled into the
+    voxel frame so it lines up with `pts`.  Returns a list of (r,g,b) ints in the
+    same order as `pts`, or None.
+    """
+    if vcolors is None:
+        return None
+    try:
+        cmesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+        closest, _, tri_id = trimesh.proximity.closest_point(cmesh, pts)
+        tris = cmesh.triangles[tri_id]                                   # (K,3,3)
+        bary = trimesh.triangles.points_to_barycentric(tris, closest)    # (K,3)
+        tri_cols = vcolors[faces[tri_id]].astype(np.float64)             # (K,3,3)
+        blended = (bary[:, :, None] * tri_cols).sum(axis=1)              # (K,3)
+        blended = np.clip(np.rint(blended), 0, 255).astype(int)
+        return [tuple(int(c) for c in rgb) for rgb in blended]
+    except Exception:
+        pass
+    try:
+        from scipy.spatial import cKDTree
+        _, idx = cKDTree(verts).query(pts)
+        return [tuple(int(c) for c in rgb) for rgb in vcolors[idx]]
+    except Exception:
+        return None
+
+
+def voxelize_mesh(norm_path: Path, norm_info: dict) -> dict:
+    """Load normalized OBJ, repair, scale to target resolution, voxelize.
+
+    The longest axis is fit to VOXEL_TARGET_RES voxels (decoupled from metres)
+    for a detailed, MagicaVoxel-like result.
+
+    Returns dict:
+      blocks       - list of (x, y, z) int tuples, all >= 0
+      colors       - list of (r,g,b) ints parallel to blocks, or None
+      block_type   - 'stone' (hard-coded for now)
+      dims         - (W, H, L) bounding box in blocks
+      block_count  - number of occupied blocks
+      scale_factor - float applied before voxelizing
+      watertight   - bool; False = warning, voxelization still proceeds
     """
     mesh = trimesh.load(str(norm_path), force="mesh")
     if isinstance(mesh, trimesh.Scene):
         geoms = list(mesh.geometry.values())
         mesh = trimesh.util.concatenate(geoms)
 
-    verts = np.asarray(mesh.vertices, dtype=np.float32)
+    # Snapshot the colored geometry BEFORE repair — fill_holes can add uncolored
+    # vertices, which would break the vertex<->color alignment used for sampling.
+    orig_verts = np.asarray(mesh.vertices, dtype=np.float64).copy()
+    orig_faces = np.asarray(mesh.faces, dtype=np.int64).copy()
+    try:
+        orig_colors = np.asarray(mesh.visual.vertex_colors, dtype=np.uint8)[:, :3].copy()
+        if len(orig_colors) != len(orig_verts):
+            orig_colors = None
+    except Exception:
+        orig_colors = None
 
-    # Subsample for performance
-    if len(verts) > 5000:
-        idx = np.random.default_rng(0).choice(len(verts), 5000, replace=False)
-        pts = verts[idx]
+    trimesh.repair.fix_normals(mesh)
+    trimesh.repair.fill_holes(mesh)
+
+    # Fit the longest axis to VOXEL_TARGET_RES voxels for a detailed result.
+    W, D, H = norm_info["W"], norm_info["D"], norm_info["H"]
+    longest = max(W, D, H)
+    scale_factor = VOXEL_TARGET_RES / longest if longest > 1e-6 else 1.0
+    mesh.apply_scale(scale_factor)
+
+    voxels = mesh.voxelized(pitch=1.0)
+    voxels = voxels.fill()
+
+    pts = voxels.points
+    bx = np.floor(pts[:, 0]).astype(int)
+    by = np.floor(pts[:, 1]).astype(int)
+    bz = np.floor(pts[:, 2]).astype(int)
+
+    bx -= bx.min()
+    bz -= bz.min()
+    if by.min() < 0:
+        by -= by.min()
+
+    blocks = list(zip(bx.tolist(), by.tolist(), bz.tolist()))
+    W_v = int(bx.max() - bx.min() + 1)
+    H_v = int(by.max() - by.min() + 1)
+    L_v = int(bz.max() - bz.min() + 1)
+
+    # Color each block from the colored mesh surface (scaled to the voxel frame).
+    colors = _sample_voxel_colors(
+        pts, orig_verts * scale_factor, orig_faces, orig_colors
+    )
+
+    return {
+        "blocks":       blocks,
+        "colors":       colors,
+        "block_type":   "stone",
+        "dims":         (W_v, H_v, L_v),
+        "block_count":  len(blocks),
+        "scale_factor": scale_factor,
+        "watertight":   bool(mesh.is_watertight),
+    }
+
+
+# ax.voxels draws every cube face (~1.5 ms/cube), so it's only snappy for small
+# models.  Above this many surface cubes, render fast square-marker points instead
+# (visually near-identical at high resolution, but instant).
+VOXEL_RENDER_LIMIT = 3500
+
+
+def _draw_steve(ax):
+    """Draw a 1(X) x 1(Z) x 2(height) wireframe box as a Steve scale reference.
+
+    Placed just off the model's -X side.  Plot axes: (plt_x, plt_y, plt_z) =
+    (block_x, block_z, block_height).
+    """
+    x0, x1 = -2.0, -1.0
+    z0, z1 = 0.0, 1.0
+    y0, y1 = 0.0, 2.0
+    corners = np.array([
+        [x0, z0, y0], [x1, z0, y0], [x0, z1, y0], [x1, z1, y0],
+        [x0, z0, y1], [x1, z0, y1], [x0, z1, y1], [x1, z1, y1],
+    ])
+    edges = [(0,1),(2,3),(4,5),(6,7),
+             (0,2),(1,3),(4,6),(5,7),
+             (0,4),(1,5),(2,6),(3,7)]
+    for n, (i, j) in enumerate(edges):
+        ax.plot([corners[i,0], corners[j,0]],
+                [corners[i,1], corners[j,1]],
+                [corners[i,2], corners[j,2]],
+                color="red", lw=1.5,
+                label="Steve = 2x1 blocks" if n == 0 else None)
+
+
+def show_voxel_diagnostic(voxel_data: dict):
+    """Render voxels as Minecraft-style colored cubes. Blocking (plt.show())."""
+    blocks = voxel_data.get("blocks", [])
+    if not blocks:
+        return
+    colors = voxel_data.get("colors")
+    xs, ys, zs = zip(*blocks)
+    xs, ys, zs = np.array(xs), np.array(ys), np.array(zs)
+    W, H, L = voxel_data["dims"]
+
+    # Per-block RGBA (0-1).  Fall back to a height gradient when no colors exist.
+    if colors:
+        rgba = np.ones((len(blocks), 4), dtype=float)
+        rgba[:, :3] = np.asarray(colors, dtype=float) / 255.0
     else:
-        pts = verts
+        norm = ys / max(ys.max(), 1)
+        rgba = plt.cm.viridis(norm)
 
     fig = plt.figure(figsize=(9, 7))
     ax = fig.add_subplot(111, projection="3d")
 
-    # Axis mapping: mesh X -> plt X, mesh Z -> plt Y, mesh Y (height) -> plt Z
-    # This keeps height visually upward in the default matplotlib 3D view.
-    ax.scatter(pts[:, 0], pts[:, 2], pts[:, 1],
-               s=0.8, c=pts[:, 1], cmap="viridis", alpha=0.6)
+    # Plot axes: block X -> plt X, block Z -> plt Y, block height (Y) -> plt Z (up).
+    # Occupancy + facecolor grids, indexed [x, z, height] to match the plot axes.
+    occ = np.zeros((W, L, H), dtype=bool)
+    facecolors = np.zeros((W, L, H, 4), dtype=float)
+    occ[xs, zs, ys] = True
+    facecolors[xs, zs, ys] = rgba
 
-    # XZ grid at mesh Y=0 (plt Z=0), lines every 1 block
-    x_min = float(verts[:, 0].min())
-    x_max = float(verts[:, 0].max())
-    z_min = float(verts[:, 2].min())
-    z_max = float(verts[:, 2].max())
-    pad = 0.5
-    W_blk = x_max - x_min
-    D_blk = z_max - z_min
-    H_blk = float(verts[:, 1].max()) - float(verts[:, 1].min())
-    # Equal-cube display: all axes span the same range so object shape reads as
-    # how much of the cube it fills (car = flat slab, tower = tall column).
-    # Always reach at least Steve's height so the reference line stays visible.
-    view_size = max(W_blk, D_blk, H_blk, 2.2) * 1.08
-    cx = (x_min + x_max) / 2.0
-    cz = (z_min + z_max) / 2.0
-    max_dim = max(W_blk, D_blk, H_blk)
-    grid_step = 10.0 if max_dim > 50 else 5.0 if max_dim > 20 else 2.0 if max_dim > 5 else 1.0
-    gx = np.arange(np.floor(x_min - pad), np.ceil(x_max + pad) + grid_step, grid_step)
-    gz = np.arange(np.floor(z_min - pad), np.ceil(z_max + pad) + grid_step, grid_step)
-    for xv in gx:
-        ax.plot([xv, xv], [gz[0], gz[-1]], [0, 0],
-                color="#888888", lw=0.5, alpha=0.4)
-    for zv in gz:
-        ax.plot([gx[0], gx[-1]], [zv, zv], [0, 0],
-                color="#888888", lw=0.5, alpha=0.4)
+    # Only the surface (exposed) voxels are visible — a fully interior voxel is
+    # hidden behind its neighbours.  Rendering just the shell is identical to the
+    # eye but vastly cheaper than drawing every solid-fill voxel.
+    pad = np.pad(occ, 1, constant_values=False)
+    surrounded = (
+        pad[2:, 1:-1, 1:-1] & pad[:-2, 1:-1, 1:-1] &
+        pad[1:-1, 2:, 1:-1] & pad[1:-1, :-2, 1:-1] &
+        pad[1:-1, 1:-1, 2:] & pad[1:-1, 1:-1, :-2]
+    )
+    shell = occ & ~surrounded
 
-    # Steve reference line at mesh Y=2 (plt Z=2)
-    ax.plot([x_min, x_max], [0, 0], [2, 2],
-            color="red", lw=1.5, label="Steve = 2 blocks")
+    if int(shell.sum()) <= VOXEL_RENDER_LIMIT:
+        ax.voxels(shell, facecolors=facecolors, edgecolor="black", linewidth=0.15)
+        render_note = ""
+    else:
+        # High-res model — draw the surface voxels as square markers (instant).
+        sx, sz, sy = np.nonzero(shell)
+        ax.scatter(sx + 0.5, sz + 0.5, sy + 0.5,
+                   s=12, marker="s", c=facecolors[sx, sz, sy], depthshade=False)
+        render_note = "  [points: >{:,} surface blocks]".format(VOXEL_RENDER_LIMIT)
 
-    # +Y (UP) arrow at origin -- plotted in plot-Z direction since mesh Y -> plt Z
-    h_up = float(verts[:, 1].max()) * 0.25
-    h_up = max(h_up, 0.5)
-    ax.quiver(0, 0, 0, 0, 0, h_up,
-              color="cyan", arrow_length_ratio=0.3, linewidth=1.5, label="+Y (UP)")
+    _draw_steve(ax)
 
-    # Bounding box wireframe
-    bx0, bx1 = float(verts[:, 0].min()), float(verts[:, 0].max())
-    bz0, bz1 = float(verts[:, 2].min()), float(verts[:, 2].max())
-    by0, by1 = float(verts[:, 1].min()), float(verts[:, 1].max())
-    # corners in plot coords: (plot_x, plot_y, plot_z) = (mesh_x, mesh_z, mesh_y)
-    bbox_corners = np.array([
-        [bx0, bz0, by0], [bx1, bz0, by0], [bx0, bz1, by0], [bx1, bz1, by0],
-        [bx0, bz0, by1], [bx1, bz0, by1], [bx0, bz1, by1], [bx1, bz1, by1],
-    ])
-    bbox_edges = [(0,1),(2,3),(4,5),(6,7),
-                  (0,2),(1,3),(4,6),(5,7),
-                  (0,4),(1,5),(2,6),(3,7)]
-    for i, j in bbox_edges:
-        ax.plot([bbox_corners[i,0], bbox_corners[j,0]],
-                [bbox_corners[i,1], bbox_corners[j,1]],
-                [bbox_corners[i,2], bbox_corners[j,2]],
-                color="orange", lw=0.8, alpha=0.8)
-
-    ax.set_xlim(cx - view_size / 2, cx + view_size / 2)
-    ax.set_ylim(cz - view_size / 2, cz + view_size / 2)
-    ax.set_zlim(0, view_size)
+    # Equal unit length on every axis so cubes read as cubes; -3 leaves room for Steve.
+    ax.set_xlim(-3, W)
+    ax.set_ylim(0, L)
+    ax.set_zlim(0, H)
+    ax.set_box_aspect((W + 3, L, H))
 
     ax.set_xlabel("X")
     ax.set_ylabel("Z")
     ax.set_zlabel("Y (height in blocks)")
-    raw_up = info.get("raw_up", "?")
-    orient_tier = info.get("orient_tier", "geometry")
-    yolo_label = info.get("yolo_label")
-    yolo_line = ""
-    if yolo_label:
-        scale_str = (
-            "{:.2f}m real-world".format(info["yolo_height_m"])
-            if info.get("yolo_height_m") else "default scale"
-        )
-        yolo_line = "\nYOLO: {} (conf={:.2f})  |  scale: {} ({})".format(
-            yolo_label, info["yolo_conf"], info.get("scale_source", "default"), scale_str
-        )
+
+    scale_note = (
+        "  [voxel scale: {:.2f}x]".format(voxel_data["scale_factor"])
+        if voxel_data["scale_factor"] != 1.0 else ""
+    )
+    watertight_note = "" if voxel_data["watertight"] else "  ⚠ mesh not watertight"
+
     ax.set_title(
-        "{name}  |  {fc:,} faces\n"
-        "Bounds: {W:.1f} x {D:.1f} x {H:.1f} blocks  "
-        "|  Y-floor: {yf:.4f} m\n"
-        "raw up: {raw_up} -> +Y  |  orient: {tier}"
-        "{yolo_line}".format(
-            name=info["name"],
-            fc=info["face_count"],
-            W=info["W"], D=info["D"], H=info["H"],
-            yf=info["y_floor_raw"],
-            raw_up=raw_up,
-            tier=orient_tier,
-            yolo_line=yolo_line,
+        "Voxel result  |  {:,} blocks  |  {}x{}x{} (XYZ){}{}{}".format(
+            voxel_data["block_count"], W, H, L,
+            scale_note, watertight_note, render_note
         )
     )
     ax.legend()
     plt.tight_layout()
     plt.show()
+
+
+def export_schematic(voxel_data: dict, out_path: Path):
+    """Write voxel_data to a Sponge Schematic v2 (.schem) gzipped NBT file."""
+    try:
+        import nbtlib
+        from nbtlib import Compound, Int, Short, ByteArray, IntArray
+    except ImportError:
+        raise RuntimeError(
+            "nbtlib is required for .schem export.\n"
+            "Run:  r2m_v2\\Scripts\\pip install nbtlib"
+        )
+
+    W, H, L = voxel_data["dims"]
+    blocks   = voxel_data["blocks"]
+
+    # Build 3D occupancy in YZX order (Sponge Schematic v2 convention)
+    # 0 = minecraft:air  |  1 = minecraft:stone
+    grid = np.zeros((H, L, W), dtype=np.uint8)
+    for x, y, z in blocks:
+        if 0 <= y < H and 0 <= z < L and 0 <= x < W:
+            grid[y, z, x] = 1
+
+    def _varint(v: int) -> bytes:
+        buf = bytearray()
+        while True:
+            if v & ~0x7F == 0:
+                buf.append(v)
+                break
+            buf.append((v & 0x7F) | 0x80)
+            v >>= 7
+        return bytes(buf)
+
+    block_data = bytearray()
+    for val in grid.flatten():
+        block_data.extend(_varint(int(val)))
+
+    schematic = Compound({
+        "Version":     Int(2),
+        "DataVersion": Int(3465),       # Minecraft 1.20.1
+        "Width":       Short(W),
+        "Height":      Short(H),
+        "Length":      Short(L),
+        "PaletteMax":  Int(2),
+        "Palette": Compound({
+            "minecraft:air":   Int(0),
+            "minecraft:stone": Int(1),
+        }),
+        "BlockData": ByteArray(block_data),
+        "Offset":    IntArray([0, 0, 0]),
+    })
+
+    nbtlib.File({"": schematic}).save(str(out_path), gzipped=True)
 
 
 # ── Main Application ──────────────────────────────────────────────────────────
@@ -507,9 +629,13 @@ class App:
         self.root.geometry("500x480")
         self.root.minsize(420, 400)
 
-        self.image_path: Path | None = None
+        self.image_path: Path | None  = None
+        self.norm_path: Path | None   = None
+        self.norm_info: dict | None   = None
+        self.voxel_data: dict | None  = None
         self.is_generating = False
         self._preview_photo = None  # keep ref to prevent GC
+        self._timer_start: float | None = None  # stopwatch start (time.time())
 
         self._build_ui()
 
@@ -561,9 +687,9 @@ class App:
             **self._btn_style,
         ).pack(fill=tk.X, pady=3)
 
-        self.generate_btn = tk.Button(
-            btn_frame, text="▶  Generate 3D Model",
-            command=self._on_generate,
+        self.build_btn = tk.Button(
+            btn_frame, text="🧱  Voxelize the Build",
+            command=self._on_build,
             bg="#238636", fg="white",
             activebackground="#2ea043",
             font=("Segoe UI", 10, "bold"),
@@ -571,10 +697,30 @@ class App:
             cursor="hand2", activeforeground="white",
             state=tk.DISABLED,
         )
-        self.generate_btn.pack(fill=tk.X, pady=3)
+        self.build_btn.pack(fill=tk.X, pady=3)
+
+        self.export_btn = tk.Button(
+            btn_frame, text="💾  Export .schem",
+            command=self._on_export_schem,
+            bg="#3d1f79", fg="white",
+            activebackground="#5a2ea6",
+            font=("Segoe UI", 10, "bold"),
+            relief=tk.FLAT, bd=0, padx=10, pady=8,
+            cursor="hand2", activeforeground="white",
+            state=tk.DISABLED,
+        )
+        self.export_btn.pack(fill=tk.X, pady=3)
 
         self.progress = ttk.Progressbar(btn_frame, mode="indeterminate")
         self.progress.pack(fill=tk.X, pady=(4, 0))
+
+        # Stopwatch — shows how long the system has been working.
+        self.timer_var = tk.StringVar(value="")
+        tk.Label(
+            btn_frame, textvariable=self.timer_var,
+            bg="#161b22", fg="#8b949e",
+            font=("Consolas", 9),
+        ).pack(fill=tk.X, pady=(2, 0))
 
         # env info label
         tk.Label(
@@ -610,7 +756,13 @@ class App:
             return
         self.image_path = Path(path)
         self._show_preview(path)
-        self.generate_btn.config(state=tk.NORMAL)
+        # New picture — clear prior results and the stopwatch.
+        self.norm_path = None
+        self.norm_info = None
+        self.voxel_data = None
+        self._reset_timer()
+        self.build_btn.config(state=tk.NORMAL)
+        self.export_btn.config(state=tk.DISABLED)
         self._set_status("Image: {}".format(self.image_path.name))
 
     def _show_preview(self, path: str):
@@ -630,56 +782,42 @@ class App:
         self.preview_canvas.delete("all")
         self.preview_canvas.create_image(130, 130, anchor=tk.CENTER, image=self._preview_photo)
 
-    def _on_generate(self):
+    def _on_build(self):
+        """Run the whole pipeline: InstantMesh -> normalize -> voxelize -> view."""
         if self.is_generating or not self.image_path:
             return
         if not self.image_path.exists():
             messagebox.showerror("File not found", str(self.image_path))
             return
         self.is_generating = True
-        self.generate_btn.config(state=tk.DISABLED, text="Generating...")
+        self.build_btn.config(state=tk.DISABLED, text="Working...")
+        self.export_btn.config(state=tk.DISABLED)
         self.progress.start(12)
+        self._start_timer()
         self._set_status("Launching InstantMesh...")
-        threading.Thread(target=self._run_instantmesh, daemon=True).start()
+        threading.Thread(target=self._run_pipeline, daemon=True).start()
 
-    # ── InstantMesh pipeline ──────────────────────────────────────────────────
+    # ── Build pipeline (InstantMesh -> normalize -> voxelize) ──────────────────
 
-    def _run_instantmesh(self):
+    def _run_pipeline(self):
         try:
-            # Extract image up-signal from the original photo before InstantMesh
-            # consumes / background-removes it, so we always analyse the source image.
-            img_tier, img_conf = _extract_image_up_signal(self.image_path)
-            hint_msg = img_tier + (" (conf={:+.2f})".format(img_conf) if img_tier != "none" else "")
-            self._set_status("Image hint: {}".format(hint_msg))
-
-            # YOLO object detection on the original photo
-            self._set_status("Running YOLO object detection...")
-            yolo_label, yolo_conf, _ = _run_yolo(self.image_path)
-
-            orient_type   = None
-            real_height_m = None
-            if yolo_label:
-                if yolo_label in VERTICAL_CLASSES:
-                    orient_type = "vertical"
-                elif yolo_label in HORIZONTAL_CLASSES:
-                    orient_type = "horizontal"
-                real_height_m = REAL_WORLD_HEIGHTS.get(yolo_label)
-                height_str = "{:.2f}m".format(real_height_m) if real_height_m else "unknown height"
-                yolo_status = "YOLO: {} (conf={:.2f}) → {}, {}".format(
-                    yolo_label, yolo_conf,
-                    orient_type or "unrecognized class",
-                    height_str,
+            # Query LLaVA (via Ollama) for object label, orientation hint, and scale.
+            self._set_status("Querying LLaVA via Ollama...")
+            llava_info = _run_llava(self.image_path)
+            if llava_info and llava_info.get("object"):
+                h = llava_info.get("height_metres")
+                size_str = (
+                    "~{:.0f}m → {:.0f} blocks".format(h, h / METERS_PER_BLOCK)
+                    if h else "unknown size"
                 )
+                self._set_status("LLaVA: {} | {} | {}".format(
+                    llava_info["object"],
+                    llava_info.get("orientation") or "?",
+                    size_str,
+                ))
             else:
-                yolo_status = "YOLO: no detection"
-            self._set_status(yolo_status)
-
-            yolo_info = {
-                "label":         yolo_label,
-                "conf":          yolo_conf,
-                "orient_type":   orient_type,
-                "real_height_m": real_height_m,
-            }
+                llava_info = None
+                self._set_status("LLaVA unavailable — using geometry fallback")
 
             # Detect pre-existing alpha -- skip rembg if image already has transparency
             img = Image.open(self.image_path)
@@ -760,32 +898,86 @@ class App:
 
             obj_path = obj_files[0]
             self._set_status("Normalizing mesh...")
-            norm_path, norm_info = normalize_mesh(obj_path, image_path=self.image_path, yolo_info=yolo_info)
-            self.root.after(0, self._on_mesh_ready, str(obj_path), str(norm_path), norm_info)
+            norm_path, norm_info = normalize_mesh(obj_path, llava_info=llava_info)
+            self.norm_path = norm_path
+            self.norm_info = norm_info
+
+            self._set_status("Voxelizing — this may take a few seconds...")
+            voxel_data = voxelize_mesh(norm_path, norm_info)
+            self.root.after(0, self._on_build_done, voxel_data)
 
         except Exception as exc:
             self.root.after(0, self._on_error, str(exc))
 
-    # ── post-generation callbacks (must run on main thread) ───────────────────
+    # ── post-build callbacks (must run on main thread) ────────────────────────
 
-    def _on_mesh_ready(self, raw_path: str, norm_path: str, info: dict):
+    def _on_build_done(self, voxel_data: dict):
+        self.voxel_data = voxel_data
         self._reset_controls()
-        name, W, D, H = info["name"], info["W"], info["D"], info["H"]
+        self._stop_timer()
+        self.export_btn.config(state=tk.NORMAL)
+        W, H, L = voxel_data["dims"]
+        note = "" if voxel_data["watertight"] else " (mesh not watertight — may have holes)"
         self._set_status(
-            "Normalization complete -- {}_normalized.obj  |  "
-            "{:.1f} x {:.1f} x {:.1f} blocks".format(name, W, D, H)
+            "Voxelized: {:,} blocks  |  {}x{}x{} (XYZ){}".format(
+                voxel_data["block_count"], W, H, L, note
+            )
         )
-        show_diagnostic(Path(norm_path), info)
+        show_voxel_diagnostic(voxel_data)
 
     def _on_error(self, msg: str):
         self._reset_controls()
+        self._stop_timer()
         self._set_status("Error: {}".format(msg[:100]))
-        messagebox.showerror("Generation failed", msg)
+        messagebox.showerror("Build failed", msg)
+
+    def _on_export_schem(self):
+        if not self.voxel_data:
+            return
+        path = filedialog.asksaveasfilename(
+            title="Save Schematic",
+            defaultextension=".schem",
+            initialfile="model.schem",
+            filetypes=[("Sponge Schematic", "*.schem"), ("All files", "*.*")],
+        )
+        if not path:
+            return
+        try:
+            export_schematic(self.voxel_data, Path(path))
+            self._set_status("Exported: {}".format(Path(path).name))
+        except Exception as exc:
+            messagebox.showerror("Export failed", str(exc))
+            self._set_status("Export failed: {}".format(str(exc)[:80]))
 
     def _reset_controls(self):
         self.is_generating = False
         self.progress.stop()
-        self.generate_btn.config(state=tk.NORMAL, text="▶  Generate 3D Model")
+        self.build_btn.config(state=tk.NORMAL, text="🧱  Voxelize the Build")
+
+    # ── stopwatch ─────────────────────────────────────────────────────────────
+
+    def _start_timer(self):
+        self._timer_start = time.time()
+        self._tick()
+
+    def _tick(self):
+        # Re-schedule itself once per second while a build is running.
+        if self._timer_start is None:
+            return
+        elapsed = int(time.time() - self._timer_start)
+        self.timer_var.set("Working for {:02d}:{:02d}".format(elapsed // 60, elapsed % 60))
+        self.root.after(1000, self._tick)
+
+    def _stop_timer(self):
+        if self._timer_start is None:
+            return
+        elapsed = int(time.time() - self._timer_start)
+        self._timer_start = None  # stops the _tick loop
+        self.timer_var.set("Done in {:02d}:{:02d}".format(elapsed // 60, elapsed % 60))
+
+    def _reset_timer(self):
+        self._timer_start = None  # stops any running _tick loop
+        self.timer_var.set("")
 
     def _set_status(self, msg: str):
         # Thread-safe status update
