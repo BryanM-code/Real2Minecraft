@@ -1,0 +1,20 @@
+
+
+**Project: Real2Minecraft**
+
+This project turns a single 2D photo of a real-world object into a buildable Minecraft blueprint.
+
+**The user flow:** a user takes or uploads a photo of something they like — a tower, a house, a car, a tree, a statue — and the app produces a voxelized, textured 3D model made entirely of real Minecraft blocks, scaled to a size the user chooses, that they can then physically construct in their Minecraft world (or export as a `.schem` file and paste it in with a tool like WorldEdit/Litematica).
+
+**Pipeline (photo → Minecraft build):**
+1. **Image → 3D mesh** — the object is first cut out of the photo (client-side background removal, shown to the user so a bad segmentation is visible), then fed through TRELLIS (an image-to-3D diffusion model) to reconstruct a full colored 3D mesh of the object, including geometry and texture on faces the camera never saw. Several candidates are generated with random seeds and the one agreeing best with the photo is kept. The TRELLIS server should run **full precision** (`C:\TRELLIS\run.bat`) — it fits in 16 GB VRAM, runs as fast as fp16, and produces markedly cleaner textures.
+2. **Normalize** — the raw mesh is reoriented upright and centered so it sits cleanly at the origin, ready for voxelization.
+3. **Voxelize** — the mesh is scaled so its longest axis matches a user-chosen size (in blocks), then converted into a solid, gap-free voxel grid (surface rasterization + exterior flood fill, so even non-watertight meshes come out solid rather than hollow/leaky).
+4. **Color → block matching** — each voxel's sampled color is matched against a real Minecraft block palette (stone, wood, wool colors, etc.), so the output isn't just gray blocks — it approximates the real object's coloring using in-game materials.
+5. **Optional refinement** — a user-selectable "Force symmetric" mode mirrors the observed (brighter) half of the build across the detected vertical plane, cleaning up one-sided artifacts on things that should be symmetric (buildings, towers, vehicles). This step never changes block colors/materials — it's purely a geometry cleanup aid. (There is no semantic/vision pass — earlier LLaVA/Ollama integration was removed; TRELLIS's own reconstruction is the only judgement about the object.)
+6. **Output** — the user gets a viewable 3D voxel preview plus an exportable `.schem` file sized and textured for direct use as a Minecraft build blueprint.
+
+**Design principle:** the whole pipeline treats the photo as a *reference*, not a template to trace exactly — the goal is a recognizable, physically buildable Minecraft version of the object at whatever scale the user wants, using authentic block textures rather than arbitrary colored cubes.
+
+---
+
