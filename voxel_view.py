@@ -10,7 +10,10 @@ blocky build, and the atlas uses nearest-neighbour sampling for the pixelated lo
 When `mesh_info` (the dict from normalize_mesh) is passed, the window splits into two
 linked views: the normalized TRELLIS mesh on the left, the voxel build on the right —
 so hallucinated texture clumps can be traced back to the source mesh.
-Falls back to the matplotlib renderer if pyvista isn't available.
+
+`show_voxel_diagnostic(voxel_data)` is the matplotlib fallback used when pyvista/VTK
+is unavailable or errors out; both matplotlib and pyvista are imported lazily so this
+module stays cheap to import headlessly (dev_rebuild).
 """
 
 import numpy as np
@@ -193,3 +196,149 @@ def _constrain_to_upper_hemisphere(pl):
         pl.iren.add_observer("EndInteractionEvent", _clamp)
     except Exception:
         pass                              # non-interactive/offscreen -> no constraint needed
+
+
+# ── Matplotlib fallback viewer ────────────────────────────────────────────────
+# ax.voxels draws every cube face (~1.5 ms/cube), so it's only snappy for small
+# models.  Above this many surface cubes, render fast square-marker points instead
+# (visually near-identical at high resolution, but instant).
+VOXEL_RENDER_LIMIT = 5000
+
+
+def _draw_steve(ax):
+    """Draw a 1(X) x 1(Z) x 2(height) wireframe box as a Steve scale reference.
+
+    Placed just off the model's -X side.  Plot axes: (plt_x, plt_y, plt_z) =
+    (block_x, block_z, block_height).
+    """
+    x0, x1 = -2.0, -1.0
+    z0, z1 = 0.0, 1.0
+    y0, y1 = 0.0, 2.0
+    corners = np.array([
+        [x0, z0, y0], [x1, z0, y0], [x0, z1, y0], [x1, z1, y0],
+        [x0, z0, y1], [x1, z0, y1], [x0, z1, y1], [x1, z1, y1],
+    ])
+    edges = [(0,1),(2,3),(4,5),(6,7),
+             (0,2),(1,3),(4,6),(5,7),
+             (0,4),(1,5),(2,6),(3,7)]
+    for n, (i, j) in enumerate(edges):
+        ax.plot([corners[i,0], corners[j,0]],
+                [corners[i,1], corners[j,1]],
+                [corners[i,2], corners[j,2]],
+                color="red", lw=1.5,
+                label="Steve = 2x1 blocks" if n == 0 else None)
+
+
+def show_voxel_diagnostic(voxel_data: dict):
+    """Render voxels as Minecraft-style colored cubes. Blocking (plt.show())."""
+    import matplotlib
+    matplotlib.use("TkAgg")
+    import matplotlib.pyplot as plt
+
+    blocks = voxel_data.get("blocks", [])
+    if not blocks:
+        return
+    colors = voxel_data.get("colors")
+    block_ids = voxel_data.get("block_ids")
+    xs, ys, zs = zip(*blocks)
+    xs, ys, zs = np.array(xs), np.array(ys), np.array(zs)
+    W, H, L = voxel_data["dims"]
+
+    # Per-block RGBA (0-1).  Prefer the matched-block palette colors so the preview shows
+    # what the .schem will actually be; fall back to raw sampled colors, then to a height
+    # gradient.
+    palette_rgb = None
+    if block_ids:
+        try:
+            from block_palette import BLOCK_PALETTE
+            palette_rgb = np.array(
+                [BLOCK_PALETTE.get(b, (128, 128, 128)) for b in block_ids], dtype=float
+            )
+        except Exception:
+            palette_rgb = None
+
+    if palette_rgb is not None:
+        rgba = np.ones((len(blocks), 4), dtype=float)
+        rgba[:, :3] = palette_rgb / 255.0
+    elif colors:
+        rgba = np.ones((len(blocks), 4), dtype=float)
+        rgba[:, :3] = np.asarray(colors, dtype=float) / 255.0
+    else:
+        norm = ys / max(ys.max(), 1)
+        rgba = plt.cm.viridis(norm)
+
+    fig = plt.figure(figsize=(9, 7))
+    ax = fig.add_subplot(111, projection="3d")
+
+    # Plot axes: block X -> plt X, block Z -> plt Y, block height (Y) -> plt Z (up).
+    # Occupancy + facecolor grids, indexed [x, z, height] to match the plot axes.
+    occ = np.zeros((W, L, H), dtype=bool)
+    facecolors = np.zeros((W, L, H, 4), dtype=float)
+    occ[xs, zs, ys] = True
+    facecolors[xs, zs, ys] = rgba
+
+    # Only the surface (exposed) voxels are visible — a fully interior voxel is
+    # hidden behind its neighbours.  Rendering just the shell is identical to the
+    # eye but vastly cheaper than drawing every solid-fill voxel.
+    pad = np.pad(occ, 1, constant_values=False)
+    surrounded = (
+        pad[2:, 1:-1, 1:-1] & pad[:-2, 1:-1, 1:-1] &
+        pad[1:-1, 2:, 1:-1] & pad[1:-1, :-2, 1:-1] &
+        pad[1:-1, 1:-1, 2:] & pad[1:-1, 1:-1, :-2]
+    )
+    shell = occ & ~surrounded
+
+    if int(shell.sum()) <= VOXEL_RENDER_LIMIT:
+        ax.voxels(shell, facecolors=facecolors, edgecolor="black", linewidth=0.15)
+        render_note = ""
+    else:
+        # High-res model — drawing real cubes (ax.voxels) costs ~1.5 ms each, so a
+        # 6k-voxel shell takes ~7 s per redraw and rotation crawls.  Instead draw the
+        # surface voxels as square markers (instant), but size each marker to the
+        # on-screen voxel pitch so they tile into a gap-free surface — and re-fit them
+        # on resize, since a fixed point size leaves gaps once the window is maximised.
+        sx, sz, sy = np.nonzero(shell)
+        sc = ax.scatter(sx + 0.5, sz + 0.5, sy + 0.5,
+                        marker="s", c=facecolors[sx, sz, sy], depthshade=False)
+        extent = max(W + 3, L, H)
+
+        def _fit_markers(_evt=None):
+            try:
+                bbox = ax.get_window_extent()
+                px_per_block = min(bbox.width, bbox.height) / max(extent, 1)
+                side_pts = px_per_block * 72.0 / fig.dpi
+                sc.set_sizes([max(9.0, (side_pts * 1.3) ** 2)])  # 1.3x overlap = no gaps
+            except Exception:
+                pass
+
+        fig.canvas.mpl_connect("resize_event", _fit_markers)
+        _fit_markers()
+        render_note = "  [points]"
+
+    _draw_steve(ax)
+
+    # Equal unit length on every axis so cubes read as cubes; -3 leaves room for Steve.
+    ax.set_xlim(-3, W)
+    ax.set_ylim(0, L)
+    ax.set_zlim(0, H)
+    ax.set_box_aspect((W + 3, L, H))
+
+    ax.set_xlabel("X")
+    ax.set_ylabel("Z")
+    ax.set_zlabel("Y (height in blocks)")
+
+    scale_note = (
+        "  [voxel scale: {:.2f}x]".format(voxel_data["scale_factor"])
+        if voxel_data["scale_factor"] != 1.0 else ""
+    )
+    watertight_note = "" if voxel_data["watertight"] else "  ⚠ mesh not watertight"
+
+    ax.set_title(
+        "Voxel result  |  {:,} blocks  |  {}x{}x{} (XYZ){}{}{}".format(
+            voxel_data["block_count"], W, H, L,
+            scale_note, watertight_note, render_note
+        )
+    )
+    ax.legend()
+    plt.tight_layout()
+    plt.show()
