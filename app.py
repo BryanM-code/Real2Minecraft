@@ -49,14 +49,8 @@ TRELLIS_TEXTURE_SIZE = 1024
 
 # Diffusion steps for both TRELLIS stages (sparse structure + slat).  The server default
 # is 12 (max 50); 24 buys noticeably cleaner geometry/texture latents for a few extra
-# seconds per candidate.
+# seconds per run.
 TRELLIS_SAMPLING_STEPS = 24
-
-# Candidates per build: each gets a fresh random seed, is scored against the input photo,
-# and the best one wins.  Hallucinated colours vary a lot between seeds, so best-of-N is
-# the single strongest lever against baked-in artifact clumps.  Override with R2M_BEST_OF
-# (e.g. 1 for fast dev iterations).
-TRELLIS_BEST_OF = max(1, int(os.environ.get("R2M_BEST_OF", "3")))
 
 # Background-removal model for the client-side cutout.  'isnet-general-use' handles
 # whole scenes (house + yard + sky) better than the u2net the TRELLIS server would run
@@ -209,84 +203,20 @@ def _extract_texture(mesh):
         return None, None
 
 
-def _score_candidate(glb_path: Path, photo_lab, n_samples: int = 20000) -> float:
-    """Photo-agreement score for a candidate GLB — LOWER is better.
-
-    Area-weighted surface samples -> interpolated UV -> texture colour -> tone lift ->
-    weighted-LAB distance to the input photo's colour population.  Three terms:
-      1. mean support distance (general colour drift);
-      2. a heavy penalty for the fraction of surface that is outright unsupported
-         (a hallucinated patch: teal walls, a lawn on the underside);
-      3. a COVERAGE penalty for photo colour families the bake failed to reproduce —
-         without it a washed-out grey bake wins on terms 1-2 (grey is always "legal")
-         over one that actually carries the roof's brown.
-
-    Returns 0.0 when scoring isn't possible (no photo/texture) so a lone candidate
-    still passes through.
-    """
-    try:
-        if photo_lab is None or not len(photo_lab):
-            return 0.0
-        from scipy.spatial import cKDTree
-        from block_palette import _srgb_to_lab
-
-        mesh = trimesh.load(str(glb_path), force="mesh")
-        uv, tex = _extract_texture(mesh)
-        if uv is None:
-            return 0.0
-        points, face_idx = trimesh.sample.sample_surface(mesh, n_samples)
-        bary = trimesh.triangles.points_to_barycentric(
-            mesh.triangles[face_idx], points)
-        bary = np.nan_to_num(bary, nan=1.0 / 3.0, posinf=1.0, neginf=0.0)
-        uv_s = (bary[:, :, None] * uv[np.asarray(mesh.faces)[face_idx]]).sum(axis=1)
-        cols = np.clip(np.rint(_bilinear_sample(tex, uv_s)), 0, 255)
-        cols = _normalize_tone([tuple(int(c) for c in rgb) for rgb in cols])
-
-        w = np.array([PHOTO_L_WEIGHT, 1.0, 1.0])
-        lab = _srgb_to_lab(np.asarray(cols, dtype=np.float64))
-        ref = np.asarray(photo_lab, dtype=np.float64)
-        d, _ = cKDTree(ref * w).query(lab * w)
-
-        # Coverage: the bake should reproduce each dominant photo colour family in
-        # roughly its photo proportion — mere existence is too weak a test (a washed-out
-        # grey bake keeps a few brown texels and would pass), so penalize MASS deficits:
-        # every bake sample is assigned to its nearest family, and any family holding
-        # less of the bake than of the photo contributes its shortfall.
-        bins = np.floor(ref[:, 1:] / 8.0).astype(np.int64)
-        key = bins[:, 0] * 4096 + bins[:, 1]
-        uniq, inv = np.unique(key, return_inverse=True)
-        reps = np.array([np.median(ref[inv == i], axis=0) for i in range(len(uniq))])
-        p_mass = np.bincount(inv, minlength=len(uniq)) / len(inv)      # photo share
-        _, nearest = cKDTree(reps * w).query(lab * w)
-        b_mass = np.bincount(nearest, minlength=len(uniq)) / len(lab)  # bake share
-        deficit = float(np.maximum(0.0, p_mass - b_mass).sum())        # 0..1
-
-        return (float(d.mean()) + 50.0 * float((d > 16.0).mean())
-                + 20.0 * deficit)
-    except Exception:
-        return 0.0
-
-
-def _generate_best_candidate(image_path: Path, n: int | None = None,
-                             status_cb=None, preview_cb=None) -> Path:
-    """Generate `n` TRELLIS candidates with fresh random seeds and keep the one that
-    agrees best with the input photo.
+def _generate_mesh(image_path: Path, status_cb=None, preview_cb=None) -> Path:
+    """Generate one TRELLIS GLB from the photo (cutout-conditioned, random seed).
 
     The object is first CUT OUT of the photo client-side (see _prepare_cutout) and the
     cutout — not the raw photo — conditions TRELLIS; `preview_cb(path)` is invoked with
     the cutout so the UI can show what will actually be reconstructed.
 
-    Every run writes to unique `<stem>_<runid>_*` paths (nothing can reuse a previous
-    run's files), archives the input photo + cutout next to the winner, and hashes each
-    download to detect a stale server (two seeds returning byte-identical models).
-    Losing candidates are deleted; the winner is renamed to `<stem>_<runid>.glb` and
-    returned.
+    Every run writes to a unique `<stem>_<runid>.glb` (nothing can reuse a previous
+    run's files) and archives the input photo + cutout next to it (dev_rebuild.py looks
+    them up as `<glb stem>_input.<ext>` / `<glb stem>_cutout.png`).
     """
-    import hashlib
     import random
     import shutil
 
-    n = TRELLIS_BEST_OF if n is None else max(1, n)
     out_dir = OUTPUTS_DIR / "trellis"
     out_dir.mkdir(parents=True, exist_ok=True)
     runid = time.strftime("%Y%m%d-%H%M%S")
@@ -311,42 +241,10 @@ def _generate_best_candidate(image_path: Path, n: int | None = None,
     if cutout is None and status_cb:
         status_cb("Background removal unavailable — sending the raw photo")
 
-    photo_lab = _photo_reference_lab(source) if n > 1 else None
-    candidates = []                       # (score, path, seed)
-    hashes: dict[str, int] = {}
-    for i in range(n):
-        seed = random.randrange(1, 2**31 - 1)
-        if status_cb:
-            status_cb("TRELLIS candidate {}/{} (seed {})...".format(i + 1, n, seed))
-        glb = _run_trellis_api(source, seed=seed,
-                               out_path=out_dir / "{}_c{}.glb".format(stem, i + 1))
-        digest = hashlib.sha256(glb.read_bytes()).hexdigest()
-        if digest in hashes:
-            raise RuntimeError(
-                "TRELLIS returned byte-identical models for two different seeds "
-                "(candidates {} and {}) — the server is serving a stale result. "
-                "Restart the TRELLIS API server and retry.".format(hashes[digest], i + 1))
-        hashes[digest] = i + 1
-        score = _score_candidate(glb, photo_lab) if n > 1 else 0.0
-        candidates.append((score, glb, seed))
-        if status_cb and n > 1:
-            status_cb("Candidate {}/{}: photo-agreement {:.1f} (lower = better)".format(
-                i + 1, n, score))
-
-    candidates.sort(key=lambda c: c[0])
-    best_score, best_glb, best_seed = candidates[0]
-    for _, glb, _ in candidates[1:]:
-        try:
-            glb.unlink()
-        except Exception:
-            pass
-    final = out_dir / (stem + ".glb")
-    best_glb.rename(final)
-    if status_cb and n > 1:
-        status_cb("Picked candidate seed {} (score {:.1f} of {})".format(
-            best_seed, best_score,
-            "/".join("{:.1f}".format(s) for s, _, _ in candidates)))
-    return final
+    seed = random.randrange(1, 2**31 - 1)
+    if status_cb:
+        status_cb("TRELLIS generating (seed {})...".format(seed))
+    return _run_trellis_api(source, seed=seed, out_path=out_dir / (stem + ".glb"))
 
 
 # ── Mesh normalization ────────────────────────────────────────────────────────
@@ -414,10 +312,11 @@ def normalize_mesh(obj_path: Path) -> tuple:
         "W": W, "D": D, "H": H,
         "raw_up": "+Y (native)",
         "orient_tier": "trellis-native",
-        # Full-resolution texture for direct per-voxel sampling (None when the source
-        # carried no texture; the voxelizer then uses the baked vertex colors).
-        "tex_verts": verts.copy() if tex_uv is not None else None,
-        "tex_faces": faces.astype(np.int64) if tex_uv is not None else None,
+        # Normalized geometry, always kept (drives the mesh preview); the texture pair
+        # is None when the source carried no texture — the voxelizer then uses the
+        # baked vertex colors and the preview falls back to a plain surface.
+        "tex_verts": verts.copy(),
+        "tex_faces": faces.astype(np.int64),
         "tex_uv":    tex_uv,
         "tex_image": tex_image,
     }
@@ -444,32 +343,67 @@ def _bilinear_sample(image, uv):
             img[y1, x0] * (1 - fx) * fy + img[y1, x1] * fx * fy)
 
 
-def _sample_voxel_colors_texture(occ, origin, grid_shape, verts, faces, uv, image):
-    """RGB per voxel by area-averaging the mesh TEXTURE over each voxel's surface patch.
+def _sample_voxel_colors_texture(occ, origin, grid_shape, verts, faces, uv, image,
+                                 vert_thresh: float = 0.35,
+                                 conflict_frac: float = 0.20,
+                                 conflict_min: int = 2,
+                                 mode_radius: float = 40.0):
+    """RGB per voxel: mode-seeking mean of the texture over the voxel's surface patch.
 
     Surface splatting with supersampling: every triangle is covered with barycentric
     sample points at ~1/3-voxel spacing, each sample looks up the texture at its
-    interpolated UV (bilinear), and all samples landing in a voxel are averaged.
-    Unlike the baked vertex-color path this keeps the texture's full resolution —
-    a stray bright texel averages out instead of tinting a whole region, and detail
-    smaller than a triangle (window rows, trim) survives down to voxel scale.
+    interpolated UV (bilinear).  The voxel's color is the mean of ONLY the samples
+    within `mode_radius` (RGB) of its median-luminance sample — i.e. the majority
+    material's samples.  A plain mean would average a bimodal voxel (black window
+    frame + cream wall, dark ridge trim + brown shingles) into a mid-grey that
+    exists nowhere in the texture and reads as a different material downstream; a
+    plain median keeps raw texture noise that inflates cluster spreads.  The
+    mode-seeking mean does both jobs: boundary voxels snap to the majority material
+    (windows/doors/trim survive) while within-material noise still averages out.
+
+    Side-aware: samples are bucketed by face orientation (UP / DOWN / SIDE at
+    |n_y| > `vert_thresh`).  A voxel that collects meaningful samples from BOTH the
+    top and bottom of a thin slab (a roof ~1 voxel thick: bright shingles above,
+    baked-shadow underside below) keeps only the brighter vertical side — the lit
+    albedo — instead of averaging them into a muddy grey that then reads as a
+    different material.  Minecraft re-lights the build, so the baked-shadow side is
+    lighting, not material.  Walls (all SIDE) and thick surfaces are unaffected.
 
     Voxels no surface sample lands in (flood-filled interiors) fall back to a
-    closest-point texture lookup.  `verts` are in the scaled voxel frame; a point p
-    lies in voxel floor(p) - origin.  Returns [(r,g,b)] aligned with `occ`, or None
-    if sampling fails (caller then uses the vertex-color path).
+    closest-point texture lookup.  `verts` are in the scaled voxel frame (axis 1 =
+    up); a point p lies in voxel floor(p) - origin.  Returns [(r,g,b)] aligned with
+    `occ`, or None if sampling fails (caller then uses the vertex-color path).
     """
     try:
         occ = np.asarray(occ)
         tri_v = verts[faces]                                        # (F,3,3)
         tri_uv = uv[faces]                                          # (F,3,2)
+
+        # Face up-components for the orientation buckets.  tex_faces never went
+        # through fix_normals, so guard against globally inverted winding via the
+        # signed volume (sum dot(v0, e1 x e2) = 6V; negative -> flipped).
+        fn = np.cross(tri_v[:, 1] - tri_v[:, 0], tri_v[:, 2] - tri_v[:, 0])
+        nrm = np.linalg.norm(fn, axis=1)
+        ny = np.divide(fn[:, 1], nrm, out=np.zeros_like(nrm), where=nrm > 1e-12)
+        if float(np.einsum("ij,ij->i", fn, tri_v[:, 0]).sum()) < 0.0:
+            ny = -ny
+        tri_bucket = np.where(ny > vert_thresh, 0,                  # 0=UP
+                              np.where(ny < -vert_thresh, 1, 2))    # 1=DOWN 2=SIDE
+
         edges = np.linalg.norm(tri_v - np.roll(tri_v, 1, axis=1), axis=2)
         n_div = np.clip(np.ceil(edges.max(axis=1) * 3).astype(np.int64), 1, 96)
 
         ncells = int(np.prod(grid_shape))
-        sums = np.zeros((ncells, 3), dtype=np.float64)
-        counts = np.zeros(ncells, dtype=np.int64)
+        sums = np.zeros((3 * ncells, 3), dtype=np.float32)          # per bucket
+        counts = np.zeros(3 * ncells, dtype=np.int32)
         hi = np.asarray(grid_shape, dtype=np.int64) - 1
+
+        # Row lookup: linear cell -> occ row (-1 = unoccupied); the batch loop only
+        # stores samples landing in occupied cells (the only ones ever read back).
+        lin_occ = np.ravel_multi_index((occ[:, 0], occ[:, 1], occ[:, 2]), grid_shape)
+        voxrow = np.full(ncells, -1, dtype=np.int32)
+        voxrow[lin_occ] = np.arange(len(occ), dtype=np.int32)
+        parts_row, parts_sb, parts_col = [], [], []
 
         # Batch triangles by subdivision count so each group splats in one shot.
         for n in np.unique(n_div):
@@ -484,13 +418,65 @@ def _sample_voxel_colors_texture(occ, origin, grid_shape, verts, faces, uv, imag
             cols = _bilinear_sample(image, uvs)
             vidx = np.clip(np.floor(pos).astype(np.int64) - origin, 0, hi)
             lin = np.ravel_multi_index((vidx[:, 0], vidx[:, 1], vidx[:, 2]), grid_shape)
-            np.add.at(sums, lin, cols)
-            np.add.at(counts, lin, 1)
+            sb = np.repeat(tri_bucket[sel], len(b0))    # sample bucket (tri-major,
+            np.add.at(sums, lin + sb * ncells, cols)    # matching the reshapes above)
+            np.add.at(counts, lin + sb * ncells, 1)
+            row = voxrow[lin]
+            m = row >= 0
+            parts_row.append(row[m])
+            parts_sb.append(sb[m].astype(np.uint8))
+            parts_col.append(np.clip(np.rint(cols[m]), 0, 255).astype(np.uint8))
 
-        lin_occ = np.ravel_multi_index((occ[:, 0], occ[:, 1], occ[:, 2]), grid_shape)
+        s_up, s_dn = (sums[lin_occ + b * ncells].astype(np.float64) for b in (0, 1))
+        c_up, c_dn, c_sd = (counts[lin_occ + b * ncells].astype(np.float64)
+                            for b in (0, 1, 2))
+        total = c_up + c_dn + c_sd
+
+        wl = np.array([0.299, 0.587, 0.114])
+        lum_up = np.divide(s_up @ wl, c_up, out=np.zeros_like(c_up), where=c_up > 0)
+        lum_dn = np.divide(s_dn @ wl, c_dn, out=np.zeros_like(c_dn), where=c_dn > 0)
+        # Top/bottom conflict -> keep the brighter vertical side (ties keep UP).
+        conflict = np.minimum(c_up, c_dn) >= np.maximum(conflict_min,
+                                                        conflict_frac * total)
+        drop_up = conflict & (lum_up < lum_dn)
+        drop_dn = conflict & ~drop_up
+        if os.environ.get("R2M_DEBUG"):
+            print("[sample] {} voxels, {} top/bottom conflicts "
+                  "(dropped underside {}, top {})".format(
+                      len(occ), int(conflict.sum()),
+                      int(drop_dn.sum()), int(drop_up.sum())))
+
+        # Mode-seeking mean per voxel: find the median-by-luminance sample (the
+        # majority material — a real texture color, never a blend), then average
+        # only the samples within mode_radius of it.  Boundary voxels snap to the
+        # majority material; within-material noise still averages out.
         out = np.zeros((len(occ), 3), dtype=np.float64)
-        have = counts[lin_occ] > 0
-        out[have] = sums[lin_occ[have]] / counts[lin_occ[have], None]
+        have = np.zeros(len(occ), dtype=bool)
+        if parts_row:
+            s_row = np.concatenate(parts_row)
+            s_sb = np.concatenate(parts_sb)
+            s_col = np.concatenate(parts_col)
+            kept = ~((drop_up[s_row] & (s_sb == 0)) |
+                     (drop_dn[s_row] & (s_sb == 1)))
+            s_row, s_col = s_row[kept], s_col[kept]
+            if len(s_row):
+                s_lum = s_col.astype(np.float32) @ wl.astype(np.float32)
+                order = np.lexsort((s_lum, s_row))   # stable: same input, same pick
+                r_sorted = s_row[order]
+                starts = np.flatnonzero(np.r_[True, r_sorted[1:] != r_sorted[:-1]])
+                seg_len = np.diff(np.r_[starts, len(r_sorted)])
+                med = order[starts + (seg_len - 1) // 2]   # lower median: real sample
+                rows = r_sorted[starts]
+                med_by_row = np.zeros((len(occ), 3), dtype=np.float32)
+                med_by_row[rows] = s_col[med].astype(np.float32)
+                near = (np.linalg.norm(s_col.astype(np.float32)
+                                       - med_by_row[s_row], axis=1) < mode_radius)
+                acc = np.zeros((len(occ), 3), dtype=np.float64)
+                cnt = np.zeros(len(occ), dtype=np.int64)
+                np.add.at(acc, s_row[near], s_col[near].astype(np.float64))
+                np.add.at(cnt, s_row[near], 1)
+                have = cnt > 0                 # every sampled voxel keeps >= its median
+                out[have] = acc[have] / cnt[have, None]
 
         missing = ~have
         if missing.any():
@@ -837,14 +823,20 @@ def _fill_unobserved_colors(occ, colors, photo_lab=None, pair_de: float = 20.0,
 
 
 def _inpaint_dark_voxels(occ, colors, floor_frac: float = 0.35,
-                         abs_floor: float = 30.0, max_frac: float = 0.40):
-    """Repair baked-shadow / unobserved dark PATCHES from the nearest well-lit voxel.
+                         abs_floor: float = 30.0, max_frac: float = 0.40,
+                         min_blob_frac: float = 0.01, min_blob_floor: int = 8):
+    """Repair baked-shadow / unobserved dark BLOBS from the nearest well-lit voxel.
 
     TRELLIS bakes parts the photo never saw (a roof top shot from ground level,
     undersides) near-black, leaving dark blobs that _fill_unobserved_colors's
     front/back mirror can't reach — they aren't a half-space split on X/Z.  Any voxel
     whose luminance falls below max(abs_floor, floor_frac * the model's median
     luminance) takes the colour of the nearest voxel above that floor.
+
+    Only LARGE dark components are repainted (26-connected size >=
+    max(min_blob_floor, min_blob_frac * N)): bake-shadow blobs span hundreds of
+    voxels, while genuine small dark detail — window frames, doors, trim — forms
+    small components that must survive to the palette matcher.
 
     Safety gate: skips entirely when more than `max_frac` of voxels qualify — then the
     object is genuinely dark (a black car), not shadow-damaged.  Colour-only.
@@ -855,13 +847,39 @@ def _inpaint_dark_voxels(occ, colors, floor_frac: float = 0.35,
     col = np.asarray(colors, dtype=float)
     lum = col @ np.array([0.299, 0.587, 0.114])
     floor = max(abs_floor, floor_frac * float(np.median(lum)))
-    dark = lum < floor
-    if not dark.any() or float(dark.mean()) > max_frac:
+    dark_raw = lum < floor                 # inpaint SOURCE excludes all of these
+    dark = dark_raw
+    n_dark_raw = int(dark_raw.sum())
+    if dark.any() and float(dark.mean()) <= max_frac:
+        # Keep small dark components: genuine detail, not bake shadow.
+        try:
+            from scipy import ndimage
+            min_blob = max(min_blob_floor, int(round(min_blob_frac * len(occ))))
+            shape = tuple(int(m) + 1 for m in occ.max(axis=0))
+            grid = np.zeros(shape, dtype=bool)
+            didx = occ[dark]
+            grid[didx[:, 0], didx[:, 1], didx[:, 2]] = True
+            lab, n_comp = ndimage.label(
+                grid, structure=ndimage.generate_binary_structure(3, 3))
+            sizes = np.bincount(lab.ravel())
+            keep_small = sizes[lab[didx[:, 0], didx[:, 1], didx[:, 2]]] < min_blob
+            d2 = dark.copy()
+            d2[np.flatnonzero(dark)[keep_small]] = False
+            dark = d2
+        except Exception:
+            pass
+    if os.environ.get("R2M_DEBUG"):
+        print("[inpaint] floor={:.1f} dark={}/{} ({:.0%}), {} in large blobs{}".format(
+            floor, n_dark_raw, len(lum), n_dark_raw / max(len(lum), 1),
+            int(dark.sum()),
+            "  SKIPPED (over max_frac)" if n_dark_raw / max(len(lum), 1) > max_frac
+            else ""))
+    if not dark.any() or n_dark_raw / max(len(lum), 1) > max_frac:
         return colors
     try:
         from scipy.spatial import cKDTree
-        _, idx = cKDTree(occ[~dark]).query(occ[dark])
-        col[dark] = col[~dark][idx]
+        _, idx = cKDTree(occ[~dark_raw]).query(occ[dark])
+        col[dark] = col[~dark_raw][idx]
     except Exception:
         return colors
     return [tuple(int(c) for c in rgb) for rgb in col]
@@ -900,70 +918,329 @@ def _normalize_tone(colors, hi_pct: float = 98.0, target_hi: int = 235,
     return [tuple(int(c) for c in rgb) for rgb in out]
 
 
-def _denoise_colors(occ, colors, outlier_dist: float = 60.0):
-    """Outlier-only spatial denoise: a voxel is replaced by the per-channel median of
-    its occupied 26-neighbours ONLY when it sits far from that median (one pass).
+def _quantize_colors(occ, colors, grid_shape,
+                     k_init: int = 24,
+                     merge_de: float = 12.0,
+                     merge_spread_factor: float = 1.2,
+                     region_divisor: int = 2000,
+                     min_region_floor: int = 3,
+                     absorb_de: float = 25.0,
+                     absorb_always_size: int = 1,
+                     shadow_chroma_max: float = 6.0,
+                     shadow_l_min: float = 28.0,
+                     shadow_dl_min: float = 12.0,
+                     donor_chroma_min: float = 8.0,
+                     shadow_contact_frac: float = 0.25,
+                     shadow_max_frac: float = 0.35):
+    """Collapse noisy per-voxel colors into a few flat color regions before matching.
 
-    Per-voxel sampling can still leave the odd stray block (a speck the texture
-    area-averaging didn't dilute).  Pulling just the outliers to the neighbourhood
-    median absorbs those while leaving everything else untouched — unlike an
-    unconditional median, genuine 1-voxel detail (a window row on a facade, trim
-    lines) survives.  `outlier_dist` is the RGB euclidean distance that counts as
-    "far" (~60 keeps window-vs-wall contrast but catches yellow-in-green specks).
+    TRELLIS textures carry baked lighting/AO/noise, so a surface a human reads as ONE
+    material is hundreds of slightly different shades; matched voxel-by-voxel they
+    straddle palette boundaries and come out as random near-miss block patches.
 
-    `occ` is the (N,3) integer voxel-index array aligned 1:1 with `colors`.
+    Stage A — global quantization: k-means in the palette's weighted-LAB match space
+    (L x L_WEIGHT, so cluster boundaries align with block boundaries), then close
+    centroids are agglomeratively merged.  The merge radius is spread-aware: two
+    clusters merge when their distance is under max(merge_de,
+    merge_spread_factor * (rms_spread_i + rms_spread_j)) capped at 2*merge_de —
+    k-means loves carving ONE noisy material into sub-clusters, and those betray
+    themselves by internal spread comparable to their separation, while genuinely
+    distinct materials are tight relative to their distance.  Global on purpose:
+    disconnected same-material surfaces (front and back wall) land in the same
+    cluster and therefore the same block.  Down-weighted L + the merge radius also
+    absorb baked shading gradients into the surface's one color.
+
+    Stage A2 — shadow → albedo repaint: a cast shadow baked into the texture (roof
+    overhang darkening a wall) forms its own near-neutral dark cluster; Minecraft
+    re-lights builds, so that's lighting, not material.  A cluster D qualifies when
+    it is near-neutral (C < shadow_chroma_max — genuine materials, even warm beige,
+    carry more chroma) and not true-black (L >= shadow_l_min, protecting window
+    frames/posts).  Shadows are LOCAL, so each connected COMPONENT of D picks its
+    own donor: the brighter chromatic cluster (L_B - L_D >= shadow_dl_min,
+    C_B >= donor_chroma_min) holding the largest share of the component's
+    brighter-neighbour boundary (>= shadow_contact_frac; contacts with darker
+    clusters say nothing about D's material, shadows grade into deeper shadow).
+    The component's voxels take the donor's centroid — the LIT albedo — so a wall
+    shadow rejoins the wall while a roof-edge shadow rejoins the roof.  If accepted
+    repaints sum past shadow_max_frac of the build, everything is skipped (misfire
+    guard: a legitimately dark/two-tone model, not a shadow).
+
+    Stage B — spatial coherence: connected components (26-conn) smaller than
+    max(min_region_floor, N/region_divisor) are absorbed into their most-adjacent
+    neighbouring cluster — unconditionally at size <= `absorb_always_size` (lone
+    specks), otherwise only when the two centroids sit within `absorb_de`, so small
+    genuine detail (a dark window on a light wall) survives.
+
+    Runs AFTER the photo-guided repairs (their calibration needs the raw per-voxel
+    variation) and only simplifies — it never re-judges hallucinations.  Fully
+    deterministic (fixed k-means rng, index-ordered tie-breaks): same GLB -> same
+    build.  Color-only; returns [(r,g,b)] parallel to `occ`, geometry untouched.
     """
-    if not colors or len(colors) < 3:
+    if not colors or len(colors) < 8:
         return colors
-    col = np.clip(np.asarray(colors, dtype=np.float64), 0, 255).astype(np.int16)
-    occ = np.asarray(occ)
-    index = {(int(x), int(y), int(z)): i for i, (x, y, z) in enumerate(occ)}
-    out = col.copy()
-    offs = [(dx, dy, dz)
-            for dx in (-1, 0, 1) for dy in (-1, 0, 1) for dz in (-1, 0, 1)
-            if (dx, dy, dz) != (0, 0, 0)]
-    for i, (x, y, z) in enumerate(occ):
-        neigh = [col[index[(x + dx, y + dy, z + dz)]]
-                 for dx, dy, dz in offs
-                 if (x + dx, y + dy, z + dz) in index]
-        if len(neigh) >= 3:                # enough support to trust the median
-            med = np.median(np.asarray(neigh), axis=0)
-            if float(np.linalg.norm(col[i] - med)) > outlier_dist:
-                out[i] = med
-    return [tuple(int(c) for c in rgb) for rgb in out]
+    import warnings
+    from scipy import ndimage
+    from block_palette import L_WEIGHT, _srgb_to_lab, _lab_to_srgb
+
+    col = np.clip(np.asarray(colors, dtype=np.float64), 0, 255)
+    labw = _srgb_to_lab(col)
+    labw[:, 0] *= L_WEIGHT
+
+    # ── Stage A: global quantization in weighted LAB ──────────────────────────
+    uniq, inv = np.unique(col, axis=0, return_inverse=True)
+    if len(uniq) <= k_init:                # tiny/flat builds: uniques ARE the clusters
+        cent = _srgb_to_lab(uniq)
+        cent[:, 0] *= L_WEIGHT
+        labels = inv.reshape(-1).astype(np.int64)
+    else:
+        from scipy.cluster.vq import kmeans2
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")     # empty-cluster warnings are handled below
+            cent, labels = kmeans2(labw, k_init, iter=20, minit="++", rng=0)
+        labels = labels.astype(np.int64)
+        keep = np.bincount(labels, minlength=len(cent)) > 0
+        cent = cent[keep]
+        labels = (np.cumsum(keep) - 1)[labels]
+    sizes = np.bincount(labels, minlength=len(cent)).astype(np.float64)
+    k_start = len(cent)
+
+    # Per-cluster scatter about the centroid, kept as sum-of-squares so merges can
+    # combine it exactly (parallel-axis theorem); rms spread = sqrt(ssq/size).
+    diffs = labw - cent[labels]
+    ssq = np.bincount(labels, weights=np.einsum("ij,ij->i", diffs, diffs),
+                      minlength=len(cent))
+
+    # Merge closest pair (relative to its threshold) until none qualifies.
+    cap = 2.0 * merge_de
+    while len(cent) > 1:
+        d = np.linalg.norm(cent[:, None, :] - cent[None, :, :], axis=2)
+        spread = np.sqrt(ssq / np.maximum(sizes, 1.0))
+        thr = np.clip(merge_spread_factor * (spread[:, None] + spread[None, :]),
+                      merge_de, cap)
+        ratio = d / thr
+        ratio[np.diag_indices(len(cent))] = np.inf
+        i, j = np.unravel_index(int(np.argmin(ratio)), ratio.shape)
+        if ratio[i, j] >= 1.0:
+            break
+        if i > j:
+            i, j = j, i                    # keep the lower index (determinism)
+        merged = (cent[i] * sizes[i] + cent[j] * sizes[j]) / (sizes[i] + sizes[j])
+        ssq[i] = (ssq[i] + sizes[i] * float(np.sum((cent[i] - merged) ** 2))
+                  + ssq[j] + sizes[j] * float(np.sum((cent[j] - merged) ** 2)))
+        cent[i] = merged
+        sizes[i] += sizes[j]
+        cent = np.delete(cent, j, axis=0)
+        sizes = np.delete(sizes, j)
+        ssq = np.delete(ssq, j)
+        labels = np.where(labels == j, i, labels)
+        labels = np.where(labels > j, labels - 1, labels)
+
+    occ_a = np.asarray(occ)
+    n_vox = len(occ_a)
+    min_region = max(min_region_floor, int(round(n_vox / region_divisor)))
+    struct = ndimage.generate_binary_structure(3, 3)   # 26-connectivity
+    X, Y, Z = grid_shape
+
+    def _sl(d, n):                         # (source, neighbour) slices for offset d
+        return (slice(0, n - d), slice(d, n)) if d >= 0 else (slice(-d, n), slice(0, n + d))
+
+    dbg = bool(os.environ.get("R2M_DEBUG"))
+
+    # ── Stage A2: shadow → albedo repaint (per connected shadow patch) ────────
+    K = len(cent)
+    if K >= 2:
+        Lu = cent[:, 0] / L_WEIGHT                   # unweighted lightness
+        Cc = np.linalg.norm(cent[:, 1:], axis=1)     # chroma
+        grid = np.full(grid_shape, -1, dtype=np.int64)
+        grid[occ_a[:, 0], occ_a[:, 1], occ_a[:, 2]] = labels
+        shadowy = np.where((Cc < shadow_chroma_max) & (Lu >= shadow_l_min))[0]
+        new_lab = labels.copy()
+        n_repaint = 0
+        for D in shadowy:
+            D = int(D)
+            donor_ok = (Lu - Lu[D] >= shadow_dl_min) & (Cc >= donor_chroma_min)
+            donor_ok[shadowy] = False                # shadow clusters can't donate
+            if not donor_ok.any():
+                continue
+            comp, n_comp = ndimage.label(grid == D, structure=struct)
+            if n_comp == 0:
+                continue
+            # Per component: contact counts with each neighbouring cluster.
+            pair_keys = []
+            for dx in (-1, 0, 1):
+                for dy in (-1, 0, 1):
+                    for dz in (-1, 0, 1):
+                        if (dx, dy, dz) == (0, 0, 0):
+                            continue
+                        (s0, t0), (s1, t1), (s2, t2) = (_sl(dx, X), _sl(dy, Y),
+                                                        _sl(dz, Z))
+                        a = comp[s0, s1, s2].ravel()     # component id (1..n_comp)
+                        b = grid[t0, t1, t2].ravel()     # neighbour cluster id
+                        m = (a > 0) & (b >= 0) & (b != D)
+                        if m.any():
+                            pair_keys.append((a[m] - 1) * K + b[m])
+            if not pair_keys:
+                continue
+            keys, counts = np.unique(np.concatenate(pair_keys), return_counts=True)
+            cids, ncl = keys // K, keys % K
+            brighter = Lu[ncl] > Lu[D]               # denominator: brighter contacts
+            bright_tot = np.bincount(cids[brighter], weights=counts[brighter],
+                                     minlength=n_comp)
+            ok = donor_ok[ncl]
+            # Best qualifying donor per component (max contact; ties -> low cluster).
+            order = np.lexsort((ncl[ok], -counts[ok], cids[ok]))
+            c_ok, n_ok, cnt_ok = cids[ok][order], ncl[ok][order], counts[ok][order]
+            first = np.ones(len(order), dtype=bool)
+            first[1:] = c_ok[1:] != c_ok[:-1]
+            tgt_comp, tgt_donor, tgt_cnt = c_ok[first], n_ok[first], cnt_ok[first]
+            frac = tgt_cnt / np.maximum(bright_tot[tgt_comp], 1)
+            take = frac >= shadow_contact_frac
+            if not take.any():
+                if dbg:
+                    print("[shadow] D#{} L={:.1f} C={:.1f}: no component passed "
+                          "contact {:.2f}".format(D, Lu[D], Cc[D],
+                                                  shadow_contact_frac))
+                continue
+            comp_to_donor = np.full(n_comp + 1, -1, dtype=np.int64)
+            comp_to_donor[tgt_comp[take] + 1] = tgt_donor[take]
+            vox_comp = comp[occ_a[:, 0], occ_a[:, 1], occ_a[:, 2]]
+            donor_lab = comp_to_donor[vox_comp]
+            upd = donor_lab >= 0
+            new_lab = np.where(upd, donor_lab, new_lab)
+            n_repaint += int(upd.sum())
+            if dbg:
+                for c, dn, fr in zip(tgt_comp[take], tgt_donor[take], frac[take]):
+                    print("[shadow] D#{} L={:.1f} C={:.1f} comp {} ({} vox) -> "
+                          "B#{} L={:.1f} C={:.1f} (contact {:.2f})".format(
+                              D, Lu[D], Cc[D], int(c) + 1,
+                              int((vox_comp == c + 1).sum()), int(dn),
+                              Lu[dn], Cc[dn], fr))
+        if n_repaint:
+            if n_repaint > shadow_max_frac * n_vox:
+                if dbg:
+                    print("[shadow] skipped: {:.0%} of voxels would repaint "
+                          "(> {:.0%} guard) — treating as real dark material".format(
+                              n_repaint / max(n_vox, 1), shadow_max_frac))
+            else:
+                labels = new_lab
+
+    # ── Stage B: absorb small spatial fragments ───────────────────────────────
+    absorbed = []
+    for _pass in range(2):
+        K = len(cent)
+        grid = np.full(grid_shape, -1, dtype=np.int64)
+        grid[occ_a[:, 0], occ_a[:, 1], occ_a[:, 2]] = labels
+
+        # Connected components per cluster, packed into one global component grid.
+        comp = np.full(grid_shape, -1, dtype=np.int64)
+        comp_cluster, comp_sizes, n_comp = [], [], 0
+        for k in range(K):
+            lab_k, n_k = ndimage.label(grid == k, structure=struct)
+            if n_k == 0:
+                continue
+            mask = lab_k > 0
+            comp[mask] = lab_k[mask] - 1 + n_comp
+            comp_sizes.extend(np.bincount(lab_k[mask])[1:].tolist())
+            comp_cluster.extend([k] * n_k)
+            n_comp += n_k
+        comp_sizes = np.asarray(comp_sizes, dtype=np.int64)
+        comp_cluster = np.asarray(comp_cluster, dtype=np.int64)
+        small = comp_sizes < min_region
+        if not small.any():
+            break
+
+        # (small component, adjacent other-cluster) contact counts over all 26 offsets.
+        pair_keys = []
+        for dx in (-1, 0, 1):
+            for dy in (-1, 0, 1):
+                for dz in (-1, 0, 1):
+                    if (dx, dy, dz) == (0, 0, 0):
+                        continue
+                    (s0, t0), (s1, t1), (s2, t2) = _sl(dx, X), _sl(dy, Y), _sl(dz, Z)
+                    a = comp[s0, s1, s2].ravel()
+                    b = grid[t0, t1, t2].ravel()
+                    m = (a >= 0) & (b >= 0)
+                    a, b = a[m], b[m]
+                    m = small[a] & (comp_cluster[a] != b)
+                    if m.any():
+                        pair_keys.append(a[m] * K + b[m])
+        if not pair_keys:
+            break
+        keys, counts = np.unique(np.concatenate(pair_keys), return_counts=True)
+        comp_ids, neigh = keys // K, keys % K
+        # Modal neighbour per component; ties -> lower cluster index (determinism).
+        order = np.lexsort((neigh, -counts, comp_ids))
+        first = np.ones(len(order), dtype=bool)
+        first[1:] = comp_ids[order][1:] != comp_ids[order][:-1]
+        tgt_comp, tgt_cluster = comp_ids[order][first], neigh[order][first]
+
+        # Absorb: lone specks always; bigger fragments only across a small color gap.
+        d_cent = np.linalg.norm(cent[comp_cluster[tgt_comp]] - cent[tgt_cluster], axis=1)
+        allow = (comp_sizes[tgt_comp] <= absorb_always_size) | (d_cent < absorb_de)
+        tgt_comp, tgt_cluster = tgt_comp[allow], tgt_cluster[allow]
+        if len(tgt_comp) == 0:
+            break
+        comp_to_new = np.full(n_comp, -1, dtype=np.int64)
+        comp_to_new[tgt_comp] = tgt_cluster
+        new_lab = comp_to_new[comp[occ_a[:, 0], occ_a[:, 1], occ_a[:, 2]]]
+        upd = new_lab >= 0
+        if not upd.any():
+            break
+        labels = np.where(upd, new_lab, labels)
+        absorbed.append(int(upd.sum()))
+
+    if os.environ.get("R2M_DEBUG"):
+        top = ", ".join("{}".format(int(s))
+                        for s in sorted(np.bincount(labels, minlength=len(cent)),
+                                        reverse=True)[:8])
+        print("[quantize] {} voxels: {} clusters -> {} after merge_de={} "
+              "(top sizes {}); min_region={}, absorbed/pass={}".format(
+                  n_vox, k_start, len(cent), merge_de, top, min_region,
+                  absorbed or [0]))
+
+    cent_lab = cent.copy()
+    cent_lab[:, 0] /= L_WEIGHT
+    cent_rgb = np.clip(np.rint(_lab_to_srgb(cent_lab)), 0, 255).astype(np.int64)
+    return [tuple(int(c) for c in cent_rgb[l]) for l in labels]
 
 
-def _smooth_materials(blocks, block_ids, max_de: float = 10.0):
-    """Post-match cleanup: a block adopts the majority block-id among its 6 face
-    neighbours, but only when that id's palette colour is within `max_de` of its own
-    (distance in the weighted-LAB match space).
+def _consolidate_block_ids(colors, block_ids, max_de: float = 10.0):
+    """Post-match cleanup: merge block ids of clusters that landed on near-identical
+    MATERIALS (distance in the weighted-LAB match space).
 
-    With a >100-block palette, two near-identical materials can alternate voxel-to-
-    voxel across a flat wall (stone/cobblestone patchwork).  Snapping within-tolerance
-    minorities to the local majority makes surfaces read as one material; the ΔE gate
-    guarantees a real colour boundary (window vs wall) is never crossed.
+    Quantization leaves only a handful of distinct colors, but two surviving clusters
+    can still match palette blocks that read as the same material (stone vs
+    cobblestone, ~4 apart) — a fake material boundary.  Working per unique color
+    (cheap: quantization guarantees few), the smaller cluster adopts the bigger
+    cluster's id whenever their MATCHED palette colors sit within `max_de`.  Global
+    and deterministic — same fix on every surface, unlike a per-voxel majority vote.
     """
-    from collections import Counter
+    if not colors or not block_ids:
+        return block_ids
     from block_palette import BLOCK_PALETTE, _match_space
 
-    lab = {bid: _match_space(np.asarray(rgb, dtype=np.float64))
-           for bid, rgb in BLOCK_PALETTE.items()}
-    index = {tuple(b): i for i, b in enumerate(blocks)}
-    offs = [(1, 0, 0), (-1, 0, 0), (0, 1, 0), (0, -1, 0), (0, 0, 1), (0, 0, -1)]
-    out = list(block_ids)
-    for i, (x, y, z) in enumerate(blocks):
-        me = block_ids[i]
-        neigh = [block_ids[index[(x + dx, y + dy, z + dz)]]
-                 for dx, dy, dz in offs if (x + dx, y + dy, z + dz) in index]
-        if len(neigh) < 3:
-            continue
-        top, n = Counter(neigh).most_common(1)[0]
-        if top == me or n < 3:               # need a clear local majority
-            continue
-        if me in lab and top in lab and \
-                float(np.linalg.norm(lab[me] - lab[top])) <= max_de:
-            out[i] = top
-    return out
+    col = np.clip(np.asarray(colors, dtype=np.float64), 0, 255)
+    uniq, first, inv, counts = np.unique(
+        col, axis=0, return_index=True, return_inverse=True, return_counts=True)
+    inv = inv.reshape(-1)
+    if len(uniq) <= 1:
+        return block_ids
+    final = [block_ids[i] for i in first]      # one id per unique color (same-color
+                                               # voxels always match the same block)
+    pal = {bid: _match_space(np.asarray(BLOCK_PALETTE[bid], dtype=np.float64))
+           for bid in set(final) if bid in BLOCK_PALETTE}
+    order = np.lexsort((np.arange(len(uniq)), -counts))   # biggest cluster first
+    for pos in range(1, len(order)):
+        i = int(order[pos])
+        for pos2 in range(pos):
+            j = int(order[pos2])
+            if final[i] == final[j]:
+                break
+            if final[i] in pal and final[j] in pal and \
+                    float(np.linalg.norm(pal[final[i]] - pal[final[j]])) <= max_de:
+                final[i] = final[j]
+                break
+    return [final[u] for u in inv]
 
 
 def _voxelize_surface_sat(verts, faces):
@@ -1091,72 +1368,9 @@ def _clean_voxels(solid, close: bool = True, despur: bool = False):
     return out
 
 
-def _mirror_brighter_half(solid, cgrid, axis):
-    """Overwrite the darker half of `solid`/`cgrid` with the mirror of the brighter half
-    across the grid centre on `axis`.  The observed (front/lit) half is brighter, so this
-    copies its shape + color onto the unobserved side, fixing one-sided lumps and dark backs.
-    """
-    n = solid.shape[axis]
-    mid = n // 2
-    bright = cgrid.max(axis=3)
-    lo_sum = float(bright.take(range(0, mid), axis=axis).sum())
-    hi_sum = float(bright.take(range(n - mid, n), axis=axis).sum())
-    sol_m = np.flip(solid, axis=axis)
-    cg_m = np.flip(cgrid, axis=axis)
-    idx = np.arange(n)
-    sel = (idx >= n - mid) if lo_sum >= hi_sum else (idx < mid)   # the darker half
-    shape = [1, 1, 1]; shape[axis] = n
-    selm = np.broadcast_to(sel.reshape(shape), solid.shape)
-    out_sol = np.where(selm, sol_m, solid)
-    out_cg = np.where(selm[..., None], cg_m, cgrid)
-    return out_sol, out_cg
-
-
-def _enforce_symmetry(solid, occ, colors, force: bool = False):
-    """Make a build symmetric by mirroring its observed (brighter) half onto the other side.
-
-    The axis to mirror is the one with the largest FRONT/BACK BRIGHTNESS imbalance — that
-    is the observed-vs-unobserved split (e.g. a tower's bright front vs dark back), which is
-    exactly where TRELLIS leaves lumps/dark colour and where mirroring helps.  (Picking the
-    most-self-similar axis instead, as before, often mirrored the wrong plane and left the
-    dark-back seam.)  If both horizontal axes are clearly imbalanced it's radial -> mirror
-    both.  Mirrors occupancy AND per-voxel colour brighter->darker.  Unless `force`, skips
-    when neither axis is meaningfully imbalanced (nothing to repair).
-
-    Returns (new_solid, new_occ, new_colors).
-    """
-    occ = np.asarray(occ)
-    cols = np.clip(np.asarray(colors, dtype=np.float64), 0, 255).astype(np.int16)
-    cgrid = np.zeros(solid.shape + (3,), dtype=np.int16)
-    cgrid[occ[:, 0], occ[:, 1], occ[:, 2]] = cols
-    lum = cols @ np.array([0.299, 0.587, 0.114])
-
-    def imbalance(ax):
-        n = solid.shape[ax]; mid = n // 2
-        m = occ[:, ax]
-        lo, hi = lum[m < mid], lum[m >= n - mid]
-        return abs(float(lo.mean()) - float(hi.mean())) if len(lo) and len(hi) else 0.0
-
-    bx, bz = imbalance(0), imbalance(2)
-    if max(bx, bz) < 5.0 and not force:
-        return solid, occ, colors                 # already balanced -> nothing to repair
-    ranked = sorted([(bx, 0), (bz, 2)], reverse=True)
-    axes = [ranked[0][1]]
-    if ranked[1][0] >= 8.0:                        # both axes imbalanced -> radial
-        axes.append(ranked[1][1])
-
-    for ax in axes:
-        solid, cgrid = _mirror_brighter_half(solid, cgrid, ax)
-
-    occ2 = np.argwhere(solid)
-    colors2 = [tuple(int(v) for v in cgrid[x, y, z]) for x, y, z in occ2]
-    return solid, occ2, colors2
-
-
 def voxelize_mesh(norm_path: Path, norm_info: dict,
                   target_blocks: int = 48,
                   match_palette: bool = True,
-                  symmetry_mode: str = "off",
                   image_path: Path | None = None) -> dict:
     """Load normalized OBJ, repair, scale to Minecraft size, voxelize solid.
 
@@ -1251,13 +1465,7 @@ def voxelize_mesh(norm_path: Path, norm_info: dict,
         if colors is not None:
             color_source = "vertex"
 
-    # 3a. Symmetry repair (user opt-in): mirror the cleaner (observed) half across the
-    # detected vertical plane — removes one-sided lumps/floating blocks and backfills
-    # the unobserved side with the front's real shape + color.
-    if colors and symmetry_mode == "force":
-        solid, occ, colors = _enforce_symmetry(solid, occ, colors, force=True)
-
-    # Block coords/dims from the (possibly symmetrized) occupancy, shifted to origin 0.
+    # Block coords/dims from the occupancy, shifted to origin 0.
     bx, by, bz = occ[:, 0].copy(), occ[:, 1].copy(), occ[:, 2].copy()
     bx -= bx.min(); by -= by.min(); bz -= bz.min()
     blocks = list(zip(bx.tolist(), by.tolist(), bz.tolist()))
@@ -1286,9 +1494,10 @@ def voxelize_mesh(norm_path: Path, norm_info: dict,
         colors = _repair_unsupported_colors(occ, colors, photo_lab)
         colors = _snap_suspect_hues(colors, photo_lab)
 
-    # 3e. Spatial denoise: median-filter colors over each voxel's neighbourhood so lone
-    # off-colour specks (e.g. yellow in green foliage) are absorbed before matching.
-    colors = _denoise_colors(occ, colors)
+    # 3e. Region quantization: collapse the noisy per-voxel colors (baked lighting/AO/
+    # texture noise) into a few flat color regions so matching can't turn one wall
+    # into random near-miss materials; small spatial fragments are absorbed too.
+    colors = _quantize_colors(occ, colors, solid.shape)
 
     # 4. Map each block's sampled color to the nearest real Minecraft block (LAB),
     # matching every voxel independently against the full palette (no per-object presets).
@@ -1296,9 +1505,10 @@ def voxelize_mesh(norm_path: Path, norm_info: dict,
     if match_palette and colors:
         import block_palette
         block_ids = block_palette.match_blocks(colors)
-        # 4b. Material coherence: merge near-identical materials that alternate across
-        # a flat surface into the local majority (never crosses a real colour boundary).
-        block_ids = _smooth_materials(blocks, block_ids)
+        # 4b. Material coherence: quantized clusters can still land on near-identical
+        # palette blocks (stone vs cobblestone); merge those ids globally so a fake
+        # material boundary never appears.
+        block_ids = _consolidate_block_ids(colors, block_ids)
     else:
         block_ids = ["minecraft:stone"] * len(blocks)
 
@@ -1532,7 +1742,6 @@ class App:
         # Voxel settings (exposed in the UI).
         self.res_var = tk.IntVar(value=48)      # target longest-axis size in blocks
         self.palette_var = tk.BooleanVar(value=True)          # match blocks vs stone-only
-        self.symmetry_var = tk.StringVar(value="Off")         # Off | Force symmetric
 
         self._build_ui()
 
@@ -1618,17 +1827,6 @@ class App:
             activebackground="#161b22", activeforeground="#c9d1d9",
             font=("Segoe UI", 8), anchor="w",
         ).pack(fill=tk.X, pady=(2, 0))
-
-        # Symmetry: Force = always mirror the observed half; Off = never.
-        sym_row = tk.Frame(settings, bg="#161b22")
-        sym_row.pack(fill=tk.X, pady=(4, 0))
-        tk.Label(
-            sym_row, text="Symmetry:", bg="#161b22", fg="#8b949e", font=("Segoe UI", 8),
-        ).pack(side=tk.LEFT)
-        ttk.Combobox(
-            sym_row, textvariable=self.symmetry_var, state="readonly", width=14,
-            values=["Force symmetric", "Off"],
-        ).pack(side=tk.LEFT, padx=(6, 0))
 
         self.export_btn = tk.Button(
             btn_frame, text="💾  Export .schem",
@@ -1728,9 +1926,6 @@ class App:
         # Snapshot settings on the main thread so the worker doesn't touch tk vars.
         self._build_target_blocks = int(self.res_var.get())
         self._build_match_palette = bool(self.palette_var.get())
-        self._build_symmetry_mode = {
-            "Force symmetric": "force", "Off": "off",
-        }.get(self.symmetry_var.get(), "off")
         self.is_generating = True
         self.build_btn.config(state=tk.DISABLED, text="Working...")
         self.export_btn.config(state=tk.DISABLED)
@@ -1744,9 +1939,9 @@ class App:
     def _run_pipeline(self):
         try:
             self._set_status("Generating mesh via TRELLIS ({})...".format(TRELLIS_API_URL))
-            obj_path = _generate_best_candidate(self.image_path,
-                                                status_cb=self._set_status,
-                                                preview_cb=self._show_cutout_preview)
+            obj_path = _generate_mesh(self.image_path,
+                                      status_cb=self._set_status,
+                                      preview_cb=self._show_cutout_preview)
             if obj_path is None or not obj_path.exists():
                 raise FileNotFoundError("TRELLIS produced no mesh under outputs/.")
 
@@ -1765,7 +1960,6 @@ class App:
                 norm_path, norm_info,
                 target_blocks=self._build_target_blocks,
                 match_palette=self._build_match_palette,
-                symmetry_mode=self._build_symmetry_mode,
                 image_path=ref_image,
             )
             self.root.after(0, self._on_build_done, voxel_data)
@@ -1791,7 +1985,7 @@ class App:
         # pyvista/VTK isn't available or errors out.
         try:
             from voxel_view import show_voxel_pyvista
-            show_voxel_pyvista(voxel_data)
+            show_voxel_pyvista(voxel_data, mesh_info=self.norm_info)
         except Exception as exc:
             self._set_status("Textured viewer unavailable ({}); using basic preview".format(
                 str(exc)[:60]))

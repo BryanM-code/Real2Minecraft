@@ -86,7 +86,6 @@ def main():
         voxel_data = voxelize_mesh(norm_path, norm_info,
                                    target_blocks=TARGET_BLOCKS,
                                    match_palette=True,
-                                   symmetry_mode="off",
                                    image_path=photo)
         dt = time.time() - t0
         png = out_dir / (glb.stem + ".png")

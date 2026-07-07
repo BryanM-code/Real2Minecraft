@@ -7,6 +7,9 @@ face is UV-mapped into a single texture atlas, edges are drawn so it reads as a 
 blocky build, and the atlas uses nearest-neighbour sampling for the pixelated look.
 
 `show_voxel_pyvista(voxel_data)` blocks until the window closes (like plt.show()).
+When `mesh_info` (the dict from normalize_mesh) is passed, the window splits into two
+linked views: the normalized TRELLIS mesh on the left, the voxel build on the right —
+so hallucinated texture clumps can be traced back to the source mesh.
 Falls back to the matplotlib renderer if pyvista isn't available.
 """
 
@@ -52,7 +55,35 @@ def _build_polydata(blocks, block_ids, uv_map):
             np.asarray(uvs, dtype=float))
 
 
-def show_voxel_pyvista(voxel_data: dict):
+def _add_source_mesh(pl, mesh_info, scale):
+    """Add the normalized TRELLIS mesh to the active subplot in voxel-world coords.
+
+    Same axis mapping as _build_polydata (mesh (X, Y-up, Z) -> world (X, Z, Y)) and
+    scaled by the voxel scale_factor, with the min corner at the origin — so it sits
+    in the voxel build's frame and linked cameras show matching orientation/size.
+    Textured when UV + image are present, plain light-gray surface otherwise.
+    """
+    import pyvista as pv
+
+    v = np.asarray(mesh_info["tex_verts"], dtype=float) * scale
+    v = v[:, [0, 2, 1]]                    # world Z is height, like the voxel points
+    v -= v.min(axis=0)                     # min corner -> block (0,0,0)
+    f = np.asarray(mesh_info["tex_faces"], dtype=np.int64)
+    faces = np.column_stack([np.full(len(f), 3, dtype=np.int64), f]).ravel()
+    mesh = pv.PolyData(v, faces)
+
+    uv, img = mesh_info.get("tex_uv"), mesh_info.get("tex_image")
+    if uv is not None and img is not None:
+        mesh.active_texture_coordinates = np.asarray(uv, dtype=float)
+        pl.add_mesh(mesh, texture=pv.Texture(np.ascontiguousarray(img)),
+                    lighting=True, ambient=0.45, diffuse=0.65, specular=0.0,
+                    culling=False)         # axis swap flips winding; never cull
+    else:
+        pl.add_mesh(mesh, color="lightgray", lighting=True,
+                    ambient=0.45, diffuse=0.65, specular=0.0, culling=False)
+
+
+def show_voxel_pyvista(voxel_data: dict, mesh_info: dict | None = None):
     """Render the voxel build as textured cubes in an interactive pyvista window."""
     import pyvista as pv
     from block_textures import build_atlas
@@ -84,7 +115,20 @@ def show_voxel_pyvista(voxel_data: dict):
             pass
 
     W, H, L = voxel_data["dims"]
-    pl = pv.Plotter(title="Real2Minecraft — voxel build")
+    have_mesh = (mesh_info is not None
+                 and mesh_info.get("tex_verts") is not None
+                 and mesh_info.get("tex_faces") is not None
+                 and len(mesh_info["tex_faces"]) > 0)
+    if have_mesh:
+        pl = pv.Plotter(shape=(1, 2), window_size=(1500, 750),
+                        title="Real2Minecraft — TRELLIS mesh vs voxel build")
+        pl.subplot(0, 0)
+        pl.set_background("white")
+        _add_source_mesh(pl, mesh_info, float(voxel_data.get("scale_factor") or 1.0))
+        pl.add_text("TRELLIS mesh (normalized)", font_size=11, color="black")
+        pl.subplot(0, 1)
+    else:
+        pl = pv.Plotter(title="Real2Minecraft — voxel build")
     pl.set_background("white")
     actor = pl.add_mesh(
         mesh, texture=tex,
@@ -112,6 +156,8 @@ def show_voxel_pyvista(voxel_data: dict):
         font_size=11, color="black",
     )
     pl.add_axes()
+    if have_mesh:
+        pl.link_views()
     pl.view_isometric()
     pl.camera.azimuth = 30
 
