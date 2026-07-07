@@ -19,7 +19,9 @@ from pathlib import Path
 
 import numpy as np
 
-from app import OUTPUTS_DIR, normalize_mesh, voxelize_mesh
+from config import OUTPUTS_DIR
+from mesh_normalize import normalize_mesh
+from voxelize import voxelize_mesh
 
 TARGET_BLOCKS = 48          # match the UI default so renders are comparable to the reports
 
@@ -85,7 +87,6 @@ def main():
         norm_path, norm_info = normalize_mesh(glb)
         voxel_data = voxelize_mesh(norm_path, norm_info,
                                    target_blocks=TARGET_BLOCKS,
-                                   match_palette=True,
                                    image_path=photo)
         dt = time.time() - t0
         png = out_dir / (glb.stem + ".png")
