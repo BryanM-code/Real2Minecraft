@@ -2,17 +2,20 @@
 
 `voxelize_mesh` is the pipeline orchestrator: SAT surface rasterization, exterior
 flood fill, cleanup, per-voxel color sampling (voxel_sampling), the color pipeline
-(color_repair + color_quantize, gated by `color_repair`), and palette matching.
+(color_repair + color_quantize, gated by `color_repair`), palette matching, and
+partial-block shape classification (block_shapes).
 """
 
+import os
 from pathlib import Path
 
 import numpy as np
 import trimesh
 
+import block_shapes
 from voxel_sampling import _sample_voxel_colors_texture, _sample_voxel_colors
 from color_repair import (_photo_reference_lab, _inpaint_dark_voxels,
-                          _normalize_tone, _fill_unobserved_colors,
+                          _normalize_tone, _lift_shadows, _fill_unobserved_colors,
                           _repair_unsupported_colors, _snap_suspect_hues)
 from color_quantize import _quantize_colors, _consolidate_block_ids
 
@@ -145,6 +148,7 @@ def _clean_voxels(solid, close: bool = True, despur: bool = False):
 def voxelize_mesh(norm_path: Path, norm_info: dict,
                   target_blocks: int = 48,
                   color_repair: bool = True,
+                  partial_shapes: bool = True,
                   image_path: Path | None = None) -> dict:
     """Load normalized OBJ, repair, scale to Minecraft size, voxelize solid.
 
@@ -162,10 +166,16 @@ def voxelize_mesh(norm_path: Path, norm_info: dict,
     to real Minecraft blocks is ALWAYS on; the all-stone fallback only covers meshes
     that carry no color at all.
 
+    `partial_shapes` (default True): after matching, classify each voxel's sub-cell
+    geometry into full cube / slab / stairs (block_shapes) and encode the choice as a
+    block-state string on the id.  Materials without a Minecraft variant swap to the
+    closest one that has (block_shapes.SWAP_MAX_DE); shapes never add or remove voxels.
+
     Returns dict:
       blocks       - list of (x, y, z) int tuples, all >= 0
       colors       - list of (r,g,b) ints parallel to blocks, or None
-      block_ids    - list of minecraft block ids parallel to blocks
+      block_ids    - list of minecraft block ids parallel to blocks (may carry [state])
+      shapes       - list of block_shapes codes parallel to blocks, or None
       block_type   - 'stone' (legacy field, kept for compatibility)
       dims         - (W, H, L) bounding box in blocks
       block_count  - number of occupied blocks
@@ -202,7 +212,8 @@ def voxelize_mesh(norm_path: Path, norm_info: dict,
 
     # 1. Gap-free surface shell via conservative SAT rasterization.
     scaled_verts = np.asarray(mesh.vertices, dtype=np.float64)
-    surf, origin = _voxelize_surface_sat(scaled_verts, np.asarray(mesh.faces, dtype=np.int64))
+    faces_arr = np.asarray(mesh.faces, dtype=np.int64)
+    surf, origin = _voxelize_surface_sat(scaled_verts, faces_arr)
 
     # 2. Exterior flood fill: pad so the model is surrounded by air, label the
     # empty space (6-connectivity so 1-voxel diagonal gaps don't leak), then mark
@@ -219,8 +230,43 @@ def voxelize_mesh(norm_path: Path, norm_info: dict,
         solid = cleaned
 
     occ = np.argwhere(solid)              # (N,3) int voxel indices
-    if len(occ) == 0:                     # degenerate mesh — fall back to the shell
+    degenerate = len(occ) == 0
+    if degenerate:                        # degenerate mesh — fall back to the shell
         occ = np.argwhere(surf)
+
+    # 2c. Partial-block shapes: voxelize AGAIN at a finer pitch so each coarse voxel has
+    # sub-cell occupancy (8 octants), then classify full cube / slab / stairs.  Skipped
+    # on the degenerate shell path (no solid interior to classify against).  A memory
+    # gate drops the fine scale (4 -> 2 -> off) so large targets never blow up.
+    shapes = None
+    if partial_shapes and not degenerate:
+        scale = int(os.environ.get("R2M_PARTIAL_SCALE", "4"))
+        extent = scaled_verts.max(axis=0) - scaled_verts.min(axis=0)
+
+        def _fine_cells(s):
+            return float(np.prod(np.floor(extent * s) + 3))
+
+        while scale > 1 and _fine_cells(scale) > 40e6:
+            scale //= 2
+        if scale >= 2 and _fine_cells(scale) <= 40e6:
+            fine_surf, sat_origin = _voxelize_surface_sat(scaled_verts * scale, faces_arr)
+            # Embed into a grid aligned to the coarse box (origin*scale, shape*scale) so
+            # every coarse voxel gets exactly scale^3 fine cells — otherwise the +X/+Z
+            # boundary voxels get truncated fine coverage and misclassify.
+            fine_origin = np.asarray(origin, dtype=np.int64) * scale
+            aligned = np.zeros(tuple(int(d) * scale for d in solid.shape), dtype=bool)
+            off = (np.asarray(sat_origin, dtype=np.int64) - fine_origin)
+            end = np.minimum(off + np.asarray(fine_surf.shape), np.asarray(aligned.shape))
+            dst = tuple(slice(int(off[i]), int(end[i])) for i in range(3))
+            src = tuple(slice(0, int(end[i] - off[i])) for i in range(3))
+            aligned[dst] = fine_surf[src]
+            fpad = np.pad(aligned, 2)
+            flabels, _ = ndimage.label(~fpad)
+            fine_solid = (~(flabels == flabels[0, 0, 0]))[2:-2, 2:-2, 2:-2]
+            shapes = block_shapes.classify_shapes(
+                occ, solid, fine_solid, fine_origin, origin, scale)
+            if shapes is None and os.environ.get("R2M_DEBUG"):
+                print("[shapes] fine-flood leak guard tripped -> all full cubes")
 
     # 3. Color each voxel from the mesh surface.  Prefer sampling the TRELLIS texture
     # directly (keeps its full resolution); fall back to baked per-vertex colors for
@@ -284,6 +330,11 @@ def voxelize_mesh(norm_path: Path, norm_info: dict,
         # absorbed too.
         colors = _quantize_colors(occ, colors, solid.shape)
 
+    # 3f. Shadow lift: brighten dark regions (TRELLIS bakes dark) so they match mid-tone
+    # blocks instead of near-black.  Runs LAST, after any repairs/quantization, so it only
+    # affects block choice — not the calibrated photo comparisons.  Both color modes.
+    colors = _lift_shadows(colors)
+
     # 4. Map each block's sampled color to the nearest real Minecraft block (LAB),
     # matching every voxel independently against the full palette (no per-object
     # presets).  Always on; all-stone only when the mesh carried no color at all.
@@ -299,10 +350,17 @@ def voxelize_mesh(norm_path: Path, norm_info: dict,
     else:
         block_ids = ["minecraft:stone"] * len(blocks)
 
+    # 5. Partial-block shapes: rewrite ids into [state] strings (slab/stairs) and swap
+    # materials that lack a variant.  Runs AFTER _consolidate_block_ids so state strings
+    # are never merged; covers Enhanced, Raw, and the no-color branch alike.
+    if shapes is not None:
+        block_ids, shapes = block_shapes.apply_shapes(block_ids, colors, shapes)
+
     return {
         "blocks":       blocks,
         "colors":       colors,
         "block_ids":    block_ids,
+        "shapes":       (shapes.tolist() if shapes is not None else None),
         "block_type":   "stone",
         "dims":         (W_v, H_v, L_v),
         "block_count":  len(blocks),

@@ -35,7 +35,8 @@ def render_screenshot(voxel_data: dict, out_png: Path):
     blocks = [tuple(b) for b in voxel_data["blocks"]]
     block_ids = voxel_data.get("block_ids") or ["minecraft:stone"] * len(blocks)
     atlas, uv_map = build_atlas(block_ids)
-    pts, faces, tcoords = _build_polydata(blocks, block_ids, uv_map)
+    pts, faces, tcoords = _build_polydata(blocks, block_ids, uv_map,
+                                          voxel_data.get("shapes"))
     if len(pts) == 0:
         return
 
