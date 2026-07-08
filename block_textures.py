@@ -108,7 +108,13 @@ def _generate_tile(block_id: str):
 
 
 def get_tile(block_id: str) -> np.ndarray:
-    """16x16x3 uint8 tile: from textures/blocks/<name>.png if present, else generated."""
+    """16x16x3 uint8 tile: from textures/blocks/<name>.png if present, else generated.
+
+    A partial-block id (`oak_stairs[facing=east,half=bottom]`) is normalized to its base
+    palette id first, so slabs/stairs render as their parent material's tile.
+    """
+    from block_shapes import base_block
+    block_id = base_block(block_id)
     png = TEX_DIR / (block_id.split(":", 1)[-1] + ".png")
     if png.exists():
         try:

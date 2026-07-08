@@ -398,3 +398,35 @@ def _normalize_tone(colors, hi_pct: float = 98.0, target_hi: int = 235,
     g = np.minimum(gain, safe_gain)[:, None]
     out = np.clip(col * g, 0, 255)         # clip is now a no-op safety net; hue preserved
     return [tuple(int(c) for c in rgb) for rgb in out]
+
+
+def _lift_shadows(colors, gamma=None):
+    """Brighten dark regions before block matching so they match mid-tone blocks.
+
+    TRELLIS bakes dark, so shadowed/unlit voxels land on near-black blocks even when the
+    material is a dark brown or grey.  A luminance gamma lift (gamma < 1) raises the darks
+    far more than the highlights, pulling them into the palette's richer mid-tone range.
+    Hue-preserving via the same brightest-channel cap as _normalize_tone (no channel
+    clips, so a dark brown stays brown, just lighter).
+
+    Runs LAST, right before matching — after the Enhanced-mode photo repairs — so it only
+    changes block choice, never the calibrated photo comparisons.  `gamma` defaults to
+    R2M_SHADOW_GAMMA (1.0 = off, lower = stronger lift).
+    """
+    if not colors:
+        return colors
+    if gamma is None:
+        gamma = float(os.environ.get("R2M_SHADOW_GAMMA", "0.85"))
+    if gamma >= 0.999:
+        return colors                      # off
+    col = np.asarray(colors, dtype=float)
+    lum = col @ np.array([0.299, 0.587, 0.114])
+    tgt = 255.0 * np.power(np.clip(lum / 255.0, 0.0, 1.0), gamma)
+    lift = np.ones_like(lum)
+    nz = lum > 1.0
+    lift[nz] = tgt[nz] / lum[nz]
+    chan_max = col.max(axis=1)             # cap so the brightest channel never clips (hue kept)
+    cap = np.divide(255.0, chan_max, out=np.full_like(chan_max, np.inf), where=chan_max > 0)
+    lift = np.minimum(lift, cap)[:, None]
+    out = np.clip(col * lift, 0, 255)
+    return [tuple(int(c) for c in rgb) for rgb in out]

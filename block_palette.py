@@ -227,3 +227,30 @@ def match_blocks(colors_rgb) -> list[str]:
     q = _match_space(np.asarray(colors_rgb, dtype=np.float64).reshape(-1, 3))
     _, idx = tree.query(q)
     return [ids[i] for i in np.atleast_1d(idx)]
+
+
+# Weighted-LAB KD-trees over palette SUBSETS (e.g. slab/stairs-capable blocks), cached
+# by the frozenset of allowed ids.
+_RESTRICTED_TREES: dict = {}
+
+
+def match_blocks_restricted(colors_rgb, allowed_ids):
+    """Nearest palette match among `allowed_ids` only; returns (ids, distances).
+
+    Same weighted-LAB space as match_blocks.  Used by block_shapes to swap a voxel whose
+    matched material has no slab/stairs variant to the closest one that does, gated on the
+    returned distance.  The (ids, cKDTree) is cached per allowed-id set.
+    """
+    key = frozenset(allowed_ids)
+    cached = _RESTRICTED_TREES.get(key)
+    if cached is None:
+        from scipy.spatial import cKDTree
+        ids = [k for k in allowed_ids if k in BLOCK_PALETTE]
+        lab = _match_space(np.array([BLOCK_PALETTE[k] for k in ids], dtype=np.float64))
+        cached = (ids, cKDTree(lab))
+        _RESTRICTED_TREES[key] = cached
+    ids, tree = cached
+    q = _match_space(np.asarray(colors_rgb, dtype=np.float64).reshape(-1, 3))
+    dist, idx = tree.query(q)
+    idx = np.atleast_1d(idx)
+    return [ids[i] for i in idx], np.atleast_1d(dist)

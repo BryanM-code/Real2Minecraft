@@ -33,26 +33,45 @@ _FACES = [
 _FACE_UV = [(0, 0), (1, 0), (1, 1), (0, 1)]   # corner -> (u-pick, v-pick) within tile rect
 
 
-def _build_polydata(blocks, block_ids, uv_map):
-    """Return (points, quad_faces, tcoords) for the exposed faces of all blocks."""
-    bset = set(blocks)
+def _build_polydata(blocks, block_ids, uv_map, shapes=None):
+    """Return (points, quad_faces, tcoords) for the exposed faces of all blocks.
+
+    `shapes` (parallel block_shapes codes, or None = all full cubes) makes each block
+    render as its full/slab/stairs geometry.  Face culling only hides a face when the
+    neighbour is a FULL cube, so a full cube next to a slab/stair keeps its shared face
+    (no holes); partial blocks emit all their box faces (backface culling is off).
+    """
+    from block_shapes import SHAPE_FULL, _SHAPE_BOXES
+
+    if shapes is None:
+        shapes = [SHAPE_FULL] * len(blocks)
+    # Only FULL cubes hide a neighbour's shared face.
+    full_set = {b for b, s in zip(blocks, shapes) if s == SHAPE_FULL}
+
     pts, faces, uvs = [], [], []
     n = 0
-    for (x, y, z), bid in zip(blocks, block_ids):
+    for (x, y, z), bid, shape in zip(blocks, block_ids, shapes):
         rect = uv_map.get(bid)
         if rect is None:
             continue
         u0, v0, u1, v1 = rect
-        for (dx, dy, dz), corners in _FACES:
-            if (x + dx, y + dy, z + dz) in bset:
-                continue                                  # neighbour present -> hidden
-            for (a, b, c) in corners:
-                # corner offset (a,b,c) on world cell at (X, Z, Y)
-                pts.append((x + a, z + b, y + c))
-            for (pu, pv) in _FACE_UV:
-                uvs.append((u1 if pu else u0, v1 if pv else v0))
-            faces.append((4, n, n + 1, n + 2, n + 3))
-            n += 4
+        is_full = shape == SHAPE_FULL
+        for box in _SHAPE_BOXES[shape]:
+            x0, x1, y0, y1, z0, z1 = box
+            for (dx, dy, dz), corners in _FACES:
+                # Full cubes cull a face against a full-cube neighbour; partial boxes
+                # always emit every face.
+                if is_full and (x + dx, y + dy, z + dz) in full_set:
+                    continue
+                for (a, b, c) in corners:
+                    # corner flags (a,b,c) select this box's fractions on (X, Z, Y=height)
+                    pts.append((x + (x1 if a else x0),
+                                z + (z1 if b else z0),
+                                y + (y1 if c else y0)))
+                for (pu, pv) in _FACE_UV:
+                    uvs.append((u1 if pu else u0, v1 if pv else v0))
+                faces.append((4, n, n + 1, n + 2, n + 3))
+                n += 4
     return (np.asarray(pts, dtype=float),
             np.asarray(faces, dtype=np.int64).ravel(),
             np.asarray(uvs, dtype=float))
@@ -98,7 +117,8 @@ def show_voxel_pyvista(voxel_data: dict, mesh_info: dict | None = None):
     blocks = [tuple(b) for b in blocks]
 
     atlas, uv_map = build_atlas(block_ids)
-    pts, faces, tcoords = _build_polydata(blocks, block_ids, uv_map)
+    pts, faces, tcoords = _build_polydata(blocks, block_ids, uv_map,
+                                          voxel_data.get("shapes"))
     if len(pts) == 0:
         return
 
@@ -251,8 +271,10 @@ def show_voxel_diagnostic(voxel_data: dict):
     if block_ids:
         try:
             from block_palette import BLOCK_PALETTE
+            from block_shapes import base_block
             palette_rgb = np.array(
-                [BLOCK_PALETTE.get(b, (128, 128, 128)) for b in block_ids], dtype=float
+                [BLOCK_PALETTE.get(base_block(b), (128, 128, 128)) for b in block_ids],
+                dtype=float,
             )
         except Exception:
             palette_rgb = None
