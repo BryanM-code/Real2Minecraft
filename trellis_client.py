@@ -198,4 +198,21 @@ def _generate_mesh(image_path: Path, status_cb=None, preview_cb=None) -> Path:
     seed = random.randrange(1, 2**31 - 1)
     if status_cb:
         status_cb("TRELLIS generating (seed {})...".format(seed))
-    return _run_trellis_api(source, seed=seed, out_path=out_dir / (stem + ".glb"))
+    out_path = _run_trellis_api(source, seed=seed, out_path=out_dir / (stem + ".glb"))
+
+    # Sidecar generation record: building mode's dataset manifests need the seed and
+    # settings that produced a GLB (the GLB is the determinism boundary — everything
+    # downstream is reproducible from it, but the generation itself is not).
+    try:
+        import json
+        meta = {"seed": seed,
+                "sampling_steps": TRELLIS_SAMPLING_STEPS,
+                "mesh_simplify": TRELLIS_MESH_SIMPLIFY,
+                "texture_size": TRELLIS_TEXTURE_SIZE,
+                "rembg_model": R2M_REMBG_MODEL if cutout is not None else None,
+                "url": TRELLIS_API_URL}
+        (out_dir / (stem + "_meta.json")).write_text(
+            json.dumps(meta, sort_keys=True, indent=1), encoding="utf-8")
+    except Exception:
+        pass
+    return out_path

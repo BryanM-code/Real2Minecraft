@@ -229,6 +229,23 @@ def match_blocks(colors_rgb) -> list[str]:
     return [ids[i] for i in np.atleast_1d(idx)]
 
 
+# Auxiliary palette: blocks matchable ONLY through match_blocks_restricted (building
+# mode's window cells).  Deliberately NOT in BLOCK_PALETTE — the global KD-tree never
+# sees these, so glass can never steal white-wall voxels (the reason it was removed
+# from the main palette in the first place).
+AUX_PALETTE: dict[str, tuple[int, int, int]] = {
+    "minecraft:glass":                    (200, 213, 216),
+    "minecraft:white_stained_glass":      (232, 235, 236),
+    "minecraft:light_gray_stained_glass": (144, 144, 144),
+    "minecraft:gray_stained_glass":       (74, 74, 74),
+    "minecraft:black_stained_glass":      (24, 24, 24),
+    "minecraft:light_blue_stained_glass": (94, 168, 216),
+    "minecraft:blue_stained_glass":       (51, 76, 178),
+    "minecraft:cyan_stained_glass":       (76, 127, 153),
+    "minecraft:tinted_glass":             (44, 38, 46),
+}
+
+
 # Weighted-LAB KD-trees over palette SUBSETS (e.g. slab/stairs-capable blocks), cached
 # by the frozenset of allowed ids.
 _RESTRICTED_TREES: dict = {}
@@ -238,15 +255,18 @@ def match_blocks_restricted(colors_rgb, allowed_ids):
     """Nearest palette match among `allowed_ids` only; returns (ids, distances).
 
     Same weighted-LAB space as match_blocks.  Used by block_shapes to swap a voxel whose
-    matched material has no slab/stairs variant to the closest one that does, gated on the
-    returned distance.  The (ids, cKDTree) is cached per allowed-id set.
+    matched material has no slab/stairs variant to the closest one that does, and by
+    building mode to match window cells against the AUX_PALETTE glasses.  Ids resolve
+    against BLOCK_PALETTE first, then AUX_PALETTE; the (ids, cKDTree) is cached per
+    allowed-id set.
     """
     key = frozenset(allowed_ids)
     cached = _RESTRICTED_TREES.get(key)
     if cached is None:
         from scipy.spatial import cKDTree
-        ids = [k for k in allowed_ids if k in BLOCK_PALETTE]
-        lab = _match_space(np.array([BLOCK_PALETTE[k] for k in ids], dtype=np.float64))
+        ids = [k for k in allowed_ids if k in BLOCK_PALETTE or k in AUX_PALETTE]
+        lab = _match_space(np.array(
+            [BLOCK_PALETTE.get(k) or AUX_PALETTE[k] for k in ids], dtype=np.float64))
         cached = (ids, cKDTree(lab))
         _RESTRICTED_TREES[key] = cached
     ids, tree = cached
