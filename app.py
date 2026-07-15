@@ -43,6 +43,7 @@ class App:
         self.norm_path: Path | None   = None
         self.norm_info: dict | None   = None
         self.voxel_data: dict | None  = None
+        self.build_state: dict | None = None    # building-mode state (refine UI)
         self.is_generating = False
         self._preview_photo = None  # keep ref to prevent GC
         self._timer_start: float | None = None  # stopwatch start (time.time())
@@ -50,6 +51,7 @@ class App:
         # Voxel settings (exposed in the UI).
         self.res_var = tk.IntVar(value=48)      # target longest-axis size in blocks
         self.colormode_var = tk.StringVar(value="Enhanced (fix shadows & clumps)")
+        self.mode_var = tk.StringVar(value="Sculpture (voxelize as-is)")
 
         self._build_ui()
 
@@ -128,19 +130,36 @@ class App:
         )
         res_scale.pack(fill=tk.X)
 
+        # Build mode: Sculpture = the classic voxelizer; Building = structure-aware
+        # replica (massing regularization + photo facade mapping + glass windows).
+        build_row = tk.Frame(settings, bg="#161b22")
+        build_row.pack(fill=tk.X, pady=(4, 0))
+        tk.Label(
+            build_row, text="Mode:", bg="#161b22", fg="#8b949e",
+            font=("Segoe UI", 8),
+        ).pack(side=tk.LEFT)
+        mode_combo = ttk.Combobox(
+            build_row, textvariable=self.mode_var, state="readonly", width=26,
+            values=["Sculpture (voxelize as-is)", "Building (beta)"],
+        )
+        mode_combo.pack(side=tk.LEFT, padx=(6, 0))
+        mode_combo.bind("<<ComboboxSelected>>", self._on_mode_change)
+
         # Color mode: Enhanced runs the full repair pipeline (shadow/clump fixes);
         # Raw maps the model's colors as-is (best when the source has no baked
-        # shadows and corrections would do more harm than good).
+        # shadows and corrections would do more harm than good).  Building mode
+        # takes colors from the photo facade directly, so it doesn't apply there.
         mode_row = tk.Frame(settings, bg="#161b22")
         mode_row.pack(fill=tk.X, pady=(4, 0))
         tk.Label(
             mode_row, text="Color mode:", bg="#161b22", fg="#8b949e",
             font=("Segoe UI", 8),
         ).pack(side=tk.LEFT)
-        ttk.Combobox(
+        self.colormode_combo = ttk.Combobox(
             mode_row, textvariable=self.colormode_var, state="readonly", width=26,
             values=["Enhanced (fix shadows & clumps)", "Raw (model colors as-is)"],
-        ).pack(side=tk.LEFT, padx=(6, 0))
+        )
+        self.colormode_combo.pack(side=tk.LEFT, padx=(6, 0))
 
         self.export_btn = tk.Button(
             btn_frame, text="💾  Export .schem",
@@ -153,6 +172,17 @@ class App:
             state=tk.DISABLED,
         )
         self.export_btn.pack(fill=tk.X, pady=3)
+
+        # Building mode only: adjust the facade quad/grid and re-apply in seconds.
+        self.facade_btn = tk.Button(
+            btn_frame, text="🏛  Facade tools…",
+            command=self._on_facade_tools,
+            bg="#21262d", fg="#c9d1d9",
+            activebackground="#30363d",
+            state=tk.DISABLED,
+            **self._btn_style,
+        )
+        self.facade_btn.pack(fill=tk.X, pady=3)
 
         self.progress = ttk.Progressbar(btn_frame, mode="indeterminate")
         self.progress.pack(fill=tk.X, pady=(4, 0))
@@ -203,9 +233,11 @@ class App:
         self.norm_path = None
         self.norm_info = None
         self.voxel_data = None
+        self.build_state = None
         self._reset_timer()
         self.build_btn.config(state=tk.NORMAL)
         self.export_btn.config(state=tk.DISABLED)
+        self.facade_btn.config(state=tk.DISABLED)
         self._set_status("Image: {}".format(self.image_path.name))
 
     def _show_preview(self, path: str):
@@ -240,9 +272,12 @@ class App:
         # Snapshot settings on the main thread so the worker doesn't touch tk vars.
         self._build_target_blocks = int(self.res_var.get())
         self._build_color_repair = self.colormode_var.get().startswith("Enhanced")
+        self._build_mode = ("building" if self.mode_var.get().startswith("Building")
+                            else "sculpture")
         self.is_generating = True
         self.build_btn.config(state=tk.DISABLED, text="Working...")
         self.export_btn.config(state=tk.DISABLED)
+        self.facade_btn.config(state=tk.DISABLED)
         self.progress.start(12)
         self._start_timer()
         self._set_status("Launching TRELLIS...")
@@ -264,18 +299,37 @@ class App:
             self.norm_path = norm_path
             self.norm_info = norm_info
 
-            # Prefer the archived cutout as the colour reference — its alpha is the
-            # exact object mask, so photo-guided repairs don't see background colours.
-            ref_image = (next(obj_path.parent.glob(obj_path.stem + "_cutout.png"), None)
-                         or self.image_path)
+            # The archived cutout: exact object mask (photo repairs + facade analysis).
+            cutout = next(obj_path.parent.glob(obj_path.stem + "_cutout.png"), None)
+
+            if self._build_mode == "building":
+                from building.pipeline import run_building
+                voxel_data, build_state = run_building(
+                    image_path=self.image_path, cutout_path=cutout,
+                    glb_path=obj_path, norm_info=norm_info,
+                    target_blocks=self._build_target_blocks,
+                    status_cb=self._set_status,
+                )
+                self.root.after(0, self._on_build_done, voxel_data, build_state)
+                return
 
             self._set_status("Voxelizing — this may take a few seconds...")
             voxel_data = voxelize_mesh(
                 norm_path, norm_info,
                 target_blocks=self._build_target_blocks,
                 color_repair=self._build_color_repair,
-                image_path=ref_image,
+                image_path=cutout or self.image_path,
             )
+            # Every run also becomes a (minimal) dataset sample — contrast data for
+            # the future learned image->build model.
+            try:
+                from building.dataset import write_sculpture_sample
+                write_sculpture_sample(
+                    obj_path.stem, self.image_path, cutout, obj_path, voxel_data,
+                    {"target_blocks": self._build_target_blocks,
+                     "color_repair": self._build_color_repair})
+            except Exception:
+                pass
             self.root.after(0, self._on_build_done, voxel_data)
 
         except Exception as exc:
@@ -283,11 +337,13 @@ class App:
 
     # ── post-build callbacks (must run on main thread) ────────────────────────
 
-    def _on_build_done(self, voxel_data: dict):
+    def _on_build_done(self, voxel_data: dict, build_state: dict | None = None):
         self.voxel_data = voxel_data
+        self.build_state = build_state
         self._reset_controls()
         self._stop_timer()
         self.export_btn.config(state=tk.NORMAL)
+        self.facade_btn.config(state=tk.NORMAL if build_state else tk.DISABLED)
         W, H, L = voxel_data["dims"]
         note = "" if voxel_data["watertight"] else " (mesh not watertight — may have holes)"
         self._set_status(
@@ -295,15 +351,38 @@ class App:
                 voxel_data["block_count"], W, H, L, note
             )
         )
+        self._show_viewer(voxel_data)
+
+    def _show_viewer(self, voxel_data: dict):
         # Prefer the textured pyvista viewer; fall back to the matplotlib preview if
-        # pyvista/VTK isn't available or errors out.
+        # pyvista/VTK isn't available or errors out.  In building mode the linked
+        # mesh view must show the YAW-ALIGNED mesh, or it won't match the voxels.
+        mesh_info = (self.build_state["aligned_info"]
+                     if self.build_state else self.norm_info)
         try:
             from voxel_view import show_voxel_pyvista
-            show_voxel_pyvista(voxel_data, mesh_info=self.norm_info)
+            show_voxel_pyvista(voxel_data, mesh_info=mesh_info)
         except Exception as exc:
             self._set_status("Textured viewer unavailable ({}); using basic preview".format(
                 str(exc)[:60]))
             show_voxel_diagnostic(voxel_data)
+
+    def _on_mode_change(self, _event=None):
+        building = self.mode_var.get().startswith("Building")
+        self.colormode_combo.config(state=tk.DISABLED if building else "readonly")
+
+    def _on_facade_tools(self):
+        if not self.build_state or self.is_generating:
+            return
+        from building.refine_ui import FacadeEditor
+        FacadeEditor(self.root, self.build_state, on_applied=self._on_refine_done)
+
+    def _on_refine_done(self, voxel_data: dict):
+        self.voxel_data = voxel_data
+        W, H, L = voxel_data["dims"]
+        self._set_status("Facade re-applied: {:,} blocks  |  {}x{}x{} (XYZ)".format(
+            voxel_data["block_count"], W, H, L))
+        self._show_viewer(voxel_data)
 
     def _on_error(self, msg: str):
         self._reset_controls()

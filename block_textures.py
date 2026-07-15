@@ -85,7 +85,8 @@ def _grass(base):
 
 def _generate_tile(block_id: str):
     """Procedural 16x16 tile for a block id, keyed to material by name."""
-    base = BLOCK_PALETTE.get(block_id, (128, 128, 128))
+    from block_palette import AUX_PALETTE
+    base = BLOCK_PALETTE.get(block_id) or AUX_PALETTE.get(block_id, (128, 128, 128))
     name = block_id.split(":", 1)[-1]
     if "glass" in name:
         return _glass(base)
