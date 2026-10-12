@@ -153,7 +153,7 @@ BLOCK_PALETTE: dict[str, tuple[int, int, int]] = {
 }
 
 
-def _srgb_to_lab(rgb: np.ndarray) -> np.ndarray:
+def srgb_to_lab(rgb: np.ndarray) -> np.ndarray:
     """Convert sRGB (0-255, shape (...,3)) to CIELAB under the D65 white point."""
     rgb = np.asarray(rgb, dtype=np.float64) / 255.0
     lin = np.where(rgb > 0.04045, ((rgb + 0.055) / 1.055) ** 2.4, rgb / 12.92)
@@ -170,8 +170,8 @@ def _srgb_to_lab(rgb: np.ndarray) -> np.ndarray:
     return np.stack([L, a, b], axis=-1)
 
 
-def _lab_to_srgb(lab: np.ndarray) -> np.ndarray:
-    """Inverse of `_srgb_to_lab`: CIELAB (D65) -> sRGB 0-255, out-of-gamut clipped."""
+def lab_to_srgb(lab: np.ndarray) -> np.ndarray:
+    """Inverse of `srgb_to_lab`: CIELAB (D65) -> sRGB 0-255, out-of-gamut clipped."""
     lab = np.asarray(lab, dtype=np.float64)
     L, a, b = lab[..., 0], lab[..., 1], lab[..., 2]
     eps, kappa = 216 / 24389, 24389 / 27
@@ -195,9 +195,9 @@ def _lab_to_srgb(lab: np.ndarray) -> np.ndarray:
     return np.clip(srgb * 255.0, 0, 255)
 
 
-def _match_space(rgb: np.ndarray) -> np.ndarray:
+def match_space(rgb: np.ndarray) -> np.ndarray:
     """LAB with L scaled by L_WEIGHT — the space nearest-neighbour matching runs in."""
-    lab = _srgb_to_lab(rgb)
+    lab = srgb_to_lab(rgb)
     lab[..., 0] *= L_WEIGHT
     return lab
 
@@ -212,7 +212,7 @@ def _palette_tree():
     if _TREE is None:
         from scipy.spatial import cKDTree
         ids = list(BLOCK_PALETTE)
-        lab = _match_space(np.array([BLOCK_PALETTE[k] for k in ids], dtype=np.float64))
+        lab = match_space(np.array([BLOCK_PALETTE[k] for k in ids], dtype=np.float64))
         _TREE = (ids, cKDTree(lab))
     return _TREE
 
@@ -224,9 +224,27 @@ def match_blocks(colors_rgb) -> list[str]:
     restriction — so block choice is driven purely by the sampled color.
     """
     ids, tree = _palette_tree()
-    q = _match_space(np.asarray(colors_rgb, dtype=np.float64).reshape(-1, 3))
+    q = match_space(np.asarray(colors_rgb, dtype=np.float64).reshape(-1, 3))
     _, idx = tree.query(q)
     return [ids[i] for i in np.atleast_1d(idx)]
+
+
+# Blocks a builder would not make a building's walls or roof from, for `BUILDER_PALETTE`:
+# wool (duplicates concrete's colours), terrain and natural blocks, ores, precious and
+# decorative blocks, ice and snow, and fantasy woods / End blocks.
+_NOT_BUILDING = {
+    "amethyst_block", "bone_block", "clay", "coarse_dirt", "dirt", "dripstone_block", "end_stone",
+    "gold_block", "grass_block", "gravel", "iron_block", "lapis_block", "moss_block", "mud",
+    "obsidian", "packed_ice", "packed_mud", "raw_iron_block", "snow_block", "purpur_block",
+    "crimson_planks", "warped_planks",
+}
+# The palette of real building materials: stones, bricks, sandstones, woods, quartz,
+# concrete, terracotta, copper, prismarine. 72 of BLOCK_PALETTE's 110 blocks. Matching a clean
+# model's colours against it gives targets a builder would recognise; matching against the
+# full palette put snow blocks, iron blocks and wool in pilot-v2's walls.
+BUILDER_PALETTE: tuple = tuple(
+    k for k in BLOCK_PALETTE
+    if not k.endswith("_wool") and k.split(":", 1)[1] not in _NOT_BUILDING)
 
 
 # Auxiliary palette: blocks matchable ONLY through match_blocks_restricted (building
@@ -265,12 +283,12 @@ def match_blocks_restricted(colors_rgb, allowed_ids):
     if cached is None:
         from scipy.spatial import cKDTree
         ids = [k for k in allowed_ids if k in BLOCK_PALETTE or k in AUX_PALETTE]
-        lab = _match_space(np.array(
+        lab = match_space(np.array(
             [BLOCK_PALETTE.get(k) or AUX_PALETTE[k] for k in ids], dtype=np.float64))
         cached = (ids, cKDTree(lab))
         _RESTRICTED_TREES[key] = cached
     ids, tree = cached
-    q = _match_space(np.asarray(colors_rgb, dtype=np.float64).reshape(-1, 3))
+    q = match_space(np.asarray(colors_rgb, dtype=np.float64).reshape(-1, 3))
     dist, idx = tree.query(q)
     idx = np.atleast_1d(idx)
     return [ids[i] for i in idx], np.atleast_1d(dist)

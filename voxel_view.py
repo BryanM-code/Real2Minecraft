@@ -41,7 +41,7 @@ def _build_polydata(blocks, block_ids, uv_map, shapes=None):
     neighbour is a FULL cube, so a full cube next to a slab/stair keeps its shared face
     (no holes); partial blocks emit all their box faces (backface culling is off).
     """
-    from block_shapes import SHAPE_FULL, _SHAPE_BOXES
+    from mcvoxel.block_shapes import SHAPE_FULL, _SHAPE_BOXES
 
     if shapes is None:
         shapes = [SHAPE_FULL] * len(blocks)
@@ -270,8 +270,8 @@ def show_voxel_diagnostic(voxel_data: dict):
     palette_rgb = None
     if block_ids:
         try:
-            from block_palette import BLOCK_PALETTE
-            from block_shapes import base_block
+            from mcvoxel.block_palette import BLOCK_PALETTE
+            from mcvoxel.block_shapes import base_block
             palette_rgb = np.array(
                 [BLOCK_PALETTE.get(base_block(b), (128, 128, 128)) for b in block_ids],
                 dtype=float,

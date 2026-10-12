@@ -152,6 +152,19 @@ for _base, (_slab, _stairs) in BLOCK_VARIANTS.items():
     if _stairs:
         _VARIANT_TO_BASE[_stairs] = _base
 
+# 1.20.1 structural families. Keep these separate from slab/stair capability.
+FENCE_VARIANTS = {b: b.replace("_planks", "_fence") for b in BLOCK_VARIANTS if b.endswith("_planks")}
+WALL_VARIANTS = {"minecraft:" + base: "minecraft:" + wall for base, wall in (
+    ("cobblestone", "cobblestone_wall"), ("stone_bricks", "stone_brick_wall"),
+    ("bricks", "brick_wall"), ("andesite", "andesite_wall"), ("diorite", "diorite_wall"),
+    ("granite", "granite_wall"), ("sandstone", "sandstone_wall"),
+    ("red_sandstone", "red_sandstone_wall"), ("mud_bricks", "mud_brick_wall"),
+    ("deepslate", "cobbled_deepslate_wall"), ("polished_deepslate", "polished_deepslate_wall"),
+    ("blackstone", "blackstone_wall"), ("polished_blackstone", "polished_blackstone_wall"),
+    ("nether_bricks", "nether_brick_wall"), ("prismarine", "prismarine_wall"))}
+for _family in (FENCE_VARIANTS, WALL_VARIANTS):
+    _VARIANT_TO_BASE.update({v: k for k, v in _family.items()})
+
 _SLAB_CAPABLE = [b for b, (s, _) in BLOCK_VARIANTS.items() if s]
 _STAIRS_CAPABLE = [b for b, (_, s) in BLOCK_VARIANTS.items() if s]
 
@@ -164,6 +177,27 @@ def base_block(bid: str) -> str:
     """
     stripped = bid.split("[", 1)[0]
     return _VARIANT_TO_BASE.get(stripped, stripped)
+
+
+def octant_counts(fine_solid, scale):
+    """(X,Y,Z,8) uint16 solid sub-cell counts per octant of each coarse voxel.
+
+    `fine_solid` must be coarse-aligned: shape == coarse shape * scale. Octant index is
+    ox + 2*oz + 4*oy with o = 1 for the upper half along that axis (oy = height) -- the
+    same convention `_decide_shape` reads.
+    """
+    X, Y, Z = (d // scale for d in fine_solid.shape)
+    h = scale // 2
+    c = fine_solid.reshape(X, 2, h, Y, 2, h, Z, 2, h).sum(axis=(2, 5, 8), dtype=np.uint16)
+    # axes now (X, ox, Y, oy, Z, oz) -> (X, Y, Z, oy, oz, ox) so the flat index is 4oy+2oz+ox
+    return np.ascontiguousarray(c.transpose(0, 2, 4, 3, 5, 1)).reshape(X, Y, Z, 8)
+
+
+def shapes_from_counts(counts, scale):
+    """Shape code per voxel from its octant counts (no interior/leak logic)."""
+    masks = ((counts >= OCTANT_MIN[scale]).astype(np.uint8)
+             << np.arange(8, dtype=np.uint8)).sum(axis=-1).astype(np.uint8)
+    return _MASK_TO_SHAPE[masks]
 
 
 def classify_shapes(occ, solid, fine_solid, fine_origin, origin, scale):
@@ -179,16 +213,20 @@ def classify_shapes(occ, solid, fine_solid, fine_origin, origin, scale):
     stairs, VERTICAL cuts (walls/beams, equal top+bottom material) stay full cubes, and
     empty/thin surface voxels become slabs.  Interior voxels are invisible and left full.
     """
-    f = np.argwhere(fine_solid)                          # (M,3) fine indices
-    if len(f) == 0:
+    if not fine_solid.any():
         return None
-    w = np.asarray(fine_origin, dtype=np.int64) + f      # scale-frame min corners
-    v = np.floor_divide(w, scale) - np.asarray(origin, dtype=np.int64)   # coarse parent
-    o = (np.mod(w, scale) >= (scale // 2)).astype(np.int64)              # upper-half per axis
-    oct_i = o[:, 0] + 2 * o[:, 2] + 4 * o[:, 1]          # x, z, y(height) -> octant index
-
-    counts = np.zeros(tuple(solid.shape) + (8,), dtype=np.uint16)
-    np.add.at(counts, (v[:, 0], v[:, 1], v[:, 2], oct_i), 1)
+    aligned = (tuple(fine_solid.shape) == tuple(int(d) * scale for d in solid.shape)
+               and (np.asarray(fine_origin) == np.asarray(origin) * scale).all())
+    if aligned:
+        counts = octant_counts(fine_solid, scale)        # one reshape-sum, no scatter
+    else:
+        f = np.argwhere(fine_solid)                      # (M,3) fine indices
+        w = np.asarray(fine_origin, dtype=np.int64) + f  # scale-frame min corners
+        v = np.floor_divide(w, scale) - np.asarray(origin, dtype=np.int64)   # coarse parent
+        o = (np.mod(w, scale) >= (scale // 2)).astype(np.int64)              # upper-half per axis
+        oct_i = o[:, 0] + 2 * o[:, 2] + 4 * o[:, 1]      # x, z, y(height) -> octant index
+        counts = np.zeros(tuple(solid.shape) + (8,), dtype=np.uint16)
+        np.add.at(counts, (v[:, 0], v[:, 1], v[:, 2], oct_i), 1)
     occ_counts = counts[occ[:, 0], occ[:, 1], occ[:, 2]]                 # (N,8)
     masks = ((occ_counts >= OCTANT_MIN[scale]).astype(np.uint8)
              << np.arange(8, dtype=np.uint8)).sum(axis=1).astype(np.uint8)
@@ -213,8 +251,10 @@ def classify_shapes(occ, solid, fine_solid, fine_origin, origin, scale):
     return shapes
 
 
-def apply_shapes(block_ids, colors, shapes):
+def apply_shapes(block_ids, colors, shapes, allowed=None):
     """Rewrite `block_ids` into shape-stated ids; returns (new_ids, corrected_shapes).
+
+    `allowed` (optional) limits the material swap to those palette ids.
 
     FULL voxels keep their id.  A partial voxel whose material has the needed variant gets
     a `[state]` id; otherwise its color is re-matched against the variant-capable blocks
@@ -261,7 +301,7 @@ def apply_shapes(block_ids, colors, shapes):
             shapes[i] = SHAPE_FULL
         return out, shapes
 
-    from block_palette import match_blocks_restricted
+    from .block_palette import match_blocks_restricted
     col = np.asarray(colors, dtype=np.float64)
     swap_rows = np.asarray(swap_rows)
     needs_stairs = np.asarray(swap_needs_stairs)
@@ -269,8 +309,10 @@ def apply_shapes(block_ids, colors, shapes):
         sel = swap_rows[needs_stairs == group_stairs]
         if len(sel) == 0:
             continue
-        allowed = _STAIRS_CAPABLE if group_stairs else _SLAB_CAPABLE
-        ids, _dist = match_blocks_restricted(col[sel], allowed)
+        pool = _STAIRS_CAPABLE if group_stairs else _SLAB_CAPABLE
+        if allowed is not None:
+            pool = [b for b in pool if b in allowed] or pool
+        ids, _dist = match_blocks_restricted(col[sel], pool)
         for idx, i in zip(range(len(sel)), sel.tolist()):
             i = int(i)
             # `allowed` only contains blocks with the needed variant, so the nearest

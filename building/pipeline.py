@@ -11,12 +11,12 @@ from pathlib import Path
 
 import numpy as np
 
-from voxel_sampling import _sample_voxel_colors_texture
+from mcvoxel.voxel_sampling import _sample_voxel_colors_texture
 from building import assemble as _assemble
 from building import facade as _facade
 from building import facade_map as _facade_map
 from building import massing as _massing
-from building import yaw_align as _yaw
+from mcvoxel import yaw_align as _yaw
 from building.dataset import Sample
 from building.errors import BuildingModeError
 from building.params import PARAMS
