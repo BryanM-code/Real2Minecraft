@@ -1,9 +1,12 @@
-"""Mesh → solid voxel grid → colored Minecraft blocks.
+"""Mesh → solid voxel grid → colored Minecraft blocks (the app's sculpture mode).
 
 `voxelize_mesh` is the pipeline orchestrator: SAT surface rasterization, exterior
 flood fill, cleanup, per-voxel color sampling (voxel_sampling), the color pipeline
 (color_repair + color_quantize, gated by `color_repair`), palette matching, and
 partial-block shape classification (block_shapes).
+
+The geometry and block steps come from the shared `mcvoxel` package; the TRELLIS-specific,
+photo-guided colour repairs (`color_repair`) belong to this app and stay here with it.
 """
 
 import os
@@ -12,137 +15,13 @@ from pathlib import Path
 import numpy as np
 import trimesh
 
-import block_shapes
-from voxel_sampling import _sample_voxel_colors_texture, _sample_voxel_colors
+from mcvoxel import block_shapes
+from mcvoxel.voxel_sampling import _sample_voxel_colors_texture, _sample_voxel_colors
 from color_repair import (_photo_reference_lab, _inpaint_dark_voxels,
                           _normalize_tone, _lift_shadows, _fill_unobserved_colors,
                           _repair_unsupported_colors, _snap_suspect_hues)
-from color_quantize import _quantize_colors, _consolidate_block_ids
-
-
-def _voxelize_surface_sat(verts, faces):
-    """Conservative triangle-box voxelization → gap-free surface occupancy grid.
-
-    `verts` are already scaled so one voxel == one unit (pitch 1).  Every voxel a
-    triangle actually intersects is marked, using the Akenine-Möller separating-axis
-    test (3 AABB axes + triangle normal + 9 edge cross-products) against a unit box.
-    Unlike vertex-rasterization this leaves no holes between triangles.
-
-    Returns (surf, origin): a bool grid and the integer min-corner so a voxel index
-    (i,j,k) corresponds to world center (i,j,k) + 0.5 + origin.
-    """
-    origin = np.floor(verts.min(axis=0)).astype(np.int64)
-    upper = np.floor(verts.max(axis=0)).astype(np.int64)
-    sx, sy, sz = (upper - origin + 1).tolist()
-    surf = np.zeros((sx, sy, sz), dtype=bool)
-
-    tris = (verts - origin)[faces]   # (F,3,3) in grid coords
-    lo_axis = np.array([0, 0, 0])
-    hi_axis = np.array([sx - 1, sy - 1, sz - 1])
-    h = 0.5
-
-    for tri in tris:
-        v0, v1, v2 = tri
-        lo = np.clip(np.floor(tri.min(axis=0)).astype(np.int64), lo_axis, hi_axis)
-        hi = np.clip(np.floor(tri.max(axis=0)).astype(np.int64), lo_axis, hi_axis)
-
-        gx, gy, gz = np.meshgrid(
-            np.arange(lo[0], hi[0] + 1),
-            np.arange(lo[1], hi[1] + 1),
-            np.arange(lo[2], hi[2] + 1),
-            indexing="ij",
-        )
-        idx = np.stack([gx.ravel(), gy.ravel(), gz.ravel()], axis=1)   # (M,3)
-        C = idx + 0.5                                                  # voxel centers
-        u0, u1, u2 = v0 - C, v1 - C, v2 - C                            # box-local verts
-
-        # 1. AABB of the triangle vs the unit box on the 3 coordinate axes.
-        ok = np.ones(len(C), dtype=bool)
-        for a in range(3):
-            tmin = np.minimum(np.minimum(u0[:, a], u1[:, a]), u2[:, a])
-            tmax = np.maximum(np.maximum(u0[:, a], u1[:, a]), u2[:, a])
-            ok &= ~((tmin > h) | (tmax < -h))
-        if not ok.any():
-            continue
-
-        # 2. Triangle plane vs box (skip degenerate triangles).
-        f0, f1, f2 = v1 - v0, v2 - v1, v0 - v2
-        n = np.cross(f0, f1)
-        if float(n @ n) < 1e-18:
-            continue
-        ok &= np.abs(u0 @ n) <= h * np.abs(n).sum()
-        if not ok.any():
-            continue
-
-        # 3. Nine edge cross-product axes (box axis × triangle edge), reduced form.
-        for f in (f0, f1, f2):
-            fx, fy, fz = f
-            # Each axis (box axis × edge) projects all three vertices; a separating
-            # axis exists if the projected triangle clears the box radius either side.
-            pa = np.stack([-u0[:, 1]*fz + u0[:, 2]*fy,
-                           -u1[:, 1]*fz + u1[:, 2]*fy,
-                           -u2[:, 1]*fz + u2[:, 2]*fy], axis=0)
-            ra = h * (abs(fz) + abs(fy))
-            ok &= ~((pa.min(0) > ra) | (pa.max(0) < -ra))
-            pb = np.stack([u0[:, 0]*fz - u0[:, 2]*fx,
-                           u1[:, 0]*fz - u1[:, 2]*fx,
-                           u2[:, 0]*fz - u2[:, 2]*fx], axis=0)
-            rb = h * (abs(fz) + abs(fx))
-            ok &= ~((pb.min(0) > rb) | (pb.max(0) < -rb))
-            pc = np.stack([-u0[:, 0]*fy + u0[:, 1]*fx,
-                           -u1[:, 0]*fy + u1[:, 1]*fx,
-                           -u2[:, 0]*fy + u2[:, 1]*fx], axis=0)
-            rc = h * (abs(fy) + abs(fx))
-            ok &= ~((pc.min(0) > rc) | (pc.max(0) < -rc))
-            if not ok.any():
-                break
-
-        if ok.any():
-            sel = idx[ok]
-            surf[sel[:, 0], sel[:, 1], sel[:, 2]] = True
-
-    return surf, origin
-
-
-def _clean_voxels(solid, close: bool = True, despur: bool = False):
-    """Tidy a solid occupancy grid: drop floating debris, fill pinholes.
-
-    InstantMesh's non-watertight meshes leave stray cubes and 1-voxel pits after
-    the flood fill (the floating blocks around the castle base).  Cleanup steps:
-
-      1. close   - binary_closing fills 1-voxel pits/cracks (dilate then erode), so
-                   surfaces read as solid walls instead of speckled ones.
-      2. largest - keep only the largest 6-connected component, deleting every
-                   floating island that isn't part of the main body.
-      3. despur  - (opt-in) remove voxels with <2 occupied face-neighbours; trims
-                   noise specks but can nibble legit 1-voxel spires/flagpoles, so
-                   it defaults off.
-
-    Returns a cleaned bool grid the same shape as `solid`.
-    """
-    from scipy import ndimage
-
-    out = solid.copy()
-    # 6-connectivity (face neighbours) — matches the flood-fill connectivity.
-    struct = ndimage.generate_binary_structure(3, 1)
-
-    if close:
-        out = ndimage.binary_closing(out, structure=struct)
-
-    labels, n = ndimage.label(out, structure=struct)
-    if n > 1:
-        # Component 0 is background; pick the largest of the real components.
-        sizes = np.bincount(labels.ravel())
-        sizes[0] = 0
-        out = labels == int(sizes.argmax())
-
-    if despur:
-        neighbours = ndimage.convolve(
-            out.astype(np.int8), struct.astype(np.int8), mode="constant", cval=0
-        ) - out  # subtract self (struct centre is 1)
-        out &= neighbours >= 2
-
-    return out
+from mcvoxel.color_quantize import quantize_colors, consolidate_block_ids
+from mcvoxel.raster import clean_solid, fine_solid_aligned, rasterize_surface, solid_from_surface
 
 
 def voxelize_mesh(norm_path: Path, norm_info: dict,
@@ -213,19 +92,16 @@ def voxelize_mesh(norm_path: Path, norm_info: dict,
     # 1. Gap-free surface shell via conservative SAT rasterization.
     scaled_verts = np.asarray(mesh.vertices, dtype=np.float64)
     faces_arr = np.asarray(mesh.faces, dtype=np.int64)
-    surf, origin = _voxelize_surface_sat(scaled_verts, faces_arr)
+    surf, origin = rasterize_surface(scaled_verts, faces_arr)
 
     # 2. Exterior flood fill: pad so the model is surrounded by air, label the
     # empty space (6-connectivity so 1-voxel diagonal gaps don't leak), then mark
     # everything the corner-connected outside region can't reach as solid.
-    padded = np.pad(surf, 2)
-    labels, _ = ndimage.label(~padded)
-    exterior = labels == labels[0, 0, 0]
-    solid = (~exterior)[2:-2, 2:-2, 2:-2]
+    solid = solid_from_surface(surf)
 
     # 2b. Cleanup: drop floating debris and fill pinholes (keeps the shell fallback
     # below honest if cleanup wipes everything on a degenerate mesh).
-    cleaned = _clean_voxels(solid)
+    cleaned = clean_solid(solid)
     if cleaned.any():
         solid = cleaned
 
@@ -249,20 +125,8 @@ def voxelize_mesh(norm_path: Path, norm_info: dict,
         while scale > 1 and _fine_cells(scale) > 40e6:
             scale //= 2
         if scale >= 2 and _fine_cells(scale) <= 40e6:
-            fine_surf, sat_origin = _voxelize_surface_sat(scaled_verts * scale, faces_arr)
-            # Embed into a grid aligned to the coarse box (origin*scale, shape*scale) so
-            # every coarse voxel gets exactly scale^3 fine cells — otherwise the +X/+Z
-            # boundary voxels get truncated fine coverage and misclassify.
-            fine_origin = np.asarray(origin, dtype=np.int64) * scale
-            aligned = np.zeros(tuple(int(d) * scale for d in solid.shape), dtype=bool)
-            off = (np.asarray(sat_origin, dtype=np.int64) - fine_origin)
-            end = np.minimum(off + np.asarray(fine_surf.shape), np.asarray(aligned.shape))
-            dst = tuple(slice(int(off[i]), int(end[i])) for i in range(3))
-            src = tuple(slice(0, int(end[i] - off[i])) for i in range(3))
-            aligned[dst] = fine_surf[src]
-            fpad = np.pad(aligned, 2)
-            flabels, _ = ndimage.label(~fpad)
-            fine_solid = (~(flabels == flabels[0, 0, 0]))[2:-2, 2:-2, 2:-2]
+            fine_solid, fine_origin = fine_solid_aligned(
+                scaled_verts, faces_arr, origin, solid.shape, scale)
             shapes = block_shapes.classify_shapes(
                 occ, solid, fine_solid, fine_origin, origin, scale)
             if shapes is None and os.environ.get("R2M_DEBUG"):
@@ -328,7 +192,7 @@ def voxelize_mesh(norm_path: Path, norm_info: dict,
         # lighting/AO/texture noise) into a few flat color regions so matching can't
         # turn one wall into random near-miss materials; small spatial fragments are
         # absorbed too.
-        colors = _quantize_colors(occ, colors, solid.shape)
+        colors = quantize_colors(occ, colors, solid.shape)
 
     # 3f. Shadow lift: brighten dark regions (TRELLIS bakes dark) so they match mid-tone
     # blocks instead of near-black.  Runs LAST, after any repairs/quantization, so it only
@@ -339,19 +203,19 @@ def voxelize_mesh(norm_path: Path, norm_info: dict,
     # matching every voxel independently against the full palette (no per-object
     # presets).  Always on; all-stone only when the mesh carried no color at all.
     if colors:
-        import block_palette
+        from mcvoxel import block_palette
         block_ids = block_palette.match_blocks(colors)
         if color_repair:
             # 4b. Material coherence: quantized clusters can still land on
             # near-identical palette blocks (stone vs cobblestone); merge those ids
             # globally so a fake material boundary never appears.  (Enhanced only:
             # on raw colors the per-unique-color pass would be O(uniques²).)
-            block_ids = _consolidate_block_ids(colors, block_ids)
+            block_ids = consolidate_block_ids(colors, block_ids)
     else:
         block_ids = ["minecraft:stone"] * len(blocks)
 
     # 5. Partial-block shapes: rewrite ids into [state] strings (slab/stairs) and swap
-    # materials that lack a variant.  Runs AFTER _consolidate_block_ids so state strings
+    # materials that lack a variant.  Runs AFTER consolidate_block_ids so state strings
     # are never merged; covers Enhanced, Raw, and the no-color branch alike.
     if shapes is not None:
         block_ids, shapes = block_shapes.apply_shapes(block_ids, colors, shapes)

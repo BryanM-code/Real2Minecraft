@@ -14,8 +14,20 @@ import numpy as np
 import trimesh
 
 
-def estimate_yaw(verts: np.ndarray, faces: np.ndarray, params: dict) -> dict:
+# The B1 defaults from Real2Minecraft's building/params.py (2026-07-14), so callers outside
+# building mode can use the same calibration without importing the app.
+DEFAULT_PARAMS = {
+    "yaw_wall_ny_max": 0.35,
+    "yaw_min_wall_area_frac": 0.20,
+    "yaw_hist_sigma_deg": 2.0,
+    "yaw_peak_window_deg": 4.0,
+    "yaw_min_confidence": 0.55,
+}
+
+
+def estimate_yaw(verts: np.ndarray, faces: np.ndarray, params: dict = None) -> dict:
     """Return the yaw IR: {theta_deg, confidence, wall_area_frac, applied, ...}."""
+    params = params or DEFAULT_PARAMS
     mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
     normals = np.asarray(mesh.face_normals, dtype=np.float64)
     areas = np.asarray(mesh.area_faces, dtype=np.float64)

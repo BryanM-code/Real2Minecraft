@@ -15,7 +15,7 @@ Textures use nearest-neighbour sampling at render time to keep the crisp pixelat
 from pathlib import Path
 import numpy as np
 
-from block_palette import BLOCK_PALETTE
+from mcvoxel.block_palette import BLOCK_PALETTE
 
 TILE = 16
 TEX_DIR = Path(__file__).parent / "textures" / "blocks"
@@ -85,7 +85,7 @@ def _grass(base):
 
 def _generate_tile(block_id: str):
     """Procedural 16x16 tile for a block id, keyed to material by name."""
-    from block_palette import AUX_PALETTE
+    from mcvoxel.block_palette import AUX_PALETTE
     base = BLOCK_PALETTE.get(block_id) or AUX_PALETTE.get(block_id, (128, 128, 128))
     name = block_id.split(":", 1)[-1]
     if "glass" in name:
@@ -114,7 +114,7 @@ def get_tile(block_id: str) -> np.ndarray:
     A partial-block id (`oak_stairs[facing=east,half=bottom]`) is normalized to its base
     palette id first, so slabs/stairs render as their parent material's tile.
     """
-    from block_shapes import base_block
+    from mcvoxel.block_shapes import base_block
     block_id = base_block(block_id)
     png = TEX_DIR / (block_id.split(":", 1)[-1] + ".png")
     if png.exists():

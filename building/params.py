@@ -6,7 +6,10 @@ the IRs written under outputs/dataset/ are training targets for the future learn
 image->build model, and silently drifting outputs would poison that dataset.
 """
 
-PIPELINE_VERSION = "bldg-0.1.0"
+# 0.2.0 (2026-09-25): mcvoxel.raster.clean_solid no longer strips the grid's outer layer
+#   (scipy's binary_closing eroded every boundary voxel), so the B2 massing keeps its full
+#   extent -- about 1 block more on each side -- and parts attached only through that layer.
+PIPELINE_VERSION = "bldg-0.2.0"
 SCHEMA_VERSION = 1
 
 PARAMS = {

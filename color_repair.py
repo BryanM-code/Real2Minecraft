@@ -34,11 +34,11 @@ def _photo_reference_lab(image_path, size: int = 96, border: int = 3,
     try:
         from scipy import ndimage
         from scipy.spatial import cKDTree
-        from block_palette import _srgb_to_lab
+        from mcvoxel.block_palette import srgb_to_lab
 
         rgba = Image.open(image_path).convert("RGBA").resize((size, size))
         arr = np.asarray(rgba, dtype=np.float64)
-        lab = _srgb_to_lab(arr[..., :3]).reshape(-1, 3)
+        lab = srgb_to_lab(arr[..., :3]).reshape(-1, 3)
         alpha = arr[..., 3]
         if (alpha < 250).any():
             # A real cutout (our _prepare_cutout output): the alpha IS the object mask
@@ -99,13 +99,13 @@ def _repair_unsupported_colors(occ, colors, photo_lab, thresh: float = 16.0,
     if not colors or photo_lab is None or not len(photo_lab):
         return colors
     from scipy.spatial import cKDTree
-    from block_palette import _srgb_to_lab
+    from mcvoxel.block_palette import srgb_to_lab
 
     occ = np.asarray(occ)
     col = np.asarray(colors, dtype=float)
     w = np.array([PHOTO_L_WEIGHT, 1.0, 1.0])
     d, _ = cKDTree(np.asarray(photo_lab, dtype=np.float64) * w).query(
-        _srgb_to_lab(col) * w)
+        srgb_to_lab(col) * w)
     bad = d > thresh
     if not bad.any() or float(bad.mean()) > max_frac:
         return colors
@@ -145,10 +145,10 @@ def _snap_suspect_hues(colors, photo_lab, lo: float = 8.0, hi: float = 16.0):
     if not colors or photo_lab is None or not len(photo_lab):
         return colors
     from scipy.spatial import cKDTree
-    from block_palette import _srgb_to_lab, _lab_to_srgb
+    from mcvoxel.block_palette import srgb_to_lab, lab_to_srgb
 
     col = np.asarray(colors, dtype=np.float64)
-    lab = _srgb_to_lab(col)
+    lab = srgb_to_lab(col)
     w = np.array([PHOTO_L_WEIGHT, 1.0, 1.0])
     ref = np.asarray(photo_lab, dtype=np.float64)
     d, idx = cKDTree(ref * w).query(lab * w)
@@ -156,7 +156,7 @@ def _snap_suspect_hues(colors, photo_lab, lo: float = 8.0, hi: float = 16.0):
     if not band.any():
         return colors
     lab[band, 1:] = ref[idx[band], 1:]
-    col[band] = _lab_to_srgb(lab[band])
+    col[band] = lab_to_srgb(lab[band])
     return [tuple(int(c) for c in np.rint(rgb)) for rgb in col]
 
 
@@ -191,7 +191,7 @@ def _fill_unobserved_colors(occ, colors, photo_lab=None, pair_de: float = 20.0,
     """
     if not colors or len(colors) < 4:
         return colors
-    from block_palette import _srgb_to_lab
+    from mcvoxel.block_palette import srgb_to_lab
 
     occ = np.asarray(occ)
     out = np.asarray(colors, dtype=float)
@@ -216,7 +216,7 @@ def _fill_unobserved_colors(occ, colors, photo_lab=None, pair_de: float = 20.0,
         lo_c, hi_c = int(occ[:, ax].min()), int(occ[:, ax].max())
         if hi_c - lo_c < 3:
             continue
-        lab = _srgb_to_lab(out)
+        lab = srgb_to_lab(out)
 
         mcoord = occ.copy()
         mcoord[:, ax] = (lo_c + hi_c) - occ[:, ax]

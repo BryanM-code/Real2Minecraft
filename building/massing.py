@@ -19,7 +19,7 @@ import numpy as np
 import trimesh
 from scipy import ndimage
 
-from voxelize import _voxelize_surface_sat, _clean_voxels
+from mcvoxel.raster import clean_solid, rasterize_surface, solid_from_surface
 from building.errors import BuildingModeError
 
 
@@ -44,14 +44,11 @@ def solid_from_mesh(verts: np.ndarray, faces: np.ndarray, target_blocks: int):
 
     scaled_verts = np.asarray(mesh.vertices, dtype=np.float64)
     faces_arr = np.asarray(mesh.faces, dtype=np.int64)
-    surf, sat_origin = _voxelize_surface_sat(scaled_verts, faces_arr)
+    surf, sat_origin = rasterize_surface(scaled_verts, faces_arr)
 
-    padded = np.pad(surf, 2)
-    labels, _ = ndimage.label(~padded)
-    exterior = labels == labels[0, 0, 0]
-    solid = (~exterior)[2:-2, 2:-2, 2:-2]
+    solid = solid_from_surface(surf)
 
-    cleaned = _clean_voxels(solid)
+    cleaned = clean_solid(solid)
     if cleaned.any():
         solid = cleaned
     if not solid.any():

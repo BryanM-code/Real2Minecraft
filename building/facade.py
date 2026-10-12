@@ -17,7 +17,7 @@ import numpy as np
 from PIL import Image
 from scipy import ndimage
 
-from block_palette import _srgb_to_lab
+from mcvoxel.block_palette import srgb_to_lab
 from building.ir import CELL_WALL, CELL_WINDOW, CELL_ACCENT, CELL_DOOR
 
 
@@ -198,7 +198,7 @@ def _classify_cells(cell_rgb: np.ndarray, params: dict):
     """cells (R,C,3 uint8) -> (class grid (R,C) uint8, classes IR list)."""
     R, C = cell_rgb.shape[:2]
     flat = cell_rgb.reshape(-1, 3).astype(np.float64)
-    labs = _srgb_to_lab(flat)
+    labs = srgb_to_lab(flat)
     assign, clusters = _kmeans_lab(labs, params["facade_kmeans_k"],
                                    params["facade_kmeans_iters"],
                                    params["facade_merge_de"])
@@ -348,7 +348,7 @@ def analyze_facade(photo_path, cutout_path, params: dict,
         rect_images[fid] = rect
 
         # Rhythm: detrended L-profile autocorrelation, rows then columns.
-        lab_img = _srgb_to_lab(rect_arr.reshape(-1, 3).astype(np.float64))
+        lab_img = srgb_to_lab(rect_arr.reshape(-1, 3).astype(np.float64))
         L = lab_img[:, 0].reshape(out_h, out_w)
         row_prof = L.mean(axis=1)
         row_det = row_prof - ndimage.gaussian_filter1d(

@@ -10,7 +10,7 @@ import os
 import numpy as np
 
 
-def _quantize_colors(occ, colors, grid_shape,
+def quantize_colors(occ, colors, grid_shape,
                      k_init: int = 24,
                      merge_de: float = 12.0,
                      merge_spread_factor: float = 1.2,
@@ -23,7 +23,8 @@ def _quantize_colors(occ, colors, grid_shape,
                      shadow_dl_min: float = 12.0,
                      donor_chroma_min: float = 8.0,
                      shadow_contact_frac: float = 0.25,
-                     shadow_max_frac: float = 0.35):
+                     shadow_max_frac: float = 0.35,
+                     shadow_repaint: bool = True):
     """Collapse noisy per-voxel colors into a few flat color regions before matching.
 
     TRELLIS textures carry baked lighting/AO/noise, so a surface a human reads as ONE
@@ -55,7 +56,10 @@ def _quantize_colors(occ, colors, grid_shape,
     The component's voxels take the donor's centroid — the LIT albedo — so a wall
     shadow rejoins the wall while a roof-edge shadow rejoins the roof.  If accepted
     repaints sum past shadow_max_frac of the build, everything is skipped (misfire
-    guard: a legitimately dark/two-tone model, not a shadow).
+    guard: a legitimately dark/two-tone model, not a shadow).  Stage A2 exists for
+    TRELLIS bakes, whose textures carry lighting; `shadow_repaint=False` skips it for
+    sources whose colours are albedo already, where a near-neutral dark cluster (a slate
+    roof, asphalt, dark trim) is a real material.
 
     Stage B — spatial coherence: connected components (26-conn) smaller than
     max(min_region_floor, N/region_divisor) are absorbed into their most-adjacent
@@ -72,16 +76,16 @@ def _quantize_colors(occ, colors, grid_shape,
         return colors
     import warnings
     from scipy import ndimage
-    from block_palette import L_WEIGHT, _srgb_to_lab, _lab_to_srgb
+    from .block_palette import L_WEIGHT, srgb_to_lab, lab_to_srgb
 
     col = np.clip(np.asarray(colors, dtype=np.float64), 0, 255)
-    labw = _srgb_to_lab(col)
+    labw = srgb_to_lab(col)
     labw[:, 0] *= L_WEIGHT
 
     # ── Stage A: global quantization in weighted LAB ──────────────────────────
     uniq, inv = np.unique(col, axis=0, return_inverse=True)
     if len(uniq) <= k_init:                # tiny/flat builds: uniques ARE the clusters
-        cent = _srgb_to_lab(uniq)
+        cent = srgb_to_lab(uniq)
         cent[:, 0] *= L_WEIGHT
         labels = inv.reshape(-1).astype(np.int64)
     else:
@@ -140,7 +144,7 @@ def _quantize_colors(occ, colors, grid_shape,
 
     # ── Stage A2: shadow → albedo repaint (per connected shadow patch) ────────
     K = len(cent)
-    if K >= 2:
+    if shadow_repaint and K >= 2:
         Lu = cent[:, 0] / L_WEIGHT                   # unweighted lightness
         Cc = np.linalg.norm(cent[:, 1:], axis=1)     # chroma
         grid = np.full(grid_shape, -1, dtype=np.int64)
@@ -292,11 +296,11 @@ def _quantize_colors(occ, colors, grid_shape,
 
     cent_lab = cent.copy()
     cent_lab[:, 0] /= L_WEIGHT
-    cent_rgb = np.clip(np.rint(_lab_to_srgb(cent_lab)), 0, 255).astype(np.int64)
+    cent_rgb = np.clip(np.rint(lab_to_srgb(cent_lab)), 0, 255).astype(np.int64)
     return [tuple(int(c) for c in cent_rgb[l]) for l in labels]
 
 
-def _consolidate_block_ids(colors, block_ids, max_de: float = 10.0):
+def consolidate_block_ids(colors, block_ids, max_de: float = 10.0):
     """Post-match cleanup: merge block ids of clusters that landed on near-identical
     MATERIALS (distance in the weighted-LAB match space).
 
@@ -309,7 +313,7 @@ def _consolidate_block_ids(colors, block_ids, max_de: float = 10.0):
     """
     if not colors or not block_ids:
         return block_ids
-    from block_palette import BLOCK_PALETTE, _match_space
+    from .block_palette import BLOCK_PALETTE, match_space
 
     col = np.clip(np.asarray(colors, dtype=np.float64), 0, 255)
     uniq, first, inv, counts = np.unique(
@@ -319,7 +323,7 @@ def _consolidate_block_ids(colors, block_ids, max_de: float = 10.0):
         return block_ids
     final = [block_ids[i] for i in first]      # one id per unique color (same-color
                                                # voxels always match the same block)
-    pal = {bid: _match_space(np.asarray(BLOCK_PALETTE[bid], dtype=np.float64))
+    pal = {bid: match_space(np.asarray(BLOCK_PALETTE[bid], dtype=np.float64))
            for bid in set(final) if bid in BLOCK_PALETTE}
     order = np.lexsort((np.arange(len(uniq)), -counts))   # biggest cluster first
     for pos in range(1, len(order)):

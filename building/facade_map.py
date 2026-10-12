@@ -22,7 +22,7 @@ import numpy as np
 from PIL import Image
 from scipy import ndimage
 
-from block_palette import _srgb_to_lab, match_blocks, match_blocks_restricted
+from mcvoxel.block_palette import srgb_to_lab, match_blocks, match_blocks_restricted
 from color_repair import _normalize_tone
 from building.ir import CELL_WALL, CELL_WINDOW, CELL_ACCENT, CELL_DOOR
 
@@ -167,14 +167,14 @@ def pick_photo_facing(raw_solid: np.ndarray, colors_raw, facade_bundle,
     rect = facade_bundle["rect_images"][0]
     n = params["facing_thumb"]
     ref = np.asarray(rect.resize((n, n), Image.BOX), dtype=np.float64)
-    ref_lab = _srgb_to_lab(ref.reshape(-1, 3))
+    ref_lab = srgb_to_lab(ref.reshape(-1, 3))
 
     scores = {}
     for d in DIRS:
         face = _face_image(raw_solid, vol, d)
         thumb = np.asarray(Image.fromarray(face.astype(np.uint8)).resize(
             (n, n), Image.BOX), dtype=np.float64)
-        lab = _srgb_to_lab(thumb.reshape(-1, 3))
+        lab = srgb_to_lab(thumb.reshape(-1, 3))
         scores[d] = float(np.linalg.norm(lab - ref_lab, axis=1).mean())
 
     best = min(DIRS, key=lambda d: scores[d])
