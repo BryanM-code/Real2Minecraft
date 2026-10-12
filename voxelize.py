@@ -33,7 +33,7 @@ def voxelize_mesh(norm_path: Path, norm_info: dict,
 
     Pipeline: conservative triangle-box SAT rasterization (gap-free surface shell)
     -> exterior flood fill (everything the outside can't reach becomes solid, which
-    is robust to the non-watertight meshes InstantMesh produces).  The longest axis is
+    is robust to the non-watertight meshes TRELLIS produces).  The longest axis is
     scaled to exactly `target_blocks` (up OR down) so the user controls how much detail
     survives.
 

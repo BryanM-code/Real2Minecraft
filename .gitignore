@@ -7,7 +7,6 @@ __pycache__/
 .venv/
 venv/
 env/
-r2m_v2/
 outputs/
 .smoke/
 .tmp/
@@ -15,5 +14,3 @@ outputs/
 r2m_app/
 # model weights are tracked separately
 models/
-# InstantMesh downloads checkpoints here
-InstantMesh/ckpts/

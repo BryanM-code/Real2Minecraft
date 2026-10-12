@@ -13,7 +13,7 @@ def export_schematic(voxel_data: dict, out_path: Path):
     except ImportError:
         raise RuntimeError(
             "nbtlib is required for .schem export.\n"
-            "Run:  r2m_v2\\Scripts\\pip install nbtlib"
+            "Run:  r2m_app\\Scripts\\pip install nbtlib"
         )
 
     W, H, L = voxel_data["dims"]
