@@ -60,7 +60,7 @@ def normalize_mesh(obj_path: Path) -> tuple:
     # texture directly per voxel preserves its full resolution, whereas baking to
     # per-vertex colors (to_color = one nearest texel per vertex) aliases badly on
     # simplified meshes.  Baked vertex colors stay as the fallback for texture-less
-    # meshes (InstantMesh OBJs carry `v x y z r g b`).  Captured before any processing
+    # meshes (e.g. OBJs that carry `v x y z r g b`).  Captured before any processing
     # so everything stays aligned 1:1 with `verts`.
     tex_uv, tex_image = _extract_texture(mesh)
     vcolors = None
