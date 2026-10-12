@@ -50,6 +50,12 @@ r2m_app\Scripts\python.exe dev_building.py --golden check <tag>    # must print 
 
 Sculpture output must also stay identical on the cached TRELLIS meshes (`dev_rebuild.py`).
 
+## Data rule
+
+This repo is public: code and docs only. Never commit schematics, worlds, meshes, renders of
+third-party builds, training pairs or model weights. `.gitignore` blocks them; do not un-ignore
+or force-add (`git add -f`) them. Datasets and outputs stay local.
+
 ## History
 
 InstantMesh, the LLaVA/Ollama vision pass and the PCA orientation system were removed; do not re-add them.
