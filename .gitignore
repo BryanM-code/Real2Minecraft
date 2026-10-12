@@ -14,3 +14,32 @@ outputs/
 r2m_app/
 # model weights are tracked separately
 models/
+
+# ── Data never goes in this repo (licences: see docs). Code and docs only. ──
+# Minecraft builds and worlds
+*.schem
+*.schematic
+*.litematic
+*.nbt
+*.mcstructure
+*.mcworld
+# Meshes, voxel arrays and training pairs
+*.glb
+*.gltf
+*.obj
+*.mtl
+*.ply
+*.npz
+*.npy
+# Model weights
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.onnx
+# Local data folders
+data/
+datasets/
+pairs/
+checkpoints/
+runs/
