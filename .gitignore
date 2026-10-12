@@ -12,6 +12,7 @@ outputs/
 .smoke/
 .tmp/
 *.egg-info/
+r2m_app/
 # model weights are tracked separately
 models/
 # InstantMesh downloads checkpoints here
