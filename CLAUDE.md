@@ -4,7 +4,7 @@ Turns one photo of a real object (mainly buildings) into a buildable Minecraft `
 Everything runs locally; no cloud APIs. The photo is a reference, not a template: the goal is
 a recognisable, buildable version in real blocks at the scale the user picks.
 
-**Training plan and decisions (D1–D18): `../BuildDataCollector/docs/mesh-to-schem-plan.md`,
+**Training plan and decisions (D1–D21): `../BuildDataCollector/docs/mesh-to-schem-plan.md`,
 Version 4 (2026-10-11).** That file is the source of truth for the learned model, the dataset
 and evaluation. This file only describes the code in this repo.
 

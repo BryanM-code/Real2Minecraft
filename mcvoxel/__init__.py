@@ -14,8 +14,10 @@ Modules
     block_shapes    full / slab / stairs classification and block variants
     roofs           builder-style roofs (Approach B)
     assign          voxel model -> blocks and model-ready encodings
-    vocab           the factored SHAPE x MATERIAL vocabulary
-    blockstates     rotation / mirror with facing remap; stair corners
+    vocab           the factored SHAPE x MATERIAL vocabulary (mcvox-v3): VALID pairs,
+                    training-target encoding, 1.21.11 blockstate validation
+    blockstates     rotation / mirror for every shape; derived states (stair corners,
+                    connections, door halves and hinges, gate in_wall)
     tiling          windowed inference and reassembly for large buildings
     yaw_align       rotate a mesh so its facades sit on the grid axes
 
@@ -26,4 +28,4 @@ Install into another project's venv (editable, so edits here are picked up):
     <venv>\\Scripts\\python -m pip install -e <path to Real2Minecraft>
 """
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"

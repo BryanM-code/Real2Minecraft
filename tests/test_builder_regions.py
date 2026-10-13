@@ -236,16 +236,28 @@ class V2States(unittest.TestCase):
             self.assertIn(prop,self.schema[name],state)
             self.assertIn(value,self.schema[name][prop],state)
 
-    def test_every_shape_material_decode_is_a_valid_1_20_1_state(self):
-        for sh in range(len(vocab.SHAPES)):
-            for mat in range(len(vocab.MATERIALS)):
-                self.assert_valid(vocab.decode(sh,mat))
+    def test_every_v2_pair_still_decodes_to_a_valid_1_20_1_state(self):
+        # The v2 contract: every v2 (shape, material) pair still decodes to the 1.20.1 state
+        # it always did -- except the pairs v3 makes valid with their real 1.21 block (tuff's
+        # slab/stairs/wall, the nether brick fence), which v2 could only colour-substitute.
+        for sh in range(vocab.V2_SHAPE_COUNT):
+            for mat in range(vocab.V2_MATERIAL_COUNT):
+                state=vocab.decode(sh,mat)
+                if vocab.VALID[sh,mat] and state!=vocab._decode_v2(sh,mat):
+                    vocab.validate_state(state,vocab.TARGET_DATA_VERSION)
+                else:
+                    self.assert_valid(state)
 
     def test_new_families_encode_decode_and_symmetry(self):
         for sh,family in ((8,bs.FENCE_VARIANTS),(9,bs.WALL_VARIANTS)):
             for base in family:
                 mat=vocab.MATERIAL_INDEX[base]
-                self.assertEqual(vocab.encode_state(vocab.decode(sh,mat)),(sh,mat))
+                state=vocab.decode(sh,mat)
+                if vocab.VALID[sh,mat]:
+                    self.assertEqual(vocab.encode_state(state),(sh,mat))
+                else:   # v2's deepslate shortcut: cobbled deepslate is its own material in v3
+                    self.assertEqual(vocab.encode_state(state),
+                                     (sh,vocab.MATERIAL_INDEX['minecraft:cobbled_'+base.split(':')[1]]))
         arr=np.array([8,9,1,4,7,255],np.uint8).reshape(3,1,2)
         np.testing.assert_array_equal(rotate_y(arr,4)[0],arr)
         np.testing.assert_array_equal(mirror_x(mirror_x(arr)[0])[0],arr)
