@@ -38,8 +38,8 @@ pip install -e <path to Real2Minecraft>        # editable: edits here are picked
 | `block_shapes` | shape codes, `BLOCK_VARIANTS`, `octant_counts`, `shapes_from_counts`, `classify_shapes`, `apply_shapes`, `base_block` | The octant classifier (full / slab / stairs from sub-voxel occupancy) and the block-variant table. |
 | `roofs` | `builder_roofs`, `plan_roofs`, `apply_roofs`, `top_surface`, `harmonize_roof_materials`, `RoofParams` | Builder-style roofs (Approach B): roof caps rebuilt per slope class the way players build them, canonical repeated courses, shallow connected backing, one material per plane/source-material region. |
 | `assign` | `assign_blocks`, `BlockTarget` | Voxel model to blocks: colour chain (optionally restricted to a `palette`, with `quantize` settings), glass and door rules, shapes, and the model-ready encodings. |
-| `vocab` | `SHAPES`, `MATERIALS`, `encode_state`, `decode`, `IGNORE_*` | The factored vocabulary a model predicts: 10 shapes x 120 materials (`mcvox-v2`; v1 IDs unchanged). |
-| `blockstates` | `rotate_y`, `mirror_x`, `finish_states` | Rotation / mirror remap stair facings; assembled-grid stair corners and fence/wall connections. |
+| `vocab` | `SHAPES`, `MATERIALS`, `VALID`, `classify_state`, `encode_state`, `encode_target`, `decode`, `validate_state`, `IGNORE_*` | The factored vocabulary a model predicts: 30 shapes x 301 materials, 1,210 valid pairs (`mcvox-v3`; v1 and v2 IDs unchanged). See [Vocabulary v3](#vocabulary-v3-mcvox-v3-060). |
+| `blockstates` | `rotate_y`, `mirror_x`, `rotate_state`, `mirror_state`, `finish_states` | Rotation / mirror for every directional and axis shape (grids and blockstate strings); derived states on the assembled grid: stair corners, fence / wall / pane connections, door upper halves and hinges, fence gate `in_wall`. |
 | `tiling` | `window_starts`, `iter_windows`, `assemble` | Overlapping windows over a large grid and blended reassembly of predictions. |
 | `yaw_align` | `estimate_yaw`, `apply_yaw` | Rotate a mesh about +Y so its facades lie on the grid axes. |
 
@@ -87,7 +87,118 @@ Full visual audit, reproduction commands and known limitations are in the siblin
 BuildDataCollector `docs/builder-roof-quality.md`. Its comparison and fixture galleries
 preserve the earlier pilots. No training is part of this change.
 
+## Vocabulary v3 (`mcvox-v3`, 0.6.0)
+
+A target voxel is a (shape, material) pair. The **material** is a texture family, named by
+its full block: `minecraft:dark_oak_planks` also covers dark oak stairs, slabs, fences,
+gates, doors and trapdoors. The **shape** is geometry plus orientation. `VALID[shape,
+material]` (30 x 301, 1,210 true) records which pairs exist in the game. `decode` returns a
+real 1.21.11 blockstate for every valid pair; training targets only hold valid pairs, and
+inference masks the invalid logits.
+
+| IDs | Shapes | Valid materials |
+| --- | --- | --- |
+| 0–9 | air, full, slab_bottom, slab_top, stairs_east / west / north / south, fence, wall (v1, v2) | full: all 300; slab 55; stairs 52; fence 13 (12 woods, nether brick); wall 25 |
+| 10–13 | stairs_top_east / west / north / south: upside-down stairs | the 52 with stairs |
+| 14 | pane | 22: glass, 16 stained glasses, iron bars, 4 copper bars |
+| 15–16 | trapdoor_bottom, trapdoor_top (closed) | 17: 12 woods, iron, 4 copper stages |
+| 17–20 | trapdoor_open_north / south / east / west | the same 17 |
+| 21–24 | door_north / south / east / west: the lower half | the same 17 |
+| 25–26 | full_axis_x, full_axis_z: horizontal pillars | 56: logs, wood, stems, hyphae (stripped too), bamboo blocks, basalt, polished basalt, bone block, deepslate, quartz pillar, purpur pillar, hay, froglights |
+| 27–28 | fence_gate_x, fence_gate_z: a closed gate spanning that axis | 12 woods |
+| 29 | carpet | 17: 16 wools, moss |
+
+Doors and open trapdoors are named by the side of the voxel their plate occupies;
+Minecraft's `facing` is the opposite side. Stair `facing` names the high side for both
+halves.
+
+**Materials: 120 to 301.** IDs 0–119 are v2's (`[air] + sorted(BLOCK_PALETTE) +
+sorted(AUX_PALETTE)`), unchanged. `V3_MATERIALS` appends 181 in a fixed order:
+
+* Woods: pale oak and bamboo planks; the log, stripped log, wood and stripped wood of every
+  1.21 species (stems and hyphae for crimson and warped, bamboo blocks for bamboo).
+* Leaves: the 9 overworld species, azalea and flowering azalea (full-shape materials).
+* The 9 stained glass colours v2 lacked.
+* Stone: mossy cobblestone and stone bricks, cracked and chiseled stone bricks; the deepslate,
+  tuff, sandstone, red sandstone and quartz families; red nether, polished blackstone, end
+  stone and prismarine bricks; polished basalt; purpur pillar.
+* Copper: cut, chiseled, grate and bulb at every oxidation stage.
+* All 16 concrete powders and glazed terracottas.
+* Full blocks the dataset builds with (in at least 2 builds or 200 supervised blocks):
+  mushroom blocks, hay, froglights, glowstone, sea lantern, redstone lamp, bookshelf, beehive,
+  lodestone, netherrack, soul sand, bedrock, sand, suspicious sand, podzol, pale moss, ice,
+  sponge, dried kelp, mangrove roots, dead coral blocks, coal / redstone / diamond /
+  netherite blocks, and five ores.
+
+The app's palettes (`BLOCK_PALETTE`, `BUILDER_PALETTE`, `AUX_PALETTE`) are unchanged; v3
+materials exist only in the vocabulary.
+
+**Derived, never predicted.** `blockstates.finish_states` restores these on the assembled
+grid: stair corners (both halves), fence / wall / pane connections and wall `up`, and a
+door's upper half and hinge (by the game's placement rule). It also sets a fence gate's
+`in_wall`. Properties with no visible effect are dropped: waterlogged, powered, leaf
+distance (decoded leaves are persistent), mushroom faces and snowy.
+
+**Lossy.** These encode, but a visible property is dropped; `classify_state` names the
+reason:
+
+* `door_open`: becomes a closed door on the plate's side.
+* `gate_open`
+* `trapdoor_facing`: closed trapdoors decode facing north.
+* `trapdoor_half`: open trapdoors decode `half=bottom`.
+* `facing`: full blocks with a facing, such as glazed terracotta.
+* `lit`
+* `double_slab`: becomes the full block.
+* `alias`: applied at read time and not part of the vocabulary. `waxed_*` maps to unwaxed,
+  `infested_*` to the host block, and `petrified_oak_slab` to `oak_slab`.
+
+**IGNORE, never air.** `encode_target(blocks, palette, shell, exterior, interior)` makes
+exterior voxels air and encodes the shell blocks the vocabulary holds. Everything else
+becomes IGNORE (shape 255, material 65535):
+
+* the interior
+* decor: torches, lanterns, buttons, plates, signs, banners, ladders, chains, rails,
+  redstone, plants, furniture, beds and heads
+* fluids and snow layers
+* blocks outside the vocabulary
+* a door's upper half
+
+**Target version (D21): Minecraft 1.21.11, DataVersion 4671.** This is the newest 1.21.x;
+pale oak needs 1.21.4 or later.
+
+* `mcvoxel/blocktables/blocks_1_21_11.json` holds the block-property table: 1,166 blocks, from
+  [PrismarineJS minecraft-data](https://github.com/PrismarineJS/minecraft-data/blob/master/data/pc/1.21.11/blocks.json)
+  (MIT). The file keeps the source URL, commit and SHA256.
+* `validate_state(state, TARGET_DATA_VERSION)` checks a state against that table. The
+  default (`V2_DATA_VERSION`, 3465) keeps v2's 1.20.1 rules, so the app's export is
+  unchanged.
+* Two blocks in real-schems-v1 are newer than any 1.21.x and become IGNORE:
+  `poplar_fence` and `stripped_poplar_wood` (one build, DataVersion 5023).
+* BuildDataCollector's reader renames `chain` to `iron_chain` (1.21.9).
+
+**Compatibility.**
+
+* v1 and v2 IDs are unchanged, and every v2 pair still decodes.
+* Pairs v3 does not make valid decode exactly as in v2: deepslate's stairs, slab and wall
+  are cobbled deepslate's; copper's stairs and slab are cut copper's.
+* Eight pairs that v2 substituted now decode to the real block: tuff's slabs, stairs and
+  wall, and the nether brick fence.
+* A 10-way shape head cannot predict v3; there is no checkpoint yet.
+* `tests/fixtures/vocab_mcvox_v2.json` freezes v2's tables and all 1,200 v2 decodes.
+* `tiling`'s shape accumulator grows to 30 x 2 bytes a voxel.
+
 ## History
+
+* 2026-10-12 (`0.6.0`): vocabulary v3 (`mcvox-v3`, decisions D20 and D21). It adds
+  upside-down stairs, panes, trapdoors, doors, horizontal pillars, fence gates and carpets;
+  materials grow from 120 to 301, with a `VALID` table and `encode_target` (IGNORE, never
+  air).
+  * Validation targets 1.21.11.
+  * `rotate_state` / `mirror_state`; `finish_states` restores door halves and hinges, pane
+    connections and gate `in_wall`.
+  * Covers 98.5% of real-schems-v1's supervised blocks, against 75.9% for v2.
+  * App output is unchanged: golden clean, and sculpture identical on 53 cached meshes in
+    both colour modes.
 
 * 2026-09-30 (`0.4.0`): coherent roof lattices and exported backing; contextual fences
   and walls; append-only vocabulary v2; column-aware enclosure; parapet preservation.

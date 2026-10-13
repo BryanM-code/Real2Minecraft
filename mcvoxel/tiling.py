@@ -11,15 +11,17 @@ windows and reassembled into one grid:
   the grid boundary (where no neighbour exists to take over). Probabilities are summed and
   normalised, then argmax'd. Predictions near a window's edge -- where the model has least
   context -- are outvoted by the window that sees the same voxel centrally.
-* **Material: most-central window wins.** Blending ~130 material probability maps over a
+* **Material: most-central window wins.** Blending ~300 material probability maps over a
   large grid would cost gigabytes; instead each voxel keeps the material from the window in
   which its blending weight is highest.
 
-Neighbour-dependent block states (stair corners) are derived after assembly, over the whole
-grid, by `blockstates.stair_shapes` -- never predicted per window.
+Neighbour-dependent block states (stair corners, connections, door halves and hinges, gate
+in_wall) are derived after assembly, over the whole grid, by `blockstates.finish_states` --
+never predicted per window.
 
-Memory: the shape accumulator is (n_shapes, X, Y, Z) float16 -- 8 x 2 bytes a voxel, so a
-256 x 384 x 256 bounding box needs about 400 MB; everything else is one byte or two a voxel.
+Memory: the shape accumulator is (n_shapes, X, Y, Z) float16 -- 30 x 2 bytes a voxel with
+mcvox-v3, so a 256 x 384 x 256 bounding box needs about 1.5 GB; everything else is one byte
+or two a voxel.
 """
 from __future__ import annotations
 
