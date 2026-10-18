@@ -28,4 +28,4 @@ Install into another project's venv (editable, so edits here are picked up):
     <venv>\\Scripts\\python -m pip install -e <path to Real2Minecraft>
 """
 
-__version__ = "0.6.0"
+__version__ = "0.6.1"

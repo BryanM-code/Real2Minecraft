@@ -22,7 +22,9 @@ Conventions (verified, not assumed):
   trapdoor; each copper oxidation stage (`copper_block`, `exposed_copper`, ...) likewise.
 
 Append-only history: v1 had shapes 0-7, v2 added fence and wall (8, 9); v3 appends shapes
-10-29 and materials 120+. Every older ID is unchanged and every v2 pair still decodes
+10-29 and materials 120-300, and 0.6.1 appends materials 301-312 within v3 (a digest of
+`vocab_json()`, not the version name, tells the two apart). Every older ID is unchanged
+(`tests/fixtures/vocab_mcvox_v3_0.json`) and every v2 pair still decodes
 (`decode(..., strict=False)` falls back exactly as v2 did for pairs v3 does not make
 valid). The app's colour palettes (`BLOCK_PALETTE`, `BUILDER_PALETTE`, `AUX_PALETTE`) are
 untouched: v3 materials live in `V3_MATERIALS` only.
@@ -157,6 +159,13 @@ def _v3_material_names() -> list[str]:
               "dead_fire_coral_block", "dead_horn_coral_block",
               "coal_block", "redstone_block", "diamond_block", "netherite_block",
               "coal_ore", "iron_ore", "lapis_ore", "diamond_ore", "nether_quartz_ore"]
+    # Appended 2026-10-17 (0.6.1), IDs 301-312: building material the Phase 3 re-crop kept (ore,
+    # gravel and sand facades, blackstone trim), which met the same data rule then. On the
+    # later targets shroomlight, redstone ore and honey block fall below it; they stay, like
+    # the other family members no supervised block uses.
+    names += ["gold_ore", "emerald_ore", "redstone_ore", "emerald_block",
+              "chiseled_polished_blackstone", "suspicious_gravel", "rooted_dirt", "red_sand",
+              "shroomlight", "honey_block", "bee_nest", "bamboo_mosaic"]
     return ["minecraft:" + n for n in names]
 
 
@@ -232,7 +241,8 @@ def _families():
              "polished_blackstone_brick_stairs", "polished_blackstone_brick_wall"),
             ("end_stone_bricks", "end_stone_brick_slab", "end_stone_brick_stairs",
              "end_stone_brick_wall"),
-            ("prismarine_bricks", "prismarine_brick_slab", "prismarine_brick_stairs", None)):
+            ("prismarine_bricks", "prismarine_brick_slab", "prismarine_brick_stairs", None),
+            ("bamboo_mosaic", "bamboo_mosaic_slab", "bamboo_mosaic_stairs", None)):
         put(base, slab=slab, stairs=stairs, wall=wall)
     axis = {"minecraft:" + n for n in (
         "basalt", "polished_basalt", "bone_block", "deepslate", "quartz_pillar", "hay_block",

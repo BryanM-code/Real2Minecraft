@@ -62,6 +62,32 @@ class AppendOnly(unittest.TestCase):
         self.assertEqual(sorted({m for _, m in changed}),
                          ["minecraft:nether_bricks", "minecraft:tuff"])
 
+    def test_v3_ids_unchanged_by_the_append(self):
+        v3 = json.loads((FIXTURES / "vocab_mcvox_v3_0.json").read_text(encoding="utf-8"))
+        self.assertEqual(V.SHAPES, v3["shapes"])
+        self.assertEqual(V.MATERIALS[:len(v3["materials"])], v3["materials"])
+        for shape, mats in v3["valid"].items():           # every 0.6.0 pair is still valid
+            self.assertTrue(V.VALID[S[shape], mats].all(), shape)
+        appended = ["gold_ore", "emerald_ore", "redstone_ore", "emerald_block",
+                    "chiseled_polished_blackstone", "suspicious_gravel", "rooted_dirt", "red_sand",
+                    "shroomlight", "honey_block", "bee_nest", "bamboo_mosaic"]
+        self.assertEqual(V.MATERIALS[len(v3["materials"]):], ["minecraft:" + n for n in appended])
+        self.assertEqual(int(V.VALID.sum()), v3["valid_pairs"] + 22)  # 12 full, mosaic slab + stairs
+
+    def test_appended_materials_encode(self):
+        for state, shape, material, status in (
+                ("minecraft:gold_ore", "full", "gold_ore", "exact"),
+                ("minecraft:suspicious_gravel[dusted=2]", "full", "suspicious_gravel", "exact"),
+                ("minecraft:redstone_ore[lit=true]", "full", "redstone_ore", "lossy"),
+                ("minecraft:bee_nest[facing=east,honey_level=3]", "full", "bee_nest", "lossy"),
+                ("minecraft:bamboo_mosaic_slab[type=top,waterlogged=false]", "slab_top",
+                 "bamboo_mosaic", "exact"),
+                ("minecraft:bamboo_mosaic_stairs[facing=west,half=bottom,shape=straight]",
+                 "stairs_west", "bamboo_mosaic", "exact")):
+            c = V.classify_state(state)
+            self.assertEqual((c["shape"], c["material"], c["status"]),
+                             (S[shape], M["minecraft:" + material], status), state)
+
     def test_app_palettes_untouched(self):
         from mcvoxel.block_palette import AUX_PALETTE, BLOCK_PALETTE, BUILDER_PALETTE
         self.assertEqual((len(BLOCK_PALETTE), len(AUX_PALETTE), len(BUILDER_PALETTE)), (110, 9, 72))
@@ -168,7 +194,7 @@ class Encoding(unittest.TestCase):
         self.check("minecraft:petrified_oak_slab[type=top]", "slab_top", "oak_planks", "lossy", "alias")
         for decor in ("minecraft:torch", "minecraft:oak_wall_sign[facing=north]", "minecraft:snow[layers=1]",
                       "minecraft:water[level=0]", "minecraft:chest[facing=north]", "minecraft:rail",
-                      "minecraft:poplar_fence", "minecraft:bamboo_mosaic"):
+                      "minecraft:poplar_fence", "minecraft:gilded_blackstone"):
             self.assertEqual(V.classify_state(decor)["status"], "ignore", decor)
             self.assertEqual(V.encode_state(decor), (V.SHAPE_FULL, None))
 
