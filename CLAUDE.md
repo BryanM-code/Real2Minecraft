@@ -29,7 +29,7 @@ lifts brightness. Colour repair never changes geometry.
 | `app.py`, `config.py`, `trellis_client.py`, `mesh_normalize.py`, `voxelize.py`, `color_repair.py`, `schematic.py`, `voxel_view.py`, `block_textures.py` | the Tk app and its app-only stages (scripts run from this folder, not a package) |
 | `building/` | Building mode B1–B5, IR-in/IR-out stages. Bump `PIPELINE_VERSION` in `building/params.py` on any behaviour change. Active as the baseline (D18) |
 | `mcvoxel/` | shared voxel/block core, the only installable package (`pyproject.toml`); BDC installs it editable. See `mcvoxel/README.md` |
-| `training/` | offline training tooling; never imported by the app |
+| `training/` | Phase 5, offline: scoring, the rule-based baseline runner, the pair cache and loader, the U-Net, training and whole-build inference (`training/README.md`); never imported by the app |
 | `dev_building.py`, `dev_rebuild.py`, `dev_golden.json` | offline harnesses on cached TRELLIS meshes in `outputs/trellis/`; the building-mode golden |
 | `../BuildDataCollector/synth/` | training-pair generation: `degrade.py` (TRELLIS-like inputs), `trellis_compare.py`, `real_eval.py` |
 | `outputs/` | gitignored: TRELLIS GLBs, renders, per-run `dataset/` samples, `dataset_dev/` |
@@ -37,6 +37,7 @@ lifts brightness. Colour repair never changes geometry.
 ## Environment
 
 - Venv `r2m_app` (Python 3.10, untracked; recreate from `requirements.txt`). No torch here.
+- Venv `r2m_train` (Python 3.10, untracked; CUDA PyTorch, recreate from `training/requirements.txt`): only for `training/`.
 - Run: `r2m_app\Scripts\python.exe app.py` with the TRELLIS server up (`http://127.0.0.1:7960/ping`).
 - TRELLIS lives in its own bundle at `C:\TRELLIS` (Python 3.11, torch, CUDA); the app only talks HTTP.
 
