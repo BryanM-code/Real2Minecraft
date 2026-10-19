@@ -1,7 +1,6 @@
-"""Training-data generation for the learned mesh->build model.
+"""Phase 5: train and evaluate the learned model that turns a voxelised TRELLIS mesh into blocks.
 
-This package is OFFLINE tooling: it never runs as part of the app pipeline. It exists to
-manufacture (melted mesh, block grid) training pairs by running the EASY direction —
-a downloaded .schem is already the label, so we render it to a mesh and degrade that mesh
-to imitate a TRELLIS reconstruction, rather than trying to find meshes that match builds.
+Offline tooling: the app never imports it. The training pairs are made in BuildDataCollector
+(`schemset.pairs`, docs/pairs-v1.md); this package reads them, trains the model, and scores
+it and the rule-based baseline (D18) the same way. See training/README.md.
 """

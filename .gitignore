@@ -12,6 +12,7 @@ outputs/
 .tmp/
 *.egg-info/
 r2m_app/
+r2m_train/
 # model weights are tracked separately
 models/
 
