@@ -1,0 +1,23 @@
+# The photo-first pipeline's extra packages, on top of r2m_train (training/requirements.txt).
+# MoGe and its geometry helper go in without their dependency lists: MoGe's own list pulls in
+# gradio and other demo packages. From the repository root:
+#
+#   r2m_train\Scripts\python -m pip install --no-deps "git+https://github.com/microsoft/MoGe.git@74fbce054ebed49800de42d0ad0e83495065719a" "utils3d_moge @ git+https://github.com/EasternJournalist/utils3d-moge.git@62f09d58509485564e24d5d9f6aac9ee9ebc0c37"
+#   r2m_train\Scripts\python -m pip install -r photofirst/requirements.txt
+#
+# MoGe-3 (front.MODELS[3], `--moge 3`) also needs FlexGEMM, which runs on Triton: on Windows
+# the community build triton-windows, 3.6 for torch 2.11 (2.10/2.11 -> 3.6). FlexGEMM's CUDA
+# extension is opt-in (FLEX_GEMM_BUILD_CUDA=1); without it the install is pure Triton and needs
+# no compiler. At the commit MoGe pins:
+#
+#   git clone https://github.com/JeffreyXiang/FlexGEMM.git && cd FlexGEMM
+#   git checkout b2fadb29d41846c7981ade6801ffc689fae119cf
+#   ..\r2m_train\Scripts\python -m pip install . --no-build-isolation --no-deps
+#
+# Weights download into the Hugging Face cache on first use and never go in this repository:
+# Ruicheng/moge-2-vitl-normal (model.pt, 1.32 GB), Ruicheng/moge-3-vitl (model.pt, 1.38 GB).
+huggingface_hub==2.2.0
+opencv-python-headless==5.0.0.93
+triton-windows==3.6.0.post26; platform_system == "Windows"
+wheel==0.48.0
+filelock

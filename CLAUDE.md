@@ -30,6 +30,7 @@ lifts brightness. Colour repair never changes geometry.
 | `building/` | Building mode B1–B5, IR-in/IR-out stages. Bump `PIPELINE_VERSION` in `building/params.py` on any behaviour change. Active as the baseline (D18) |
 | `mcvoxel/` | shared voxel/block core, the only installable package (`pyproject.toml`); BDC installs it editable. See `mcvoxel/README.md` |
 | `training/` | Phase 5, offline: scoring, the rule-based baseline runner, the pair cache and loader, the U-Net, training and whole-build inference (`training/README.md`); never imported by the app |
+| `photofirst/` | experimental photo-first pipeline, separate from TRELLIS: MoGe-2 depth → the blocks the photo shows → a completion model (training's U-Net) → the build (`photofirst/README.md`); offline, never imported by the app |
 | `dev_building.py`, `dev_rebuild.py`, `dev_golden.json` | offline harnesses on cached TRELLIS meshes in `outputs/trellis/`; the building-mode golden |
 | `../BuildDataCollector/synth/` | training-pair generation: `degrade.py` (TRELLIS-like inputs), `trellis_compare.py`, `real_eval.py` |
 | `outputs/` | gitignored: TRELLIS GLBs, renders, per-run `dataset/` samples, `dataset_dev/` |
