@@ -232,7 +232,7 @@ class CompletionDataset:
 
     def __init__(self, dataset: Path, split: str = "train", length: int = 4000, seed: int = 0,
                  symmetries: bool = True, colour: bool = True, ids=None, noise=None, photo_colour: bool = False,
-                 n_views=(1, 1), carve: bool = True):
+                 n_views=(1, 1), carve: bool = True, real_pairs=None, real_share: float = 0.0):
         self.dataset, self.length, self.seed = Path(dataset), int(length), int(seed)
         self.symmetries, self.colour, self.noise = symmetries, colour, noise
         self.colour_params = PHOTO_COLOUR if photo_colour else COLOUR
@@ -242,6 +242,15 @@ class CompletionDataset:
         self.builds = list(ids) if ids is not None else store.ids(split)
         self.views = {b: store.n_views(b) for b in self.builds}
         self.weights = D.build_weights([{"id": b, "target_dims": store.builds[b]["dims"]} for b in self.builds])
+        self.real_dir, self.real_share, self.real = None, float(real_share), {}
+        if real_pairs is not None:               # the front end's own inputs (`mv_pairs`)
+            self.real_dir = Path(real_pairs)
+            index = json.loads((self.real_dir / "index.json").read_text(encoding="utf-8"))["pairs"]
+            for name, e in sorted(index.items()):
+                if e["build"] in self.views:
+                    self.real.setdefault(e["build"], []).append(name)
+            self.real_builds = sorted(self.real)
+            self.real_weights = D.build_weights([{"id": b, "target_dims": store.builds[b]["dims"]} for b in self.real_builds])
         self.epoch = 0
 
     def __len__(self):
@@ -252,6 +261,8 @@ class CompletionDataset:
             self.store = Store(self.dataset)
             self.table = material_rgb()
         rng = np.random.default_rng([self.seed, self.epoch, int(i)])
+        if self.real and rng.random() < self.real_share:
+            return self._real_item(rng)
         bid = self.builds[int(rng.choice(len(self.builds), p=self.weights))]
         n = int(rng.integers(self.n_views[0], self.n_views[1] + 1))
         ks = rng.choice(self.views[bid], size=min(n, self.views[bid]), replace=False)
@@ -266,3 +277,19 @@ class CompletionDataset:
         if self.symmetries:
             w_i, w_s, w_m = D.symmetry(w_i, w_s, w_m, int(rng.integers(4)), bool(rng.integers(2)))
         return D.to_tensors(upsample(w_i), w_s, w_m, start)
+
+    def _real_item(self, rng):
+        """A window of one of the front end's real inputs of a build (a random photo set)."""
+        bid = self.real_builds[int(rng.choice(len(self.real_builds), p=self.real_weights))]
+        names = self.real[bid]
+        inp = np.load(self.real_dir / f"{names[int(rng.integers(len(names)))]}.npz")["input"]
+        _, w_s, w_m, start = window(self.store, bid, 0, rng, self.table, colour=None)
+        f = 2 if tuple(inp.shape[:3]) == tuple(2 * d for d in self.store.builds[bid]["dims"]) else 1
+        size = f * D.WINDOW                      # 2: the input is at the model's resolution already
+        hi = np.minimum(f * start + size, inp.shape[:3])
+        n = tuple(b - a for a, b in zip(f * start, hi))
+        w_i = np.zeros((size,) * 3 + (5,), np.uint8)
+        w_i[:n[0], :n[1], :n[2]] = inp[tuple(slice(a, b) for a, b in zip(f * start, hi))]
+        if self.symmetries:
+            w_i, w_s, w_m = D.symmetry(w_i, w_s, w_m, int(rng.integers(4)), bool(rng.integers(2)))
+        return D.to_tensors(upsample(w_i) if f == 1 else w_i, w_s, w_m, start)
