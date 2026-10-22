@@ -31,9 +31,10 @@ from . import data as P
 from .views import OUT_DIR
 
 
-def validate(model, store, ids, table, device="cuda", front_dir=None) -> dict:
+def validate(model, store, ids, table, device="cuda", front_dir=None, passes: int = 1, temperature: float = 1.0) -> dict:
     """Scores on the val builds: their true view-0 inputs, or (`front_dir`) the front end's
-    inputs saved by `evaluate_front` (the builds it has)."""
+    inputs saved by `evaluate_front` (the builds it has). `passes` > 1: a masked model decoded
+    over that many passes (`masked.decode`)."""
     rows = []
     t0 = time.time()
     for bid in ids:
@@ -42,10 +43,15 @@ def validate(model, store, ids, table, device="cuda", front_dir=None) -> dict:
             p = Path(front_dir) / f"{bid}.npz"
             if not p.is_file():
                 continue
-            inp = P.upsample(np.load(p)["input"])
+            inp = np.load(p)["input"]
+            inp = P.upsample(inp) if inp.shape[:3] == tuple(ts.shape) else inp     # 1 or 2 cells per block
         else:
             inp = P.full_input(store, bid, 0, table)
-        ps, pm = predict_grid(model, inp, ts.shape, device=device)
+        if passes > 1:
+            from .masked import decode
+            ps, pm = decode(model, inp, ts.shape, passes=passes, temperature=temperature, device=device)
+        else:
+            ps, pm = predict_grid(model, inp, ts.shape, device=device)
         r = score(ps, pm, np.asarray(ts), np.asarray(tm))
         r["id"] = bid
         rows.append(r)
@@ -84,6 +90,16 @@ def main(argv=None) -> int:
     ap.add_argument("--val-front", default=None,
                     help="also validate on the front end's inputs of the val builds (photofirst/front/<this>/), "
                          "keeping best_front.pt")
+    ap.add_argument("--real-pairs", default=None,
+                    help="also train on the front end's own inputs: photofirst/mv_pairs/<this>/ (mv_pairs)")
+    ap.add_argument("--real-share", type=float, default=0.7, help="share of samples from --real-pairs")
+    ap.add_argument("--init", default=None, help="start from this run's best_front.pt (or a .pt path)")
+    ap.add_argument("--masked", action="store_true",
+                    help="iterative completion (photofirst.masked): decided blocks as inputs, loss on the rest")
+    ap.add_argument("--val-passes", type=int, default=1, help="with --masked: decoding passes on the front-end val inputs")
+    ap.add_argument("--val-temperature", type=float, default=1.0, help="with --val-passes: the decoding temperature")
+    ap.add_argument("--wrong-tokens", type=float, default=0.0,
+                    help="with --masked: share of the given blocks given wrong (masked.given_tokens)")
     ap.add_argument("--resume", action="store_true")
     args = ap.parse_args(argv)
     if hasattr(sys.stdout, "reconfigure"):
@@ -100,9 +116,21 @@ def main(argv=None) -> int:
     ds = P.CompletionDataset(dataset, "train", length=args.steps * args.batch, seed=args.seed,
                              colour=not args.no_colour, noise=P.FRONT_NOISE if args.front_noise else None,
                              photo_colour=args.photo_colour, n_views=tuple(args.views_per_sample),
-                             carve=not args.no_carve)
+                             carve=not args.no_carve,
+                             real_pairs=dataset / OUT_DIR / "mv_pairs" / args.real_pairs if args.real_pairs else None,
+                             real_share=args.real_share)
     weights, counts = class_weights(store, [{"id": b} for b in ds.builds], args.weight_power, args.weight_cap)
-    model = UNet3D(tuple(args.widths), args.blocks).to(device)
+    if args.masked:
+        from .masked import MaskedUNet3D, masked_losses
+        model = MaskedUNet3D(tuple(args.widths), args.blocks).to(device)
+    else:
+        model = UNet3D(tuple(args.widths), args.blocks).to(device)
+    loss_fn = (lambda m, b, w, d: masked_losses(m, b, w, d, args.wrong_tokens)) if args.masked else losses
+    if args.init and not args.resume:
+        p = Path(args.init) if args.init.endswith(".pt") else dataset / OUT_DIR / "runs" / args.init / "best_front.pt"
+        missing, unexpected = model.load_state_dict(torch.load(p, map_location=device, weights_only=False)["model"],
+                                                    strict=not args.masked)
+        print(f"initialised from {p}" + (f" (new: {', '.join(sorted({k.split('.')[0] for k in missing}))})" if missing else ""))
     opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     step, best, best_front = 0, None, None
     if args.resume and (run / "last.pt").is_file():
@@ -114,7 +142,8 @@ def main(argv=None) -> int:
     front_dir = dataset / OUT_DIR / "front" / args.val_front if args.val_front else None
     val_ids = store.ids("val")
     config = {**vars(args), "dataset": str(dataset), "params": sum(p.numel() for p in model.parameters()),
-              "train_builds": len(ds.builds), "train_views": sum(ds.views.values()), "val_builds": len(val_ids),
+              "train_builds": len(ds.builds), "train_views": sum(ds.views.values()),
+              "real_pairs": sum(len(v) for v in ds.real.values()), "real_builds": len(ds.real), "val_builds": len(val_ids),
               "torch": torch.__version__, "model": model.config, "views": store.manifest.get("settings"),
               "class_weights": weights.tolist()}
     (run / "config.json").write_text(json.dumps(config, indent=1, default=str), encoding="utf-8", newline="\n")
@@ -133,7 +162,7 @@ def main(argv=None) -> int:
         acc["wait"] += time.time() - t_wait
         for g in opt.param_groups:
             g["lr"] = lr_at(step, args.steps, args.lr, args.warmup)
-        shape_loss, material_loss = losses(model, batch, w, device)
+        shape_loss, material_loss = loss_fn(model, batch, w, device)
         loss = shape_loss + material_loss
         opt.zero_grad(set_to_none=True)
         loss.backward()
@@ -160,7 +189,8 @@ def main(argv=None) -> int:
             improved = best is None or (sel is not None and sel > best)
             if improved:
                 best = sel
-            vf = validate(model, store, val_ids, table, device, front_dir) if front_dir else None
+            vf = validate(model, store, val_ids, table, device, front_dir,
+                          passes=args.val_passes if args.masked else 1, temperature=args.val_temperature) if front_dir else None
             improved_f = vf is not None and vf["select"] is not None and (best_front is None or vf["select"] > best_front)
             if improved_f:
                 best_front = vf["select"]

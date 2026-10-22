@@ -98,7 +98,8 @@ def estimate_stretch(points: np.ndarray, valid: np.ndarray, R: np.ndarray, stret
     return best
 
 
-def frame_from_normals(normals: np.ndarray, image_up=(0.0, -1.0, 0.0), roll: bool = False) -> np.ndarray:
+def frame_from_normals(normals: np.ndarray, image_up=(0.0, -1.0, 0.0), roll: bool = False,
+                       pitch_range=(-20.0, 60.0)) -> np.ndarray:
     """Camera -> build rotation from surface normals (camera frame, unit) alone: the up
     direction is the one most normals are perpendicular to (walls) or along (roofs, ground),
     searched over the camera's pitch (and, with `roll`, its roll; photos are rarely rolled);
@@ -107,7 +108,8 @@ def frame_from_normals(normals: np.ndarray, image_up=(0.0, -1.0, 0.0), roll: boo
     within hard thresholds finds the right region robustly but has a plateau a few degrees
     wide; a smooth score then centres it within 3 degrees. On the 25 perspective renders the
     up direction is off by 1.5 degrees (median; 3.9 at p90): hard alone 2.0 (5.0), smooth
-    alone 1.5 (8.1), MoGe's predicted normals 4.0 (13.1)."""
+    alone 1.5 (8.1), MoGe's predicted normals 4.0 (13.1). `pitch_range`: degrees, looking down
+    positive (the renders look down 5-30; a street photo of a tall building looks up)."""
     n = normals[np.isfinite(normals).all(-1)]
     n = n[:: max(1, len(n) // 20000)]
     a0 = np.asarray(image_up, float)
@@ -128,7 +130,8 @@ def frame_from_normals(normals: np.ndarray, image_up=(0.0, -1.0, 0.0), roll: boo
                 if best is None or score > best[0]:
                     best = (score, u, np.degrees(pitch), np.degrees(r))
         return best
-    _, _, p0, r0 = best_up(np.arange(-20, 60.01, 0.5), np.arange(-12, 12.01, 1.0) if roll else [0.0], smooth=False)
+    _, _, p0, r0 = best_up(np.arange(pitch_range[0], pitch_range[1] + 0.01, 0.5),
+                           np.arange(-12, 12.01, 1.0) if roll else [0.0], smooth=False)
     _, up, _, _ = best_up(np.arange(p0 - 3, p0 + 3.01, 0.25),
                           np.arange(r0 - 2, r0 + 2.01, 0.5) if roll else [0.0], smooth=True)
     up = up / np.linalg.norm(up)

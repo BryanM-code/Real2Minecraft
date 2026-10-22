@@ -93,9 +93,13 @@ class UNet3D(nn.Module):
             return torch.utils.checkpoint.checkpoint(module, x, use_reentrant=False)
         return module(x)
 
-    def forward(self, x):
-        """(B, 6, 2w, 2w, 2w) -> (shape logits (B, 30, w, w, w), features (B, C, w, w, w))."""
+    def forward(self, x, extra=None):
+        """(B, 6, 2w, 2w, 2w) -> (shape logits (B, 30, w, w, w), features (B, C, w, w, w)).
+        `extra` (B, widths[0], w, w, w) is added after the stem (`photofirst.masked`'s
+        decided blocks)."""
         h = self.stem(space_to_depth(x))
+        if extra is not None:
+            h = h + extra
         skips = []
         for i, block in enumerate(self.enc):
             h = self._run(block, h)

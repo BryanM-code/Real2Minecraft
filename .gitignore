@@ -13,6 +13,7 @@ outputs/
 *.egg-info/
 r2m_app/
 r2m_train/
+r2m_da3/
 # model weights are tracked separately
 models/
 
