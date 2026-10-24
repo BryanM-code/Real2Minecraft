@@ -39,6 +39,12 @@ def main(argv=None) -> int:
     ap.add_argument("--temperature", type=float, default=1.0)
     ap.add_argument("--splits", nargs="*", default=["val"])
     ap.add_argument("--tag", default=None)
+    ap.add_argument("--shape-bias", type=float, default=0.0,
+                    help="decoding calibration: solid shapes reweighted by (the run's class weight / full's) ** this "
+                         "(training.predict.predict_grid shape_prior); 0 = plain argmax")
+    ap.add_argument("--free", action="store_true",
+                    help="inputs saved by evaluate_mv --placement free: the model on the input as placed (its own "
+                         "grid, as on real photos), the prediction put on the human build by the input's alignment")
     args = ap.parse_args(argv)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
@@ -46,11 +52,16 @@ def main(argv=None) -> int:
     from .masked import decode, load_any
     dataset = args.dataset.resolve()
     pf = dataset / OUT_DIR
-    tag = args.tag or f"{args.inputs}__{args.run}" + (f"_p{args.passes}" if args.passes > 1 else "")
+    tag = args.tag or (f"{args.inputs}__{args.run}" + (f"_p{args.passes}" if args.passes > 1 else "")
+                       + (f"_sb{args.shape_bias:g}" if args.shape_bias else "") + ("_free" if args.free else ""))
     out_dir = pf / "front" / tag
     out_dir.mkdir(parents=True, exist_ok=True)
     store = P.Store(dataset)
     model, ck = load_any(pf / "runs" / args.run / args.checkpoint)
+    prior = None
+    if args.shape_bias:
+        cw = np.asarray(json.loads((pf / "runs" / args.run / "config.json").read_text(encoding="utf-8"))["class_weights"])
+        prior = (cw / cw[1]) ** args.shape_bias
     rows = []
     for f in sorted((pf / "front" / args.inputs).glob("*.npz")):
         if f.name.endswith(".pred.npz"):
@@ -59,12 +70,25 @@ def main(argv=None) -> int:
         if store.builds.get(bid, {}).get("split") not in args.splits:
             continue
         ts, tm = (np.asarray(a) for a in store.target(bid))
-        inp = M.model_input(np.load(f)["input"], ts.shape)
+        z = np.load(f)
+        if args.free:
+            from mcvoxel.blockstates import rotate_y
+            from training.score import _place
+            raw = z["free_input"]
+            dims = tuple(int(d) // 2 for d in raw.shape[:3])
+        else:
+            raw, dims = z["input"], ts.shape
+        inp = M.model_input(raw, dims)
         t = time.time()
         if args.passes > 1:
-            ps, pm = decode(model, inp, ts.shape, passes=args.passes, temperature=args.temperature)
+            ps, pm = decode(model, inp, dims, passes=args.passes, temperature=args.temperature)
         else:
-            ps, pm = predict_grid(model, inp, ts.shape)
+            ps, pm = predict_grid(model, inp, dims, shape_prior=prior)
+        if args.free:                                       # onto the human build by the input's own alignment
+            k = int(z["free_turns"]) % 4
+            ps, pm = rotate_y(ps, k, pm) if k else (ps, pm)
+            ps, pm = (_place(ps, [int(v) for v in z["free_shift"]], ts.shape, 0),
+                      _place(pm, [int(v) for v in z["free_shift"]], ts.shape, 0))
         np.savez_compressed(out_dir / f"{bid}.pred.npz", shape=ps, material=pm)
         r = {"id": bid, "score": score(ps, pm, ts, tm), "parts": Q.parts(ps, pm, ts, tm),
              "quality": Q.quality(ps, pm), "human": Q.quality(ts, tm, target=True), "seconds": time.time() - t}
@@ -73,7 +97,7 @@ def main(argv=None) -> int:
         print(f"{bid:58s} IoU {s['iou']:.3f}  F1~1 {s['f1_tol1']:.3f}  material {s['material_acc']:.3f}  "
               f"stairs F1 {r['parts']['stairs']['f1']:.2f}  glass F1 {r['parts']['glass']['f1']:.2f}  "
               f"({r['seconds']:.0f} s)", flush=True)
-    summary = {"inputs": args.inputs, "run": args.run, "checkpoint": args.checkpoint, "step": ck.get("step"),
+    summary = {"inputs": args.inputs, "free": args.free, "shape_bias": args.shape_bias, "run": args.run, "checkpoint": args.checkpoint, "step": ck.get("step"),
                "passes": args.passes, "temperature": args.temperature, "builds": len(rows),
                "score": summarize([r["score"] for r in rows]),
                "parts": {k: {m: float(np.nanmean([r["parts"][k][m] for r in rows])) for m in ("precision", "recall", "f1")}

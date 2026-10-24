@@ -50,15 +50,31 @@ def _worker_init():
     M.FFT_WORKERS = 2
 
 
+def free_pair(views, masks, sim, ts, tm, eye: float, res: int) -> tuple:
+    """A photo set placed as on real photos (`place.free_placement`, the true scale; the
+    ground at the lowest visible point, or with `eye` at eye height below the cameras) and the
+    human build moved into that frame: the
+    inverse of the input's alignment onto it (`front_mv.onto_target`, `front_mv.target_into`).
+    Returns (input, target shape, target material, what was done)."""
+    from . import place as PL
+    sim_f, dims_f, pinfo = PL.free_placement(views, masks, metres_per_block=1.0 / sim["s"],
+                                             eye_units=None if eye is None else eye / sim["s"])
+    inp = M.to_grid(views, sim_f, dims_f, masks, res=res)
+    _, ainfo = M.onto_target(inp, dims_f, ts, tm)
+    t_s, t_m = M.target_into(ts, tm, ainfo, dims_f)
+    return inp, t_s, t_m, {"free": pinfo, "alignment": ainfo}
+
+
 def place_pair(job) -> tuple:
     """The CPU part of one photo set (in a worker process when `--workers` > 1): placement on
     the target, blocks, written atomically (a stopped run leaves no half file), metrics.
-    Returns (name, index entry, seconds)."""
+    With placement "oracle+free" also the pair placed as on real photos (`free_pair`), into
+    `<out_dir>_free`. Returns (name, index entry, seconds, the free pair's entry or None)."""
     import os
-    dataset, out_dir, bid, name, keys, views, res, placement = job
+    dataset, out_dir, bid, name, keys, views, res, placement, renders = job
     t = time.time()
     pf = Path(dataset) / OUT_DIR
-    folder = pf / TRAIN_DIR / bid
+    folder = pf / renders / bid
     cams = json.loads((folder / "cameras.json").read_text(encoding="utf-8"))
     ts = np.load(pf / "targets" / f"{bid}.shape.npy")
     h, w = views[0]["pts"].shape[:2]
@@ -66,6 +82,15 @@ def place_pair(job) -> tuple:
                       .resize((w, h), Image.NEAREST)) for k in keys]
     sim = M.similarity_from_cameras([v["cam2world"] for v in views], [cams[k]["centre"] for k in keys],
                                     M.true_rotations(cams, keys))
+    free_entry = None
+    if placement == "oracle+free":
+        tm = np.load(pf / "targets" / f"{bid}.material.npy")
+        f_inp, f_s, f_m, finfo = free_pair(views, masks, sim, ts, tm, None, res)   # ground: lowest point
+        free_dir = Path(str(out_dir) + "_free")
+        tmp = free_dir / f"{name}.part.npz"
+        np.savez_compressed(tmp, input=f_inp, target_shape=f_s, target_material=f_m)
+        os.replace(tmp, free_dir / f"{name}.npz")
+        free_entry = {"build": bid, "views": [int(k) for k in keys], "dims": list(f_s.shape), **finfo}
     if placement == "free":
         from . import place as PL
         tm = np.load(pf / "targets" / f"{bid}.material.npy")
@@ -85,7 +110,7 @@ def place_pair(job) -> tuple:
     entry = {"build": bid, "views": [int(k) for k in keys], "yaw": [cams[k]["yaw"] for k in keys],
              "pitch": [cams[k]["pitch"] for k in keys], "scale": sim["s"], "refine": sim["refine"],
              "front": {k: round(float(v), 4) for k, v in m.items()}}
-    return name, entry, time.time() - t
+    return name, entry, time.time() - t, free_entry
 
 
 def write_index(path: Path, index: dict) -> None:
@@ -115,9 +140,14 @@ def main(argv=None) -> int:
     ap.add_argument("--res", type=int, default=2, choices=(1, 2), help="front_mv.to_grid cells per block")
     ap.add_argument("--workers", type=int, default=1,
                     help="processes for the CPU part (placement, blocks) while MapAnything runs the next set")
-    ap.add_argument("--placement", choices=("oracle", "free"), default="oracle",
+    ap.add_argument("--placement", choices=("oracle", "free", "oracle+free"), default="oracle",
                     help="free: placed as on real photos (place.free_placement, at the true cameras' scale), then "
-                         "turned and shifted onto the target by quarter turns and whole blocks (front_mv.onto_target)")
+                         "turned and shifted onto the target by quarter turns and whole blocks (front_mv.onto_target); "
+                         "oracle+free: the oracle pairs and, into <tag>_free, the same reconstruction placed as on "
+                         "real photos with the ground from the cameras and the human build moved into that frame "
+                         "(free_pair; the pair carries its own target)")
+    ap.add_argument("--renders", default=TRAIN_DIR,
+                    help="the training photos: persp_train (render --train-views) or persp_street (render --street)")
     ap.add_argument("--reverse", action="store_true",
                     help="builds in reverse order: a second process alongside a first, the same --tag")
     args = ap.parse_args(argv)
@@ -130,14 +160,23 @@ def main(argv=None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     index_path = out_dir / "index.json"
     index = json.loads(index_path.read_text(encoding="utf-8")) if index_path.is_file() else {"pairs": {}}
+    free_dir = Path(str(out_dir) + "_free")
+    free_path = free_dir / "index.json"
+    free_index = {"pairs": {}}
+    if args.placement == "oracle+free":
+        free_dir.mkdir(parents=True, exist_ok=True)
+        if free_path.is_file():
+            free_index = json.loads(free_path.read_text(encoding="utf-8"))
+        free_index.update({"front_end": "mapanything", "hints": args.hints, "res": args.res,
+                           "placement": "free_ground", "renders": args.renders, "own_targets": True})
     index.update({"front_end": args.views_from or "mapanything", "hints": args.hints, "res": args.res,
-                  "placement": args.placement})
+                  "placement": args.placement, "renders": args.renders})
     store = P.Store(dataset)
     ma = None if args.views_from else M.load_mapanything()
     tmp = pf / "tmp_mv" / "train"
     tmp.mkdir(parents=True, exist_ok=True)
     builds = [b for b in sorted(store.builds) if store.builds[b]["split"] in args.splits
-              and (not args.ids or b in args.ids) and (pf / TRAIN_DIR / b / "cameras.json").is_file()]
+              and (not args.ids or b in args.ids) and (pf / args.renders / b / "cameras.json").is_file()]
     if args.reverse:
         builds = builds[::-1]
     if args.limit:
@@ -156,8 +195,10 @@ def main(argv=None) -> int:
             return
         ready, pending = wait(pending, return_when=FIRST_COMPLETED) if block else             ({f for f in pending if f.done()}, {f for f in pending if not f.done()})
         for f in ready:
-            name, entry, seconds = f.result()
+            name, entry, seconds, free_entry = f.result()
             index["pairs"][name] = entry
+            if free_entry is not None:
+                free_index["pairs"][name] = free_entry
             done += 1
             m = entry["front"]
             print(f"[{done}] {name:50s} {len(entry['views'])} photos {seconds:5.1f} s | recall "
@@ -166,13 +207,15 @@ def main(argv=None) -> int:
                   flush=True)
         if ready:
             write_index(index_path, index)
+            if args.placement == "oracle+free":
+                write_index(free_path, free_index)
 
     for i, bid in enumerate(builds, 1):
-        folder = pf / TRAIN_DIR / bid
+        folder = pf / args.renders / bid
         cams = json.loads((folder / "cameras.json").read_text(encoding="utf-8"))
         for j, keys, K, poses in M.pair_jobs(bid, cams, args.hints):
             name = f"{bid}_s{j}"
-            if (out_dir / f"{name}.npz").is_file():
+            if (out_dir / f"{name}.npz").is_file() and (args.placement != "oracle+free" or (free_dir / f"{name}.npz").is_file()):
                 if name not in index["pairs"]:          # written by a process whose index entry was lost
                     index["pairs"][name] = {"build": bid, "views": [int(k) for k in keys], "adopted": True}
                 continue
@@ -189,10 +232,12 @@ def main(argv=None) -> int:
                 views = M.load_views(src)
             else:
                 views = M.run_mapanything(ma, paths, K, poses)
-            job = (dataset, out_dir, bid, name, keys, views, args.res, args.placement)
+            job = (dataset, out_dir, bid, name, keys, views, args.res, args.placement, args.renders)
             if pool is None:
-                name, entry, seconds = place_pair(job)
+                name, entry, seconds, free_entry = place_pair(job)
                 index["pairs"][name] = entry
+                if free_entry is not None:
+                    free_index["pairs"][name] = free_entry
                 print(f"[{i}/{len(builds)}] {name:50s} {len(keys)} photos {seconds:5.1f} s", flush=True)
                 continue
             pending.add(pool.submit(place_pair, job))
@@ -201,11 +246,15 @@ def main(argv=None) -> int:
             collect(block=False)
         if pool is None:
             write_index(index_path, index)
+            if args.placement == "oracle+free":
+                write_index(free_path, free_index)
     while pending:
         collect(block=True)
     if pool is not None:
         pool.shutdown()
     write_index(index_path, index)
+    if args.placement == "oracle+free":
+        write_index(free_path, free_index)
     rows = [r for r in index["pairs"].values() if "front" in r]
     print(f"{len(index['pairs'])} pairs, {time.time() - t_all:.0f} s; mean recall within 1 "
           f"{np.nanmean([r['front'].get('recall_1', np.nan) for r in rows] or [np.nan]):.3f}, precision within 1 "

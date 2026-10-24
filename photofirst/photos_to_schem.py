@@ -3,7 +3,7 @@ human build anywhere: for real photos).
 
     r2m_train\\Scripts\\python -m photofirst.photos_to_schem front.jpg left.jpg back.jpg right.jpg
         --out outputs/photofirst/house [--yaws 0 90 180 270] [--metres-per-block 1 | --height 24]
-        [--run pf-b1] [--checkpoint best_front.pt] [--passes 1] [--no-hints] [--dataset <BDC>/data/real-schems-v1]
+        [--run pf-c1] [--shape-bias 0.5] [--no-hints] [--dataset <BDC>/data/real-schems-v2]
 
 1. each photo upright (EXIF orientation); its compass heading and 35 mm focal from EXIF
    (`real.exif_info`); the building cut out by the app's own background removal (a photo that
@@ -13,10 +13,12 @@ human build anywhere: for real photos).
    from the photo (`real.tilt`, MoGe-2), the focal; without directions MapAnything runs on the
    photos alone (a four-sided building can then come out with a camera turned 90 degrees)
 3. MapAnything on all photos together (`front_mv.run_mapanything`), placed without a target
-   (`place.free_placement`: up, walls along the grid, metric scale or `--height`), turned into
+   (`place.free_placement`: up, walls along the grid, metric scale or `--height`, the ground
+   at the lowest visible point, room round it for what the photos do not show), turned into
    blocks at two cells per block (`front_mv.to_grid`)
-4. the completion model (`--run`, a photofirst run: pf-b1 is the best so far) completes the
-   build; `--passes` > 1 decodes a masked model iteratively (`masked.decode`)
+4. the completion model (`--run`, a photofirst run) completes the build, its block shapes
+   calibrated toward the human builds' share of stairs, slabs and thin parts (`--shape-bias`);
+   `--passes` > 1 decodes a masked model iteratively (`masked.decode`)
 5. `<out>/build.schem` (Sponge v2, 1.21.11), `blocks.npz` (shape, material, the input),
    `placement.json` (hints, tilt, placement, timings), the cutouts, and preview renders when
    BuildDataCollector's renderer is there
@@ -41,7 +43,7 @@ from . import real as RL
 from .views import OUT_DIR
 
 ROOT = Path(__file__).resolve().parents[1]
-DATASET = ROOT.parent / "BuildDataCollector" / "data" / "real-schems-v1"
+DATASET = ROOT.parent / "BuildDataCollector" / "data" / "real-schems-v2"
 BDC_PYTHON = ROOT.parent / "BuildDataCollector" / ".venv" / "Scripts" / "python.exe"
 
 
@@ -89,10 +91,19 @@ def main(argv=None) -> int:
     ap.add_argument("--no-hints", action="store_true", help="MapAnything on the photos alone")
     ap.add_argument("--metres-per-block", type=float, default=1.0)
     ap.add_argument("--height", type=float, default=None, help="the build's height in blocks (instead of metric scale)")
+    ap.add_argument("--ground", choices=("points", "cameras"), default="points",
+                    help="the ground at the lowest point the photos show (the better estimate on street photo sets), "
+                         "or at eye height below the cameras (place.ground_from_cameras)")
+    ap.add_argument("--eye-height", type=float, default=1.6, help="the photographer's eye height, metres")
     ap.add_argument("--dataset", type=Path, default=DATASET, help="where the photofirst runs are")
-    ap.add_argument("--run", default="pf-b1")
+    ap.add_argument("--run", default="pf-c1", help="pf-c1: looks most like the human builds; pf-c2b: the "
+                    "most accurate materials placed as real photos, blander")
     ap.add_argument("--checkpoint", default="best_front.pt")
     ap.add_argument("--passes", type=int, default=1)
+    ap.add_argument("--shape-bias", type=float, default=0.5,
+                    help="detail calibration: a solid block's shape picked by probability x (class weight / full's) "
+                         "** this (training.predict shape_prior; the geometry stays). 0.5 makes as many stairs, "
+                         "slabs, fences, panes as the human builds have; 0: plain argmax")
     ap.add_argument("--max-blocks", type=int, default=192)
     ap.add_argument("--solid", action="store_true",
                     help="keep the model's guessed inside (default: a shell, the blocks next to the outside)")
@@ -151,8 +162,9 @@ def main(argv=None) -> int:
     ma = M.load_mapanything()
     views = M.run_mapanything(ma, whites, K, poses)
     metric_height = None
-    if args.height is None and poses is not None:
-        # the hinted run takes the hints' unit-free scale: the photos alone give it in metres
+    if poses is not None:
+        # the hinted run takes the hints' unit-free scale: the photos alone give it in metres (the
+        # build's height, and the eye height for the ground)
         plain = M.run_mapanything(ma, whites, K, None)
         hp, wp = plain[0]["pts"].shape[:2]
         mp = [np.array(Image.fromarray(a).resize((wp, hp), Image.NEAREST)) for a in masks_full]
@@ -166,8 +178,14 @@ def main(argv=None) -> int:
     t = time.time()
     height = args.height if args.height is not None else (
         metric_height / args.metres_per_block if metric_height is not None else None)
+    eye_units = None
+    if args.ground == "cameras":                                # metres per unit of the hinted run
+        units = PL.free_placement(views, masks, metres_per_block=args.metres_per_block, height_blocks=height,
+                                  max_blocks=args.max_blocks)[2]["height_units"]
+        m_per_unit = metric_height / units if metric_height is not None else 1.0   # no hints: metric already
+        eye_units = args.eye_height / m_per_unit
     sim, dims, info = PL.free_placement(views, masks, metres_per_block=args.metres_per_block,
-                                        height_blocks=height, max_blocks=args.max_blocks)
+                                        height_blocks=height, max_blocks=args.max_blocks, eye_units=eye_units)
     inp = M.to_grid(views, sim, dims, masks, res=2)
     times["placement_and_blocks"] = time.time() - t
     report["placement"] = info
@@ -184,7 +202,12 @@ def main(argv=None) -> int:
     if args.passes > 1:
         shape, material = decode(model, inp, dims, passes=args.passes, temperature=0.0)
     else:
-        shape, material = predict_grid(model, inp, dims)
+        prior = None
+        if args.shape_bias:
+            cw = np.asarray(json.loads((Path(args.dataset) / OUT_DIR / "runs" / args.run / "config.json")
+                                       .read_text(encoding="utf-8"))["class_weights"])
+            prior = (cw / cw[1]) ** args.shape_bias
+        shape, material = predict_grid(model, inp, dims, shape_prior=prior)
     del model
     free_gpu()
     times["completion"] = time.time() - t

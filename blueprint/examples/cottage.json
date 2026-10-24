@@ -1,0 +1,32 @@
+{
+  "format": "blueprint-0",
+  "name": "Example cottage",
+  "materials": {"wall": "white_terracotta", "wall_base": "cobblestone", "trim": "spruce_planks",
+                "roof": "deepslate_tiles", "roof_edge": "spruce_planks", "window": "glass",
+                "door": "spruce_planks", "floor": "oak_planks", "chimney": "bricks"},
+  "masses": [
+    {"id": "main", "x": 0, "z": 0, "w": 13, "d": 9, "y": 0, "storeys": 1, "storey_h": 5, "plinth": 1,
+     "roof": {"type": "gable", "ridge": "x", "pitch": 1.0, "overhang": 1}},
+    {"id": "porch", "x": 4, "z": 9, "w": 5, "d": 3, "y": 0, "walls": 3, "plinth": 1,
+     "roof": {"type": "hip", "pitch": 0.5, "overhang": 0}}
+  ],
+  "openings": [
+    {"mass": "main", "side": "south", "kind": "window", "u": 1, "y": 2, "w": 2, "h": 2, "shutters": true},
+    {"mass": "main", "side": "south", "kind": "window", "u": 10, "y": 2, "w": 2, "h": 2, "shutters": true},
+    {"mass": "porch", "side": "south", "kind": "door", "u": 2, "y": 1},
+    {"mass": "main", "side": "east", "kind": "window", "u": 3, "y": 2, "w": 3, "h": 2, "mullions": [1]},
+    {"mass": "main", "side": "west", "kind": "window", "u": 3, "y": 2, "w": 3, "h": 2, "mullions": [1]},
+    {"mass": "main", "side": "north", "kind": "window", "u": 2, "y": 2, "w": 2, "h": 2},
+    {"mass": "main", "side": "north", "kind": "window", "u": 9, "y": 2, "w": 2, "h": 2}
+  ],
+  "features": [
+    {"kind": "chimney", "x": 10, "z": 2, "w": 2, "d": 2, "top": 12}
+  ],
+  "site": {
+    "seed": 1,
+    "ground": [{"x0": -4, "z0": -4, "x1": 16, "z1": 16, "top": -1}],
+    "boxes": [{"x0": 6, "y0": -1, "z0": 12, "x1": 6, "y1": -1, "z1": 16, "material": "gravel"}],
+    "bushes": [{"x": 1, "z": 11, "r": 1}, {"x": 11, "z": 11, "r": 1, "flowers": true}],
+    "trees": [{"x": -2, "z": -2, "h": 8, "kind": "oak"}]
+  }
+}

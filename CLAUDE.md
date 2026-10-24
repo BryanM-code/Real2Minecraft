@@ -31,6 +31,7 @@ lifts brightness. Colour repair never changes geometry.
 | `mcvoxel/` | shared voxel/block core, the only installable package (`pyproject.toml`); BDC installs it editable. See `mcvoxel/README.md` |
 | `training/` | Phase 5, offline: scoring, the rule-based baseline runner, the pair cache and loader, the U-Net, training and whole-build inference (`training/README.md`); never imported by the app |
 | `photofirst/` | experimental photo-first pipeline, separate from TRELLIS: 1 photo (MoGe-2 depth) or 2–4 photos registered together (MapAnything, `front_mv.py`) → the blocks the photos show → a completion model (training's U-Net, trained on the front end's own outputs) → the build (`photofirst/README.md`); offline, never imported by the app |
+| `blueprint/` | buildings described by their parts (masses, roofs, openings, features, site) and the builder that turns a description into mcvox-v3 grids / `.schem`: plus the photo chain: a local vision model reads the photo (`describe.py`, style / kind / form), a segmentation model finds the building's pixels (`segment.py`), MapAnything measures it (`measure.py`), `compose.py` turns that into a blueprint, and the evaluator (`refine.py`: `score.py`'s measures + the vision model's critique, corrections only from `edits.py`) corrects it against the photo; `python -m blueprint.photo` runs it end to end (`blueprint/README.md`); offline, never imported by the app |
 | `dev_building.py`, `dev_rebuild.py`, `dev_golden.json` | offline harnesses on cached TRELLIS meshes in `outputs/trellis/`; the building-mode golden |
 | `../BuildDataCollector/synth/` | training-pair generation: `degrade.py` (TRELLIS-like inputs), `trellis_compare.py`, `real_eval.py` |
 | `outputs/` | gitignored: TRELLIS GLBs, renders, per-run `dataset/` samples, `dataset_dev/` |
@@ -40,6 +41,7 @@ lifts brightness. Colour repair never changes geometry.
 - Venv `r2m_app` (Python 3.10, untracked; recreate from `requirements.txt`). No torch here.
 - Venv `r2m_train` (Python 3.10, untracked; CUDA PyTorch, recreate from `training/requirements.txt`): only for `training/`.
 - Venv `r2m_da3` (Python 3.10, untracked; numpy < 2, recreate from the notes in `photofirst/requirements.txt`): only for `photofirst/front_da3.py`.
+- Venv `r2m_vlm` (Python 3.10, untracked; CUDA PyTorch + transformers, recreate from `blueprint/requirements-vlm.txt`): only for `blueprint/` (`describe.py`, `refine.py`: a local vision-language model, Qwen3.5-9B, 4-bit, and `segment.py`'s EoMT-L segmentation model, both in the Hugging Face cache).
 - Run: `r2m_app\Scripts\python.exe app.py` with the TRELLIS server up (`http://127.0.0.1:7960/ping`).
 - TRELLIS lives in its own bundle at `C:\TRELLIS` (Python 3.11, torch, CUDA); the app only talks HTTP.
 
