@@ -78,6 +78,32 @@ class Placement(unittest.TestCase):
         self.assertTrue(all(d > 0 for d in dims) and dims[1] >= 10)
         self.assertTrue((q.min(0) >= -0.01).all() and (q.max(0) <= np.array(dims) + 0.01).all())
 
+    def test_room_for_the_unseen_back(self):
+        views = box_views(np.eye(3))                               # an 8 x 5 x 6 box
+        front = [views[0], views[3]]                               # both cameras on its +z side
+        sim, dims, info = PL.free_placement(front, metres_per_block=0.5, margin=3, below=2)
+        self.assertEqual(len(info["back_extended"]), 1)            # the depth only, away from them
+        sim_all, dims_all, info_all = PL.free_placement(views, metres_per_block=0.5, margin=3, below=2)
+        self.assertEqual(info_all["back_extended"], [])           # round it: nothing unseen
+        self.assertEqual(sorted(dims), sorted([dims_all[0], dims_all[1], max(dims_all[0], dims_all[2])]))
+
+    def test_ground_from_cameras_under_a_hidden_base(self):
+        world = turn((0.0, 1.0, 0.0), 21.0)
+        views = box_views(world)                                   # cameras 4 above the ground
+        masks = [(np.asarray(v["pts"]) @ world)[..., 1] >= 1.5 for v in views]   # the base hidden
+        # eye height 4: the ground at the box's foot (y = 0) goes `below` (2) above the floor, 2 blocks a unit
+        sim, dims, info = PL.free_placement(views, masks, metres_per_block=0.5, margin=3, below=2, eye_units=4.0)
+        self.assertEqual(info["ground"], "cameras")
+        self.assertAlmostEqual(float(sim["t"][1]), 2.0, delta=0.05)
+        self.assertGreaterEqual(dims[1], 2 + 10 + 3)               # ground to top: 5 units = 10 blocks
+        # an eye height that puts the ground above what the photos show gives way to the points
+        sim, dims, info = PL.free_placement(views, masks, metres_per_block=0.5, margin=3, below=2, eye_units=1.0)
+        self.assertEqual(info["ground"], "lowest_point")
+        P, _ = PL.fused_points(views, masks)                       # lowest point with a normal, as placed
+        lowest = float(np.percentile(P @ (world @ [0.0, 1.0, 0.0]), 0.2))
+        self.assertTrue(1.5 <= lowest < 2.0)
+        self.assertAlmostEqual(float(sim["t"][1]), 2.0 - 2 * lowest, delta=0.01)
+
 
 class OntoTarget(unittest.TestCase):
     def test_a_turned_shifted_input_comes_back(self):
@@ -94,6 +120,23 @@ class OntoTarget(unittest.TestCase):
         back, info = M.onto_target(free, dims, ts, tm)
         self.assertEqual(back.shape, inp.shape)
         self.assertTrue(np.array_equal(back[..., 0], inp[..., 0]))
+        # and the target into the free frame (`target_into`, for pairs placed as on real
+        # photos): the free input's own solid, stair facings turned with it
+        from mcvoxel import vocab
+        from mcvoxel.blockstates import rotate_y
+        from training.score import _place
+        ts2 = ts.copy()
+        stair = vocab.SHAPES.index(next(s for s in vocab.SHAPES if "stair" in s))
+        ts2[2:5, 4, 3:8] = stair                                 # facings that a turn must move
+        tm2 = np.where(ts2 != 0, 5, 0).astype(np.uint16)
+        f_s, f_m = M.target_into(ts2, tm2, info, dims)
+        self.assertEqual(f_s.shape, dims)
+        free_solid = np.asarray(free[0::2, 0::2, 0::2, 0] > 0)
+        self.assertTrue(np.array_equal(f_s != 0, free_solid))
+        k = int(info["turns"]) % 4                               # forward again: the target back
+        r_s, r_m = rotate_y(f_s, k, f_m) if k else (f_s, f_m)
+        self.assertTrue(np.array_equal(_place(r_s, info["shift"], ts2.shape, 0), ts2))
+        self.assertTrue(np.array_equal(_place(r_m, info["shift"], ts2.shape, 0), tm2))
 
 
 class Schem(unittest.TestCase):

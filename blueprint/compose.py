@@ -1,0 +1,725 @@
+"""The style-aware form (`describe.form2`) + the building's style and kind + its measured
+size (`measure`) -> a blueprint-1. The model chooses and counts; this module decides every
+size and position: metres from the measurement (or the kind's typical sizes), blocks at an
+adaptive scale, the parts the style and kind call for when the model says nothing, and the
+style's palette under the colours the model reports.
+
+The evaluator (`refine`) corrects a build only through the form and through `adjust`, which
+this module honours: {"scale": {"width" | "depth" | "height": factor}, "mirror": bool,
+"pitch": {part number: 0.5 | 1 | 2 | 3}, "skylights_on": part number, "materials": {role:
+block}}; part numbers count the form's parts from 0, left to right as the photo shows them.
+
+    compose(form, style="victorian", kind="house", measure={"width_m": 14, "height_m": 9, ...})
+"""
+from __future__ import annotations
+
+import copy
+
+from .assemble import BASES, DOORS, ROOFS, TRIMS, WALLS, _int, pick
+from .spec import PITCHES, material_index, shape_ok
+from .styles import KINDS, STYLES
+
+KIND_ALIASES = {"bank": "office", "museum": "library_museum", "library": "library_museum", "temple": "mosque_temple",
+                "mosque": "mosque_temple", "pagoda": "mosque_temple", "cathedral": "church", "chapel": "church",
+                "capitol": "government", "courthouse": "government", "city_hall": "government", "hall": "government",
+                "villa": "mansion", "cabin": "cottage", "bungalow": "house", "row_house": "townhouse",
+                "terraced": "townhouse", "fort": "castle", "keep": "castle", "chateau": "palace", "motel": "hotel",
+                "store": "shop", "market": "shop", "cafe": "restaurant", "diner": "restaurant", "silo": "barn",
+                "airport": "hangar_airport", "hangar": "hangar_airport", "terminal": "station", "mill": "windmill",
+                "power_plant": "factory", "plant": "factory", "industrial": "factory", "garage": "parking"}
+STYLE_ALIASES = {"georgian": "colonial", "cape_cod": "colonial", "federal": "colonial", "italianate": "victorian",
+                 "queen_anne": "victorian", "gothic_revival": "gothic", "spanish": "mediterranean",
+                 "mission": "mediterranean", "contemporary": "modern", "minimalist": "modern",
+                 "cabin": "rustic", "log": "rustic", "bauhaus": "modern", "classical": "neoclassical",
+                 "greek_revival": "neoclassical", "chalet": "alpine", "nordic": "scandinavian", "ottoman": "islamic"}
+WALLS2 = dict(WALLS, metal=[("", "light_gray_concrete")], logs=[("", "spruce_log")],
+              timber_frame=[("", "white_terracotta")])
+WALL_COLOURS = [("green", "green_terracotta"), ("blue", "light_blue_terracotta"), ("yellow", "yellow_terracotta"),
+                ("pink", "pink_terracotta"), ("red", "red_terracotta"), ("orange", "orange_terracotta"),
+                ("purple", "purple_terracotta")]
+ROOF_KINDS = ("gable", "cross_gable", "hip", "flat", "shed", "mansard", "gambrel", "dome", "cone", "spire", "pyramid",
+              "sawtooth", "pagoda")
+BIG = 150                    # blocks: the longest side of a build at the adaptive scale
+# kinds a photo shows end-on (their long side runs away from the camera)
+END_ON = ("church", "barn", "lighthouse", "windmill", "tower", "mosque_temple")
+# kinds that step back in tiers
+TIER_KINDS = ("skyscraper", "office", "hotel", "apartment", "hospital")
+# kinds with a podium and a crown
+TALL_KINDS = ("skyscraper", "office", "hotel", "apartment", "hospital")
+# where a part the model calls a tower really is one (elsewhere it is often a taller block)
+TOWER_KINDS = ("church", "castle", "government", "palace", "station", "school", "mansion", "lighthouse", "tower",
+               "mosque_temple", "library_museum")
+TOWER_STYLES = ("victorian", "gothic", "romanesque", "medieval", "baroque", "beaux_arts")
+# "steep" means 63 degrees only where steep roofs are the style; the model says steep often
+STEEP_STYLES = ("gothic", "victorian", "tudor", "medieval", "scandinavian", "romanesque", "dutch")
+# kinds whose roof, when the photo cannot see it, is flat (tall or commercial buildings from the street)
+FLAT_KINDS = ("skyscraper", "office", "apartment", "hotel", "hospital", "shop", "warehouse", "factory", "station",
+              "stadium", "parking", "hangar_airport", "school", "gas_station", "library_museum", "government")
+# kinds whose stacked roofs make a pagoda's tiers (elsewhere upturned eaves are one roof)
+PAGODA_KINDS = ("mosque_temple", "tower", "other")
+# a row's houses in turn when they differ: the form's wall block first, then these
+ROW_WALLS = ("bricks", "brown_terracotta", "deepslate_bricks", "smooth_quartz", "mud_bricks", "white_terracotta")
+UNIT_M = 6.0                 # metres: one house of a row
+
+
+def kind_of(kind) -> str:
+    k = str(kind or "other").lower().replace(" ", "_")
+    return k if k in KINDS else KIND_ALIASES.get(k, "other")
+
+
+def style_of(style) -> str:
+    s = str(style or "other").lower().replace(" ", "_").replace("-", "_")
+    return s if s in STYLES else STYLE_ALIASES.get(s, "other")
+
+
+def _f(v, default=0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _choice(v, options, default):
+    v = str(v or "").lower()
+    return v if v in options else default
+
+
+def palette(form: dict, style: str, overrides: dict | None = None) -> dict:
+    """Block per role: the style's palette, then what the model reports, then `overrides`."""
+    st = STYLES[style]["palette"]
+    mats = {"wall": "smooth_sandstone", "wall_base": "stone_bricks", "trim": "dark_oak_planks", "roof": "stone_bricks",
+            "window": "glass", "door": "spruce_planks", "garage": "smooth_quartz", "chimney": "bricks", "skylight": "glass",
+            "column": "smooth_quartz", "dome": "oxidized_cut_copper", "railing": "dark_oak_planks", "floor": "spruce_planks"}
+    mats.update({k: v for k, v in st.items() if k in ("wall", "trim", "roof", "window", "column", "dome", "shutter")})
+    if st.get("base"):
+        mats["wall_base"] = st["base"]
+    wall = form.get("wall") if isinstance(form.get("wall"), dict) else {}
+    material, colour = str(wall.get("material", "")).lower(), str(wall.get("colour", "")).lower()
+    if material in WALLS2:
+        block = pick(WALLS2[material], colour)
+        # painted walls in a colour their table lacks (pink concrete): the coloured terracottas
+        if material in ("wood_siding", "stucco", "concrete", "metal") and not any(
+                k for k, _ in WALLS2[material] if k and k in colour):
+            block = next((b for k, b in WALL_COLOURS if k in colour), block)
+        mats["wall"] = block
+    base = form.get("base") if isinstance(form.get("base"), dict) else {}
+    if str(base.get("material", "")).lower() in BASES:
+        mats["wall_base"] = BASES[str(base["material"]).lower()]
+    if form.get("trim_colour"):
+        mats["trim"] = pick(TRIMS, form.get("trim_colour"))
+    if form.get("roof_colour"):
+        mats["roof"] = pick(ROOFS, form.get("roof_colour"))
+    if form.get("door_colour"):
+        mats["door"] = pick(DOORS, form.get("door_colour"))
+    for role, block in (overrides or {}).items():
+        if role in mats and material_index(str(block)) is not None:
+            mats[role] = str(block)
+    for role, need in (("roof_edge", "slab_bottom"), ("sill", "stairs_north"), ("shutter", "trapdoor_open_north")):
+        mats[role] = mats["trim"] if shape_ok(need, mats["trim"]) else ("dark_oak_planks" if role != "roof_edge"
+                                                                        else mats["roof"])
+    if not shape_ok("fence", mats["railing"]):
+        mats["railing"] = "dark_oak_planks"
+    return mats
+
+
+def _parts(form: dict) -> list:
+    raw = form.get("parts") or form.get("wings") or []
+    parts = [p for p in raw if isinstance(p, dict)] or [{"part": "main"}]
+    return parts
+
+
+def _row(form: dict, parts: list, style: str):
+    """A row of joined houses (terraced or canal) as one part per house: the model's parts
+    when it listed one per house, else copies of its main part. (parts, row) with row None
+    when the form describes a single building."""
+    n = _int(form.get("units"), 1, 1, 30)
+    if n < 2:
+        return parts, None
+    gables = _choice(form.get("gables"), ("side", "front", "stepped", "curved"),
+                     "stepped" if style == "dutch" else "side")
+    own = len(parts) == n
+    main = next((p for p in parts if p.get("part") == "main"), parts[0])
+    out = []
+    for i in range(n):
+        p = dict(parts[i] if own else main)
+        p.update(part="main" if i == 0 else "wing", share=100.0 / n, front_offset="flush", level="ground")
+        p["windows_across"] = max(1, min(3, _int(p.get("windows_across"), 2, 1, 40) if own else 2))
+        front = dict(p.get("front") if isinstance(p.get("front"), dict) else {})
+        front.update(door=True, wide_window=False)
+        p["front"] = front
+        if p.get("roof") in (None, "", "not_visible", "flat") and gables != "side":
+            p["roof"] = "gable"
+        if gables != "side":
+            p.update(ridge="perpendicular", pitch=p.get("pitch") or "steep")
+        out.append(p)
+    varied = own and len({_int(p.get("storeys"), 1, 1, 120) for p in out}) > 1 or style == "dutch"
+    return out, {"n": n, "gables": gables, "varied": varied}
+
+
+def compose(form: dict, style=None, kind=None, measure: dict | None = None, blocks_per_m: float | None = None,
+            site: bool = False, adjust: dict | None = None) -> dict:
+    """A blueprint-1 dict for the building the form describes (see the module docstring)."""
+    form = form if isinstance(form, dict) else {}
+    adjust = adjust if isinstance(adjust, dict) else {}
+    style, kind = style_of(style), kind_of(kind)
+    st, kd = STYLES[style], KINDS[kind]
+    parts, row = _row(form, _parts(form), style)
+    main_i = next((i for i, p in enumerate(parts) if p.get("part") == "main"), 0)
+    storeys = [_int(p.get("storeys"), 1, 1, 120) for p in parts]
+    top_storeys = max(storeys)
+    storey_m = kd["storey_m"] if not row else KINDS["townhouse"]["storey_m"]
+    kd_w = kd["width_m"] if not row else (UNIT_M * 0.7 * row["n"], UNIT_M * 1.4 * row["n"])
+    # --- size in metres: measured, else typical for the kind -------------------------------
+    m = measure or {}
+    across = sum(max(1, _int(p.get("windows_across"), 2, 0, 40)) for p in parts)
+    typical = min(max(kd_w[0], across * 3.0), kd_w[1]) if not row else UNIT_M * row["n"]
+    width_m, height_m, depth_m = typical, 0.0, 0.0
+    if _f(m.get("width_m")) > 0:
+        # a single photo's scale is rough, its proportions less so: keep the measured ratios,
+        # and the measured width only within reach of what such buildings measure
+        mw, md = _f(m["width_m"]), _f(m.get("depth_m"))
+        if md > 1.3 * mw and kind not in END_ON:     # a view along the street: the long side is the front
+            mw, md = md, mw
+        # (a row: at least 4 m a house; one photo of a canal row measured 15 m for five houses)
+        width_m = max(4.0 * row["n"], min(9.0 * row["n"], mw)) if row else max(kd_w[0] * 0.7, min(kd_w[1] * 1.5, mw))
+        height_m = _f(m.get("height_m")) / mw * width_m
+        r_dw = md / mw
+        if r_dw >= 0.3:
+            depth_m = min(3.0, r_dw) * width_m
+    height_used = False
+    main_roof = str(parts[main_i].get("roof", "gable"))
+    if height_m:
+        roofy = main_roof not in ("flat", "dome", "not_visible")
+        # walls ~80% of the measured height (tested: a share by what crowns the building, a dome
+        # 50%, a pitched roof 65%, scored worse against the photos' outlines: 0.529 against 0.544)
+        implied = height_m * (0.8 if roofy else 0.95) / max(top_storeys, 1)
+        # else the photo cannot give the height (a view up a tower); a pagoda's storeys are tall
+        if 2.4 <= implied <= (14.0 if main_roof == "pagoda" else 8.5):
+            storey_m, height_used = implied, True
+    top_storeys = min(top_storeys, 80)
+    total_h_m = storey_m * top_storeys
+    roofy = main_roof not in ("flat", "dome", "not_visible")
+    aspect = _f(m.get("mask_aspect"))
+    if not height_used and aspect > 0 and kind != "skyscraper" and not row:
+        # MapAnything gave no usable size: the cut-out's height / width does
+        full = total_h_m * (1.25 if roofy else 1.0)
+        width_m = max(kd_w[0] * 0.5, min(kd_w[1] * 2.0, full / aspect))
+    if kind == "skyscraper":
+        width_m = max(width_m, total_h_m / 6.0)        # towers are seldom slimmer than 6 : 1
+    if row:
+        depth_m = max(6.0, min(14.0, UNIT_M * 1.6))   # a row is as deep as one of its houses
+    elif not depth_m or depth_m < 0.35 * width_m * kd["depth"]:
+        depth_m = width_m * kd["depth"]
+    if kind == "skyscraper":
+        depth_m = max(depth_m, 0.6 * width_m)          # a tower, not a slab
+    scale = adjust.get("scale") if isinstance(adjust.get("scale"), dict) else {}
+    width_m *= _f(scale.get("width"), 1.0) or 1.0
+    depth_m *= _f(scale.get("depth"), 1.0) or 1.0
+    storey_m *= _f(scale.get("height"), 1.0) or 1.0
+    total_h_m = storey_m * top_storeys
+    bpm = blocks_per_m or min(2.0, BIG / max(width_m, depth_m, total_h_m * 1.25, 1.0))
+    if storey_m * bpm < 4:                             # a storey needs 4 blocks: scale up, keeping proportions
+        bpm = 4.0 / storey_m
+    storey_h = max(4, min(8, round(storey_m * bpm)))
+    width = max(7, round(width_m * bpm))
+    depth = max(7, round(depth_m * bpm))
+    # --- parts: widths by share, left to right ------------------------------------------------
+    shares = [max(5.0, _f(p.get("share"), 100.0 / len(parts))) for p in parts]
+    total = sum(shares)
+    masses, openings, features = [], [], []
+    base_form = form.get("base") if isinstance(form.get("base"), dict) else {}
+    has_base = str(base_form.get("material", "none")).lower() in BASES
+    pitches = adjust.get("pitch") if isinstance(adjust.get("pitch"), dict) else {}
+    mats0 = palette(form, style, adjust.get("materials") if isinstance(adjust.get("materials"), dict) else None)
+    x = 0
+    main_depth = depth
+    rows = []
+    for i, p in enumerate(parts):
+        role = _choice(p.get("part"), ("main", "wing", "tower", "annex"), "wing")
+        shape = {"round": "round", "octagonal": "octagon", "octagon": "octagon"}.get(str(p.get("shape")).lower(), "box")
+        w = max(3 if role == "tower" else 5, round(width * shares[i] / total))
+        if row:
+            w = max(5, round(width / row["n"]) + 1)      # + 1: neighbours share their party wall
+        d = w if role == "tower" or shape != "box" else (
+            main_depth if i == main_i or row else max(5, round(main_depth * 0.8)))
+        below = 3 if p.get("level") == "half_below" else 0
+        walls = storeys[i] * storey_h + below
+        others = max([sv for j, sv in enumerate(storeys) if j != i] or [0])
+        if role == "tower" and i != main_i and storeys[i] <= others and (kind in TOWER_KINDS or style in TOWER_STYLES):
+            walls = max(walls, top_storeys * storey_h + storey_h)       # a tower rises above the rest
+        offset = {"forward": 3, "back": -3}.get(p.get("front_offset"), 0) if i != main_i else 0
+        z = main_depth - d + offset
+        raw_roof = str(p.get("roof") or "").lower()
+        if raw_roof in ("not_visible", "hidden", "none", "unknown", ""):
+            roof_kind = "flat" if kind in FLAT_KINDS else (st["roofs"][0] if st["roofs"] else "gable")
+        else:
+            roof_kind = _choice(raw_roof, ROOF_KINDS, st["roofs"][0] if st["roofs"] else "gable")
+        ends = str(p.get("roof_ends") or "").lower()
+        if roof_kind == "hip" and ends == "triangle":       # the ends are what the model sees best
+            roof_kind = "gable"
+        elif roof_kind == "gable" and ends == "slope":
+            roof_kind = "hip"
+        if form.get("flared_eaves") and roof_kind == "hip":
+            roof_kind = "pagoda"
+        if form.get("sawtooth") and i == main_i:
+            roof_kind = "sawtooth"
+        pitch = {"low": 0.5, "medium": 1.0, "steep": 2.0 if style in STEEP_STYLES or kind == "church" else 1.0}.get(
+            p.get("pitch"), 1.0)
+        if roof_kind in ("gable", "hip", "cross_gable") and pitch == 1.0 and w > 24:
+            pitch = 0.5                                   # wide roofs read better gentle
+        if _f(pitches.get(str(i))) in PITCHES:
+            pitch = _f(pitches[str(i)])
+        roof = {"type": roof_kind, "ridge": "z" if p.get("ridge") == "perpendicular" else "x", "pitch": pitch,
+                "overhang": 0 if roof_kind in ("flat", "dome", "spire") or shape != "box" or row else 1,
+                "battlements": bool(form.get("battlements")) and roof_kind == "flat"}
+        if row and row["gables"] in ("stepped", "curved") and roof_kind == "gable":
+            roof["gable_end"] = "stepped"
+        decor = []
+        for flag, dec in (("half_timbering", "half_timber"), ("pilasters", "pilasters"), ("buttresses", "buttresses"),
+                          ("curtain_wall", "curtain")):
+            if form.get(flag) and (role != "tower" or dec in ("curtain",)):
+                decor.append(dec)
+        if p.get("window_style") == "curtain" and "curtain" not in decor:
+            decor.append("curtain")
+        mid = f"p{i}"
+        mass = {"id": mid, "x": x, "z": z, "w": w, "d": d, "y": -below, "walls": walls, "shape": shape,
+                "storey_h": storey_h, "floors": sorted({0, *(below + k * storey_h for k in range(storeys[i]))}),
+                "plinth": (below + 1) if has_base else 0, "decor": decor, "roof": roof}
+        if row and row["varied"]:
+            walls_cycle = [mats0["wall"]] + [b for b in ROW_WALLS if b != mats0["wall"]]
+            mass["materials"] = {"wall": walls_cycle[i % len(walls_cycle)]}
+        masses.append(mass)
+        rows.append({"i": i, "p": p, "role": role, "below": below, "storeys": storeys[i]})
+        x += w - 1 if row else w
+    # --- pagoda: a platform, tiers that step in, each under its own eave, a finial on top ------
+    pagoda = masses[main_i]["roof"]["type"] == "pagoda" and top_storeys >= 2 and kind in PAGODA_KINDS
+    tier_masses = []
+    if pagoda:                                         # tiers as tall as the storeys, past the 8-row cap
+        tier_masses = _pagoda(masses, main_i, top_storeys, max(4, round(storey_m * bpm * 0.7)), features, mats0)
+    # --- podium: a tall building's wider base ----------------------------------------------------
+    pod = form.get("podium") if isinstance(form.get("podium"), dict) else {}
+    n_pod = _int(pod.get("storeys"), 0, 0, 12) if kind in TALL_KINDS and not pagoda else 0
+    if 0 < n_pod < storeys[main_i] and not row:
+        _podium(masses, main_i, rows[main_i], n_pod, storey_h, openings)
+    # --- tiers (setbacks) on the main part -------------------------------------------------------
+    tiers = [t for t in (form.get("tiers") or []) if _int(t, 0, 0, 120) > 0] if isinstance(form.get("tiers"), list) else []
+    if [_int(t) for t in tiers] == list(range(1, len(tiers) + 1)):     # numbered, not counted: equal tiers
+        tiers = [max(1, top_storeys // max(len(tiers), 1))] * len(tiers)
+    if kind not in TIER_KINDS or pagoda:
+        tiers = []
+    if len(tiers) >= 2:
+        base = masses[main_i]
+        total_tiers = sum(_int(t, 1, 1, 120) for t in tiers)
+        scale_t = base["walls"] / max(total_tiers, 1)
+        y, inset = base["y"], 0
+        base["walls"] = max(storey_h, round(_int(tiers[0], 1, 1, 120) * scale_t))
+        y += base["walls"]
+        for k, t in enumerate(tiers[1:], 1):
+            inset += max(1, round(min(base["w"], base["d"]) * 0.12))
+            if base["w"] - 2 * inset < 5 or base["d"] - 2 * inset < 5:
+                break
+            tw = max(storey_h, round(_int(t, 1, 1, 120) * scale_t))
+            tier = {"id": f"tier{k}", "x": base["x"] + inset, "z": base["z"] + inset, "w": base["w"] - 2 * inset,
+                    "d": base["d"] - 2 * inset, "y": y, "walls": tw, "storey_h": storey_h,
+                    "floors": list(range(0, tw, storey_h)), "decor": list(base["decor"]), "roof": dict(base["roof"])}
+            masses.append(tier)
+            tier_masses.append(tier)
+            base["roof"] = {"type": "flat", "overhang": 0, "parapet": 1}
+            y += tw
+    crown = str(form.get("crown") or "").lower()
+    if crown and not pagoda:
+        _crown(masses, tier_masses[-1] if tier_masses else masses[main_i], crown, storey_h, features)
+    # --- towers, minarets, silos the form lists beyond its parts ---------------------------
+    main = masses[main_i]
+    towers = form.get("towers") if isinstance(form.get("towers"), dict) else {}
+    have = sum(1 for r in rows if r["role"] == "tower")
+    extra = max(0, _int(towers.get("count"), 0, 0, 8) - have)
+    if form.get("spire") and not have and not extra:
+        extra = 1
+        towers = dict(towers, where=towers.get("where") or "front", roof="spire")
+    tw = max(3, round(min(main["w"], main["d"]) * 0.28))
+    tower_h = main["walls"] + max(storey_h, main["walls"] // 2)
+    tshape = {"round": "round", "octagonal": "octagon"}.get(str(towers.get("shape")).lower(), "box")
+    troof = _choice(towers.get("roof"), ("cone", "spire", "pyramid", "flat", "dome"), "cone" if tshape != "box" else "pyramid")
+    if form.get("spire"):
+        troof = "spire"
+    where = str(towers.get("where") or "corners").lower()
+    spots = {"left": [(main["x"] - tw // 2, main["z"] + main["d"] - tw)],
+             "right": [(main["x"] + main["w"] - tw + tw // 2, main["z"] + main["d"] - tw)],
+             "centre": [(main["x"] + (main["w"] - tw) // 2, main["z"] + (main["d"] - tw) // 2)],
+             "front": [(main["x"] + (main["w"] - tw) // 2, main["z"] + main["d"] - tw + tw // 2)],
+             "corners": [(main["x"] - 1, main["z"] + main["d"] - tw + 1), (main["x"] + main["w"] - tw + 1, main["z"] + main["d"] - tw + 1),
+                         (main["x"] - 1, main["z"] - 1), (main["x"] + main["w"] - tw + 1, main["z"] - 1)]}.get(where, [])
+    if where == "corners" and extra <= 2:
+        spots = spots[:2]
+    for k in range(extra):
+        if not spots:
+            break
+        tx, tz = spots[k % len(spots)]
+        masses.append({"id": f"tower{k}", "x": tx, "z": tz, "w": tw, "d": tw, "y": main["y"], "walls": tower_h,
+                       "shape": tshape, "storey_h": storey_h, "floors": [0],
+                       "roof": {"type": troof, "overhang": 0 if troof in ("flat", "spire") else 1,
+                                "battlements": bool(form.get("battlements")) and troof == "flat", "pitch": 1.0}})
+        openings.append({"mass": f"tower{k}", "side": "south", "kind": "window", "u": tw // 2, "y": tower_h - storey_h + 1,
+                         "w": 1, "h": min(3, storey_h - 2), "sill": False,
+                         "style": "lancet" if style == "gothic" else "rect"})
+    for k in range(_int(form.get("minarets"), 0, 0, 6)):
+        mx = main["x"] - 4 if k % 2 == 0 else main["x"] + main["w"] + 1
+        mz = main["z"] + main["d"] - 3 if k < 2 else main["z"]
+        mh = max(main["walls"] * 2, storey_h * 6)
+        masses.append({"id": f"minaret{k}", "x": mx, "z": mz, "w": 3, "d": 3, "shape": "round", "y": main["y"],
+                       "walls": mh, "floors": [0], "roof": {"type": "spire", "overhang": 0}})
+        features.append({"kind": "gallery", "mass": f"minaret{k}", "y": mh - 3})
+    if form.get("silo"):
+        sx = main["x"] + main["w"] + 1
+        masses.append({"id": "silo", "x": sx, "z": main["z"] + 1, "w": 5, "d": 5, "shape": "round", "y": main["y"],
+                       "walls": main["walls"] * 2, "floors": [0], "roof": {"type": "dome"}})
+    # --- openings on each part -----------------------------------------------------------------
+    win_h = max(2, storey_h - 3)
+    door_done = False
+    for r, mass in zip(rows, masses):
+        p, mid, w = r["p"], mass["id"], mass["w"]
+        front = p.get("front") if isinstance(p.get("front"), dict) else {}
+        n_top = _int(p.get("windows_across"), 2, 0, 40)
+        style_w = _choice(p.get("window_style"), ("rect", "arched", "lancet", "ribbon", "curtain"),
+                          st["windows"][0] if st["windows"] else "rect")
+        if style_w == "curtain":
+            continue                                       # the curtain wall decor is the window
+        win_w = 2 if w < 9 else 3
+        if style_w == "ribbon":
+            win_w = max(3, w - 4)
+        n = 1 if style_w == "ribbon" else n_top
+        floors_n = max(1, min(r["storeys"], (mass["walls"] - r["below"]) // storey_h))
+        for k in range(floors_n):
+            row_y = r["below"] + k * storey_h + (2 if storey_h >= 6 else 1)
+            if row_y + win_h > mass["walls"]:
+                break
+            count = n if k > 0 else _int(front.get("ground_windows"), n, 0, 40)
+            if k == 0 and (front.get("wide_window") or front.get("door")):
+                continue                                   # the ground floor gets its door / wide window below
+            if k == 0 and form.get("arcade"):
+                continue
+            for u in _positions(count, win_w, w):
+                o = {"mass": mid, "side": "south", "kind": "window", "u": u, "y": row_y, "w": win_w, "h": win_h,
+                     "style": style_w if style_w in ("arched", "lancet") else "rect",
+                     "shutters": bool(form.get("shutters")) and style_w == "rect"}
+                if style_w == "ribbon":
+                    o["mullions"] = list(range(3, win_w - 1, 3))
+                openings.append(o)
+        g0 = r["below"] + (2 if storey_h >= 6 else 1)
+        g_h = min(win_h, mass["walls"] - g0 - 1)           # short walls (a pagoda tier's) get short windows
+        if form.get("arcade"):
+            for u in _positions(max(2, w // 4), 3, w):
+                openings.append({"mass": mid, "side": "south", "kind": "arch", "u": u, "y": r["below"] + 1, "w": 3,
+                                 "h": min(storey_h - 1, 4)})
+        elif front.get("door") or front.get("wide_window"):
+            u_door = None
+            if front.get("door") and (not door_done or row):
+                if row:                                    # neighbours' doors in mirrored pairs
+                    u_door = 1 if r["i"] % 2 == 0 else w - 2
+                else:
+                    u_door = (w - 2) // 2 if form.get("symmetric") or len(rows) == 1 else (w - 3 if r["i"] < len(rows) / 2 else 2)
+                openings.append({"mass": mid, "side": "south", "kind": "door", "u": max(1, min(u_door, w - 2)),
+                                 "y": r["below"] + 1, "w": 2 if form.get("symmetric") and w >= 9 and not row else 1})
+                door_done = True
+            if front.get("wide_window") and g_h >= 1:
+                ww = max(3, min(w - 6, 13))
+                u = 1 if u_door is not None and u_door > w / 2 else w - ww - 1 if u_door is not None else (w - ww) // 2
+                openings.append({"mass": mid, "side": "south", "kind": "window", "u": max(1, u), "y": g0, "w": ww,
+                                 "h": g_h, "mullions": list(range(4, ww - 1, 4))})
+            elif g_h >= 1:
+                count = _int(front.get("ground_windows"), n_top, 0, 40)
+                lo_u, hi_u = (0, u_door - 1) if u_door is not None and u_door > w / 2 else (
+                    (u_door + 3, w) if u_door is not None else (0, w))
+                for u in _positions(count, win_w, hi_u - lo_u):
+                    openings.append({"mass": mid, "side": "south", "kind": "window", "u": lo_u + u, "y": g0, "w": win_w,
+                                     "h": g_h, "shutters": bool(form.get("shutters"))})
+        sides = [s for s, keep in (("west", r["i"] == 0), ("east", r["i"] == len(rows) - 1)) if keep] + ["north"]
+        for side in sides:                                 # the walls the photo barely shows
+            length = mass["d"] if side != "north" else w
+            for k in range(floors_n):
+                row_y = r["below"] + k * storey_h + (2 if storey_h >= 6 else 1)
+                if row_y + win_h > mass["walls"]:
+                    break
+                for u in _positions(max(1, length // 6), win_w, length):
+                    openings.append({"mass": mid, "side": side, "kind": "window", "u": u, "y": row_y, "w": win_w,
+                                     "h": win_h, "style": style_w if style_w in ("arched", "lancet") else "rect"})
+    # --- the form's features -------------------------------------------------------------------------
+    garage = form.get("garage") if isinstance(form.get("garage"), dict) else {}
+    gn = _int(garage.get("doors"), 0, 0, 6) + _int(form.get("big_doors"), 0, 0, 6)
+    if gn:
+        gwall = _choice(garage.get("wall"), ("front", "left", "right"), "front")
+        big = bool(form.get("big_doors"))
+        gw, gh = (6, min(6, masses[main_i]["walls"] - 1)) if big else (5, 4)
+        target = rows[0] if gwall == "left" else rows[-1] if gwall == "right" else min(rows, key=lambda r: r["storeys"])
+        mass = masses[target["i"]]
+        gh = max(2, min(gh, mass["walls"] - 1))            # as tall as the part it is in allows
+        side = {"left": "west", "right": "east"}.get(gwall, "south")
+        length = mass["d"] if side != "south" else mass["w"]
+        us = _positions(gn, gw, length)
+        openings[:] = [o for o in openings if not (o["mass"] == mass["id"] and o["side"] == side and o["y"] < gh + 1)]
+        for u in us:
+            openings.append({"mass": mass["id"], "side": side, "kind": "garage", "u": u, "y": 0, "w": gw, "h": gh})
+    main_row = rows[main_i]
+    porch = str(form.get("porch") or "none").lower()
+    if porch in ("front", "wraparound"):
+        features.append({"kind": "porch", "mass": main["id"], "side": "south", "u": 0, "w": main["w"],
+                         "depth": max(2, round(2.4 * bpm)), "height": storey_h, "wrap": porch == "wraparound"})
+    portico = form.get("portico") if isinstance(form.get("portico"), dict) else {}
+    if _int(portico.get("columns"), 0, 0, 20) >= 2:
+        n = _int(portico["columns"], 4, 2, 20)
+        pw = min(main["w"] - 2, max(5, n * 3 - 2))
+        features.append({"kind": "portico", "mass": main["id"], "side": "south", "u": (main["w"] - pw) // 2, "w": pw,
+                         "depth": max(3, round(main["d"] * 0.18)), "columns": n,
+                         "pediment": bool(portico.get("pediment", True)),
+                         "height": min(main["walls"] - 1, max(storey_h, main["walls"] - (storey_h if main_row["storeys"] > 2 else 0)))})
+    dome = form.get("dome") if isinstance(form.get("dome"), dict) else {}
+    if str(dome.get("size", "none")).lower() in ("small", "large") or main["roof"]["type"] == "dome":
+        if main["roof"]["type"] == "dome":
+            main["roof"] = {"type": "flat", "overhang": 0}
+        large = str(dome.get("size")).lower() == "large"
+        r = max(2, round(min(main["w"], main["d"]) * (0.36 if large else 0.22)))
+        cx, cz = main["x"] + main["w"] // 2, main["z"] + main["d"] // 2
+        features.append({"kind": "dome", "x": cx, "z": cz, "r": r, "y": main["y"] + main["walls"] + 1,
+                         "drum": max(2, r // 2) if dome.get("drum") else 0, "squash": 1.1, "lantern": True})
+    n_dormers = _int(form.get("dormers"), 0, 0, 8)
+    if n_dormers and main["roof"]["type"] in ("gable", "hip", "mansard", "cross_gable") and main["roof"].get("ridge") == "x":
+        for u in _positions(n_dormers, 2, main["w"] - 2):
+            features.append({"kind": "dormer", "mass": main["id"], "side": "south", "u": u + 1, "w": 2, "h": 2})
+    n_bays = _int(form.get("bay_windows"), 0, 0, 4)
+    if row and n_bays:                                     # one per house, beside its door
+        for r, mass in zip(rows, masses):
+            u = mass["w"] - 4 if r["i"] % 2 == 0 else 1
+            if 0 <= u <= mass["w"] - 3:
+                features.append({"kind": "bay", "mass": mass["id"], "side": "south", "u": u, "w": 3,
+                                 "y": r["below"] + 2, "h": max(2, storey_h - 3), "depth": 1})
+    else:
+        for u in _positions(n_bays, 3, main["w"]):
+            features.append({"kind": "bay", "mass": main["id"], "side": "south", "u": u, "w": 3, "y": main_row["below"] + 2,
+                             "h": max(2, storey_h - 3), "depth": 1})
+    n_sky = _int(form.get("skylights"), 0, 0, 6)
+    sky_on = adjust.get("skylights_on")
+    if sky_on is None and form.get("skylights_part") is not None:
+        sky_on = _int(form.get("skylights_part"), 1, 1, 40) - 1
+    order = sorted(zip(rows, masses), key=lambda rm: rm[0]["i"] != _int(sky_on, -1, -1, 40))
+    for r, mass in order:
+        if n_sky and mass["roof"]["type"] in ("gable", "hip") and r["role"] != "tower":
+            side = "south" if mass["roof"].get("ridge") == "x" else ("east" if r["i"] >= len(rows) / 2 else "west")
+            length = mass["w"] if side == "south" else mass["d"]
+            for u in _positions(n_sky, 3, length):
+                features.append({"kind": "skylight", "mass": mass["id"], "side": side, "u": u + 1, "v": 3, "w": 3,
+                                 "h": 3})
+            n_sky = 0
+    roof_t = main["roof"]["type"]
+    span = main["d"] if main["roof"].get("ridge", "x") == "x" else main["w"]
+    rise = 1 if roof_t in ("flat", "dome", "sawtooth") else max(2, round(span / 2 * min(main["roof"].get("pitch", 1.0), 2.0)))
+    n_chim = _int(form.get("chimneys"), 0, 0, 6)
+    if row and n_chim:                                     # a terrace's stacks stand on its party walls
+        for r, mass in list(zip(rows, masses))[1:]:
+            cz = mass["z"] + mass["d"] // 2 - 1
+            features.append({"kind": "chimney", "x": mass["x"] - 1, "z": cz, "w": 2, "d": 2,
+                             "top": mass["y"] + mass["walls"] + rise + 2})
+    else:
+        for k in range(n_chim):
+            cx = main["x"] + 1 if k % 2 == 0 else main["x"] + main["w"] - 3
+            ridge = main["y"] + main["walls"] + rise
+            features.append({"kind": "chimney", "x": cx, "z": main["z"] + main["d"] // 2 - 2, "w": 2, "d": 2, "top": ridge + 2})
+    for k in range(_int(form.get("smokestacks"), 0, 0, 6)):
+        features.append({"kind": "stack", "x": main["x"] + main["w"] + 3 + 4 * k, "z": main["z"] + 2, "r": 1,
+                         "top": main["y"] + main["walls"] * 2 + 6})
+    balconies = str(form.get("balconies") or "none").lower()
+    if balconies in ("some", "every_floor"):
+        for o in [o for o in openings if o["kind"] == "window" and o["side"] == "south" and o["y"] > storey_h]:
+            mass = next(mm for mm in masses if mm["id"] == o["mass"])
+            if balconies == "some" and (o["u"] < mass["w"] / 3 or o["u"] > 2 * mass["w"] / 3):
+                continue
+            features.append({"kind": "balcony", "mass": o["mass"], "side": "south", "u": max(0, o["u"] - 1),
+                             "w": min(o["w"] + 2, mass["w"] - max(0, o["u"] - 1)), "y": o["y"] - 2, "depth": 1})
+    if form.get("awning"):
+        for mass in masses[:len(rows)]:
+            features.append({"kind": "awning", "mass": mass["id"], "side": "south", "u": 0, "w": mass["w"],
+                             "y": storey_h - 1, "depth": 2})
+    if form.get("canopy"):
+        features.append({"kind": "canopy", "x0": main["x"], "x1": main["x"] + main["w"] - 1, "z0": main["z"] + main["d"] + 3,
+                         "z1": main["z"] + main["d"] + 3 + max(6, main["d"]), "top": main["y"] + storey_h})
+    if form.get("sails") or kind == "windmill":
+        features.append({"kind": "sails", "mass": main["id"], "side": "south"})
+    if form.get("gallery") or kind == "lighthouse":
+        features.append({"kind": "gallery", "mass": main["id"], "y": main["walls"] - 1})
+    if form.get("lantern") or kind == "lighthouse":
+        main["roof"] = {"type": "flat", "overhang": 0}
+        features.append({"kind": "lantern", "mass": main["id"], "h": max(2, storey_h // 2)})
+    bp = {"format": "blueprint-1", "name": f"{style} {kind}", "materials": mats0, "masses": masses,
+          "openings": openings, "features": features,
+          "meta": {"style": style, "kind": kind, "blocks_per_m": round(bpm, 3), "storey_h": storey_h,
+                   "size_m": [round(width_m, 1), round(depth_m, 1), round(total_h_m, 1)], "measured": bool(measure),
+                   "measured_height_used": height_used, "parts": len(rows), "row": row,
+                   "adjust": copy.deepcopy(adjust) if adjust else None}}
+    if site:
+        xs = [mm["x"] for mm in masses] + [mm["x"] + mm["w"] for mm in masses]
+        zs = [mm["z"] for mm in masses] + [mm["z"] + mm["d"] for mm in masses]
+        bp["site"] = {"ground": [{"x0": min(xs) - 4, "x1": max(xs) + 4, "z0": min(zs) - 4, "z1": max(zs) + 6,
+                                  "top": -1 - max(r["below"] for r in rows)}]}
+    if adjust.get("mirror"):
+        bp = mirror(bp)
+    return bp
+
+
+def _pagoda(masses: list, main_i: int, top_storeys: int, th: int, features: list, mats: dict) -> list:
+    """A pagoda in place of the main mass: a stone platform, then up to 9 tiers stepping in,
+    each with walls `th` rows high under a wide eave whose slope runs in to the next tier's
+    walls (the `skirt`), a railed gallery round each upper tier, a full roof and a finial on
+    the last."""
+    base = masses[main_i]
+    n = max(2, min(top_storeys, 9))
+    o = 2                                              # the eaves stand out this far
+    shrink = max(1, round(base["w"] * 0.05))
+    run = o + shrink                                   # from an eave's edge to the next tier's wall
+    platform = {"id": "platform", "x": base["x"] - 2, "z": base["z"] - 2, "w": base["w"] + 4, "d": base["d"] + 4,
+                "y": base["y"], "walls": 2, "floors": [0], "plinth": 2, "corner_trim": False,
+                "roof": {"type": "flat", "overhang": 0, "parapet": 0}}
+    y = base["y"] + 2
+    tiers = []
+    column = {"trim": mats["column"]} if "column" in mats else {}
+    for k in range(n):
+        s = k * shrink
+        w, d = base["w"] - 2 * s, base["d"] - 2 * s
+        if min(w, d) < 5:
+            break
+        tier = base if k == 0 else {"id": f"tier{k}", "storey_h": th, "shape": "box"}
+        tier.update(x=base["x"] + s if k else base["x"], z=base["z"] + s if k else base["z"], w=w, d=d, y=y, walls=th,
+                    floors=[0], plinth=0, decor=["pilasters"], storey_h=th, shape="box",
+                    roof={"type": "pagoda", "pitch": 0.5, "overhang": o, "skirt": run + 1})
+        if column:
+            tier["materials"] = dict(tier.get("materials") or {}, **column)
+        if k:
+            masses.append(tier)
+            features.append({"kind": "gallery", "mass": tier["id"], "y": 0})
+        tiers.append(tier)
+        y += th + run // 2
+    top = tiers[-1]
+    top["roof"] = {"type": "pagoda", "pitch": 1.0 if top["w"] <= 15 else 0.5, "overhang": o}
+    features.append({"kind": "finial", "mass": top["id"]})
+    masses.append(platform)
+    return tiers[1:]
+
+
+def _podium(masses: list, main_i: int, row: dict, n_pod: int, storey_h: int, openings: list) -> None:
+    """The main part's lowest storeys as a wider base, the tower standing on it, with shop
+    windows and a door in the base's front."""
+    base = masses[main_i]
+    g = max(2, round(min(base["w"], base["d"]) * 0.12))
+    ph = n_pod * storey_h
+    podium = {"id": "podium", "x": base["x"] - g, "z": base["z"] - g, "w": base["w"] + 2 * g, "d": base["d"] + 2 * g,
+              "y": base["y"], "walls": ph, "storey_h": storey_h, "floors": list(range(0, ph, storey_h)),
+              "plinth": base["plinth"], "decor": [], "roof": {"type": "flat", "overhang": 0, "parapet": 1}}
+    base.update(y=base["y"] + ph, walls=max(storey_h, base["walls"] - ph), plinth=0)
+    base["floors"] = sorted({0, *range(0, base["walls"], storey_h)})
+    row["storeys"] = max(1, row["storeys"] - n_pod)
+    row["below"] = 0
+    row["p"] = dict(row["p"], front={})                # the door is the podium's; the tower has windows all the way
+    masses.append(podium)
+    w = podium["w"]
+    win_h = max(2, storey_h - 2)
+    openings.append({"mass": "podium", "side": "south", "kind": "door", "u": w // 2 - 1, "y": 1, "w": 2})
+    for k in range(n_pod):
+        for u in _positions(max(1, w // 5), 3, w):
+            if k == 0 and w // 2 - 3 <= u <= w // 2 + 1:
+                continue
+            openings.append({"mass": "podium", "side": "south", "kind": "window", "u": u, "y": k * storey_h + 1, "w": 3,
+                             "h": win_h})
+
+
+def _crown(masses: list, top: dict, crown: str, storey_h: int, features: list) -> None:
+    """How a tall building ends, on its top mass: flat with a plant room, stepped, a spire
+    on a stepped top, a pyramid, a dome, an antenna, or pinnacles on the corners."""
+    ey = top["y"] + top["walls"] + 1
+    if crown in ("pyramid", "dome", "flat", "antenna", "stepped", "spire", "pinnacles"):
+        top["roof"] = {"pyramid": {"type": "pyramid", "pitch": 2.0, "overhang": 0}, "dome": {"type": "dome"}}.get(
+            crown, {"type": "flat", "overhang": 0, "parapet": 1})
+    if crown == "flat" and min(top["w"], top["d"]) >= 12:      # the plant room on a modern tower's roof
+        bw, bd = top["w"] // 3, top["d"] // 3
+        masses.append({"id": "crown", "x": top["x"] + (top["w"] - bw) // 2, "z": top["z"] + (top["d"] - bd) // 2,
+                       "w": bw, "d": bd, "y": ey, "walls": max(2, storey_h // 2 + 1), "floors": [0],
+                       "corner_trim": False, "roof": {"type": "flat", "overhang": 0}})
+    if crown in ("stepped", "spire") and top["w"] > 9 and top["d"] > 9:
+        step = {"id": "crown", "x": top["x"] + 2, "z": top["z"] + 2, "w": top["w"] - 4, "d": top["d"] - 4, "y": ey,
+                "walls": storey_h if crown == "stepped" else storey_h + storey_h // 2, "floors": [0],
+                "roof": {"type": "flat", "overhang": 0}}
+        masses.append(step)
+        if crown == "spire":
+            sw = max(3, round(step["w"] * 0.3)) | 1
+            masses.append({"id": "spire", "x": step["x"] + (step["w"] - sw) // 2, "z": step["z"] + (step["d"] - sw) // 2,
+                           "w": sw, "d": sw, "y": step["y"] + step["walls"] + 1, "walls": storey_h, "floors": [0],
+                           "roof": {"type": "spire", "overhang": 0}})
+    elif crown == "spire":                             # too slim to step: a spire on the top itself
+        top["roof"] = {"type": "spire", "overhang": 0}
+    if crown == "antenna":
+        cx, cz = top["x"] + top["w"] // 2, top["z"] + top["d"] // 2
+        features.append({"kind": "stack", "x": cx, "z": cz, "r": 0, "y": top["y"] + top["walls"],
+                         "top": top["y"] + top["walls"] + max(8, top["walls"] // 4)})
+    if crown == "pinnacles" and min(top["w"], top["d"]) >= 9:
+        for k, (px, pz) in enumerate(((top["x"], top["z"]), (top["x"] + top["w"] - 3, top["z"]),
+                                      (top["x"], top["z"] + top["d"] - 3), (top["x"] + top["w"] - 3, top["z"] + top["d"] - 3))):
+            masses.append({"id": f"pinnacle{k}", "x": px, "z": pz, "w": 3, "d": 3, "y": ey,
+                           "walls": max(2, storey_h // 2), "floors": [0], "roof": {"type": "spire", "overhang": 0}})
+
+
+def mirror(bp: dict) -> dict:
+    """The blueprint flipped left to right (along x; the front stays south): masses,
+    openings, features and site trade sides, and walls east and west swap."""
+    bp = copy.deepcopy(bp)
+    ms = bp["masses"]
+    s = min(m["x"] for m in ms) + max(m["x"] + m["w"] - 1 for m in ms)      # x -> s - x
+    swap = {"east": "west", "west": "east"}
+    by_id = {}
+    for m in ms:
+        m["x"] = s - (m["x"] + m["w"] - 1)
+        r = m.get("roof") or {}
+        if r.get("high") in swap:
+            r["high"] = swap[r["high"]]
+        if isinstance(m.get("plinth"), dict):
+            m["plinth"] = {swap.get(k, k): v for k, v in m["plinth"].items()}
+        by_id[m["id"]] = m
+    for o in bp.get("openings", []):
+        m = by_id.get(o.get("mass"))
+        if m is None or "u" not in o:
+            continue
+        length = m["w"] if o["side"] in ("south", "north") else m["d"]
+        o["u"] = length - o["u"] - o.get("w", 1)
+        if o.get("mullions"):
+            o["mullions"] = sorted(o["w"] - 1 - t for t in o["mullions"])
+        o["side"] = swap.get(o["side"], o["side"])
+    for f in bp.get("features", []):
+        m = by_id.get(f.get("mass"))
+        if "side" in f:
+            if m is not None and "u" in f and "w" in f:
+                length = m["w"] if f["side"] in ("south", "north") else m["d"]
+                f["u"] = length - f["u"] - f["w"]
+            f["side"] = swap.get(f["side"], f["side"])
+        if f["kind"] == "chimney":
+            f["x"] = s - (f["x"] + f.get("w", 2) - 1)
+        elif f["kind"] == "stack" or (f["kind"] == "dome" and "x" in f):
+            f["x"] = s - f["x"]
+        elif f["kind"] == "canopy":
+            f["x0"], f["x1"] = s - f["x1"], s - f["x0"]
+        if f["kind"] == "porch" and f.get("wrap"):
+            f["wrap_side"] = "left" if f.get("wrap_side", "right") == "right" else "right"
+    site = bp.get("site") or {}
+    for g in site.get("ground", []) + site.get("boxes", []):
+        g["x0"], g["x1"] = s - g["x1"], s - g["x0"]
+    for b in site.get("bushes", []) + site.get("trees", []):
+        b["x"] = s - b["x"]
+    if bp.get("meta") is not None:
+        bp["meta"]["mirrored"] = True
+    return bp
+
+
+def _positions(n: int, w: int, length: int, margin: int = 1) -> list:
+    """Left ends of `n` openings `w` wide spread evenly along a wall, at least `margin` in."""
+    room = length - 2 * margin
+    if n <= 0 or room < w:
+        return []
+    n = min(n, max(1, (room + 1) // (w + 1)))
+    gap = (room - n * w) / (n + 1)
+    return [margin + round(gap * (i + 1) + w * i) for i in range(n)]

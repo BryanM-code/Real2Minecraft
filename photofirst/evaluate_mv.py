@@ -55,6 +55,14 @@ def main(argv=None) -> int:
     ap.add_argument("--placement", choices=("oracle", "free"), default="oracle",
                     help="free: no target (place.free_placement), the prediction aligned to the target afterwards "
                          "(quarter turn + shift, training.score.align) for scoring")
+    ap.add_argument("--renders", default="persp",
+                    help="the photos: persp (render --views: the evaluation builds' corners) or persp_street "
+                         "(render --street: street-level photos, per build)")
+    ap.add_argument("--set", choices=sorted(M.STREET_EVAL), default=None,
+                    help="with --renders persp_street: a fixed photo set (front_mv.STREET_EVAL) instead of --views")
+    ap.add_argument("--ground", choices=("points", "cameras"), default="points",
+                    help="with --placement free: the ground at the lowest visible point, or at the street renders' "
+                         "eye height below the cameras (place.ground_from_cameras)")
     ap.add_argument("--free-scale", choices=("target", "metric", "cameras"), default="target",
                     help="with --placement free: the target's height in blocks, MapAnything's metric scale, or the "
                          "scale from the true cameras (isolates the placement's turn and position from the scale)")
@@ -77,7 +85,8 @@ def main(argv=None) -> int:
     out_dir.mkdir(parents=True, exist_ok=True)
     tmp = pf / "tmp_mv"
     tmp.mkdir(exist_ok=True)
-    cams = json.loads((pf / "persp" / "cameras.json").read_text(encoding="utf-8"))
+    street = args.renders != "persp"
+    cams = {} if street else json.loads((pf / "persp" / "cameras.json").read_text(encoding="utf-8"))
     store = P.Store(dataset)
     model = None
     if args.run:
@@ -91,19 +100,28 @@ def main(argv=None) -> int:
         from .front import load_moge
         from .real import steady_pitches, tilt
         moge = load_moge()
-    builds = sorted({c.get("build", k) for k, c in cams.items()})
+    if street:
+        builds = sorted(b for b in store.builds if (pf / args.renders / b / "cameras.json").is_file())
+    else:
+        builds = sorted({c.get("build", k) for k, c in cams.items()})
     rows = []
     for bid in builds:
         if args.ids and bid not in args.ids:
             continue
-        keys = [view_key(bid, v) for v in args.views]
+        if street:
+            folder = pf / args.renders / bid
+            cams = json.loads((folder / "cameras.json").read_text(encoding="utf-8"))
+            keys = list(M.STREET_EVAL[args.set]) if args.set else [str(v) for v in args.views]
+        else:
+            folder = pf / "persp"
+            keys = [view_key(bid, v) for v in args.views]
         if not all(k in cams for k in keys) or store.builds.get(bid, {}).get("split") not in args.splits:
             continue
         ts, tm = store.target(bid)
         ts, tm = np.asarray(ts), np.asarray(tm)
         paths, alphas = [], []
         for k in keys:
-            im = np.array(Image.open(pf / "persp" / f"{k}.png").convert("RGBA"))
+            im = np.array(Image.open(folder / f"{k}.png").convert("RGBA"))
             alphas.append(im[..., 3] > 127)
             Image.fromarray(np.where(alphas[-1][..., None], im[..., :3], 255).astype(np.uint8)).save(tmp / f"{k}.png")
             paths.append(tmp / f"{k}.png")
@@ -134,9 +152,14 @@ def main(argv=None) -> int:
             from .front import place as put
             t_solid = (ts != 0) & (ts != 255)
             ys = np.nonzero(t_solid.any((0, 2)))[0]
+            eye = None
+            if args.ground == "cameras":                           # standing: a raised spot is not known
+                from .render import eye_blocks
+                eye = eye_blocks(json.loads((dataset / "normalized" / "records" / f"{bid}.json").read_text(encoding="utf-8")))
             sim_f, dims_f, pinfo = PL.free_placement(
                 views, masks, height_blocks=float(ys.max() - ys.min() + 1) if args.free_scale == "target" else None,
-                metres_per_block=1.0 / sim["s"] if args.free_scale == "cameras" else 1.0)
+                metres_per_block=1.0 / sim["s"] if args.free_scale == "cameras" else 1.0,
+                eye_units=None if eye is None else eye / sim["s"])
             D = np.asarray(sim_f["R"]) @ np.asarray(sim["R"]).T       # oracle grid -> free grid
             up_err = float(np.degrees(np.arccos(np.clip(D[1, 1], -1, 1))))
             yaw = float(np.degrees(np.arctan2(D[0, 2], D[0, 0])))
@@ -149,7 +172,8 @@ def main(argv=None) -> int:
             _, _, ainfo = align(blk_f[..., 0].astype(np.uint8), np.zeros(dims_f, np.uint16), ts, tm)
             free["input_alignment"] = ainfo
             on_target, _ = M.onto_target(inp_f, dims_f, ts, tm)      # the same alignment, at the input's own cells
-            np.savez_compressed(out_dir / f"{bid}.npz", input=on_target)
+            np.savez_compressed(out_dir / f"{bid}.npz", input=on_target, free_input=inp_f,   # and as placed, for
+                                free_turns=np.int64(ainfo["turns"]), free_shift=np.asarray(ainfo["shift"]))  # evaluate_saved --free
             blocks = put(blk_f, ainfo["turns"], ainfo["shift"], ts.shape)
         elif args.refine:
             sim = M.refine_to_target(views, sim, (ts != 0) & (ts != 255), masks,
@@ -164,7 +188,7 @@ def main(argv=None) -> int:
         t_seen = np.zeros(ts.shape, bool)
         t_air = np.zeros(ts.shape, bool)
         for k in keys:
-            packed = np.load(pf / "persp" / f"{k}.seen.npy")
+            packed = np.load(folder / f"{k}.seen.npy")
             t_seen |= np.unpackbits(packed[0])[:ts.size].reshape(ts.shape).astype(bool)
             t_air |= np.unpackbits(packed[1])[:ts.size].reshape(ts.shape).astype(bool)
         t_air &= ~t_seen
@@ -200,7 +224,8 @@ def main(argv=None) -> int:
               f"(1 blk {f['recall_1']:.2f}) prec {f.get('precision', 0):.2f} (1 blk {f.get('precision_1', 0):.2f}) "
               f"false-on-air {f['false_solid_on_seen_air']:.3f} | alone IoU {row['front_alone']['iou']:.3f}"
               + (f" | e2e IoU {row['end_to_end']['iou']:.3f}" if "end_to_end" in row else ""), flush=True)
-    summary = {"views": args.views, "builds": len(rows), "run": args.run, "checkpoint": args.checkpoint,
+    summary = {"views": args.views, "renders": args.renders, "set": args.set, "ground": args.ground,
+               "builds": len(rows), "run": args.run, "checkpoint": args.checkpoint,
                "front_end": args.views_from or "mapanything", "hints": None if args.views_from else args.hints,
                "refine": args.refine, "res": args.res, "coarse_scale": args.coarse_scale, "carve": args.carve,
                "placement": args.placement, "free_scale": args.free_scale if args.placement == "free" else None,

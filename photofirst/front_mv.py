@@ -169,17 +169,35 @@ def render_hints(cams: dict, keys: list, mode: str, rng) -> tuple:
     return K, rough_poses(yaws, pitches)
 
 
+def street_subsets(cams: dict, rng) -> list:
+    """Photo sets from street-level renders (`render.street_views`: five views across the
+    street front, three round the back), as people photograph a building that has neighbours
+    behind it: three and two photos from the front arc, four of its five, and one set of four
+    round it (both ends of the front, its middle, one from the back). Keys, sorted."""
+    front = sorted((k for k, c in cams.items() if c.get("arc") == "front"), key=int)
+    back = sorted((k for k, c in cams.items() if c.get("arc") == "back"), key=int)
+    pick = lambda pool, n: sorted((pool[i] for i in rng.choice(len(pool), n, replace=False)), key=int)
+    sets = [pick(front, 3), pick(front, 2), pick(front, 4)]
+    if len(front) == 5 and back:
+        sets.append(sorted([front[0], front[2], front[4], back[int(rng.integers(len(back)))]], key=int))
+    return sets
+
+
+STREET_EVAL = {"street3": ("1", "2", "3"), "street2": ("1", "3"), "around4": ("0", "2", "4", "6")}
+
+
 def pair_jobs(bid: str, cams: dict, hints: str, seed: int = 0) -> list:
     """A training build's photo sets and their camera hints: [(j, keys, intrinsics, poses)]
-    for its `render.render_build` cameras (`cams`, keyed by view index). The same for every
-    front end (seeded by the build), so their pairs differ only in the reconstruction."""
+    for its `render.render_build` or `render.render_street_build` cameras (`cams`, keyed by
+    view index; street renders get `street_subsets`). The same for every front end (seeded
+    by the build), so their pairs differ only in the reconstruction."""
     rng = np.random.default_rng([seed, *bid.encode()])
     order = sorted(cams, key=int)
-    out = []
-    for j, sub in enumerate(view_subsets(len(order), rng)):
-        keys = [order[i] for i in sub]
-        out.append((j, keys, *render_hints(cams, keys, hints, rng)))
-    return out
+    if any("arc" in c for c in cams.values()):
+        subsets = street_subsets(cams, rng)
+    else:
+        subsets = [[order[i] for i in sub] for sub in view_subsets(len(order), rng)]
+    return [(j, keys, *render_hints(cams, keys, hints, rng)) for j, keys in enumerate(subsets)]
 
 
 def true_rotations(cams: dict, keys: list) -> list:
@@ -401,6 +419,23 @@ def model_input(inp: np.ndarray, dims) -> np.ndarray:
     from .data import upsample
     dims = tuple(int(d) for d in dims)
     return upsample(inp) if inp.shape[:3] == dims else inp
+
+
+def target_into(ts: np.ndarray, tm: np.ndarray, info: dict, dims) -> tuple:
+    """The target (shapes, materials) moved into a free placement's grid `dims`: the inverse
+    of `onto_target`'s alignment `info` (the input turned `turns` quarter turns about +Y, then
+    shifted by `shift` onto the target), the shapes turned with their facings
+    (`mcvoxel.blockstates.rotate_y`), air past the target's grid."""
+    from mcvoxel.blockstates import rotate_y
+    from training.score import _place
+    dims = tuple(int(d) for d in dims)
+    k = int(info["turns"]) % 4
+    rdims = (dims[2], dims[1], dims[0]) if k % 2 else dims
+    back = [-int(v) for v in info["shift"]]
+    t_s, t_m = _place(np.asarray(ts), back, rdims, 0), _place(np.asarray(tm), back, rdims, 0)
+    if k:
+        t_s, t_m = rotate_y(t_s, (4 - k) % 4, t_m)
+    return np.ascontiguousarray(t_s), np.ascontiguousarray(t_m)
 
 
 def onto_target(inp: np.ndarray, dims, ts: np.ndarray, tm: np.ndarray) -> tuple:

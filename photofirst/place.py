@@ -122,12 +122,52 @@ def wall_axes(normals: np.ndarray, up: np.ndarray, reference=(1.0, 0.0, 0.0)) ->
     return x_axis, np.cross(x_axis, up), float(len(walls) / max(len(normals), 1))
 
 
+def ground_from_cameras(views: list, up: np.ndarray, eye_units: float, lowest: float) -> tuple:
+    """(the ground's height along `up`, how it was found): hand-held photos are taken at eye
+    height, so the ground lies `eye_units` below the cameras (the lowest of them: a photo from
+    a window or a slope across the street is higher, hardly ever lower). It never lies above
+    the lowest visible point (`lowest`): a photographer below the building's base, or a raised
+    spot for every photo, then gives way to the points."""
+    h = float(min(np.asarray(v["cam2world"])[:3, 3] @ up for v in views)) - float(eye_units)
+    return (h, "cameras") if h <= lowest else (lowest, "lowest_point")
+
+
+BACK_DEPTH = 1.0      # the unseen back: a footprint at least this deep, in widths, away from the cameras
+
+
+def extend_back(lo, hi, cams) -> list:
+    """Make room for the back the photos do not show: along each horizontal grid axis where
+    every camera stands on one side of the visible box, the box is extended away from them
+    until it is `BACK_DEPTH` times its wider side deep (in place). Returns the axes extended."""
+    w = float(max(hi[0] - lo[0], hi[2] - lo[2]))
+    out = []
+    for a in (0, 2):
+        if hi[a] - lo[a] >= BACK_DEPTH * w:
+            continue
+        side = np.sign(cams[:, a] - (lo[a] + hi[a]) / 2.0)
+        if (side < 0).all():
+            hi[a] = lo[a] + BACK_DEPTH * w
+        elif (side > 0).all():
+            lo[a] = hi[a] - BACK_DEPTH * w
+        else:
+            continue
+        out.append("xyz"[a])
+    return out
+
+
 def free_placement(views: list, masks=None, metres_per_block: float = 1.0, height_blocks=None,
-                   margin: int = 4, max_blocks: int = 192, max_tilt: float = 15.0, level=None,
-                   below: int = 2) -> tuple:
+                   margin: int = 8, max_blocks: int = 192, max_tilt: float = 15.0, level=None,
+                   below: int = 2, eye_units=None, back: bool = True) -> tuple:
     """(similarity {"s", "R", "t"}, dims (X, Y, Z), info) for `front_mv.to_grid`, from the
     reconstruction alone (module docstring). `level`: level the up on the surfaces (default:
-    only for a single photo)."""
+    only for a single photo). `eye_units`: the photographer's eye height in the
+    reconstruction's units; given, the ground is put `below` blocks above the grid's floor
+    (`ground_from_cameras`), else the lowest visible point is: on street photo sets that is
+    the better estimate (the true base lands at its median, 2.0; within a block for 56% of 80
+    sets, against 42% from the lowest camera: MapAnything's camera heights are noisy, and
+    another photo usually shows a base one photo hides). `margin` 8: a margin of 4 kept a
+    quarter of sets under 76% of the build inside the grid (8: 91%). `back`: room for the back
+    photos from one side do not show (`extend_back`)."""
     P, N = fused_points(views, masks)
     up_cam = up_from_cameras(views)
     if level is None:
@@ -137,6 +177,11 @@ def free_placement(views: list, masks=None, metres_per_block: float = 1.0, heigh
     R = np.stack([x_axis, up, z_axis])                         # rows: grid axes in world coordinates
     q = P @ R.T
     lo, hi = np.percentile(q, 0.2, axis=0), np.percentile(q, 99.8, axis=0)   # as front.to_blocks
+    ground_how = "lowest_point"
+    if eye_units is not None:
+        lo[1], ground_how = ground_from_cameras(views, up, eye_units, float(lo[1]))
+    visible_height = float(hi[1] - lo[1])
+    extended = extend_back(lo, hi, np.stack([np.asarray(v["cam2world"])[:3, 3] for v in views]) @ R.T) if back else []
     if height_blocks is not None:
         s = float(height_blocks) / max(float(hi[1] - lo[1]), 1e-9)
     else:
@@ -147,10 +192,11 @@ def free_placement(views: list, masks=None, metres_per_block: float = 1.0, heigh
         s *= (max_blocks - 2 * margin) / span.max()
         span = (hi - lo) * s
     dims = np.ceil(span + np.array([2 * margin, margin + 1 + below, 2 * margin])).astype(int)
-    # the low corner of the points' box at (margin, below, margin)
+    # the low corner of the points' box (its floor: the ground) at (margin, below, margin)
     t = -s * lo + np.array([margin, float(below), margin])
     tilt = float(np.degrees(np.arccos(np.clip(up @ up_cam, -1, 1))))
     info = {"up_world": up.tolist(), "up_from_cameras": up_cam.tolist(), "levelling_deg": tilt,
-            "wall_share": wall_share, "blocks_per_unit": s, "height_units": float(hi[1] - lo[1]),
-            "dims": dims.tolist(), "capped_to_max_blocks": capped}
+            "wall_share": wall_share, "blocks_per_unit": s, "height_units": visible_height,
+            "dims": dims.tolist(), "capped_to_max_blocks": capped, "ground": ground_how,
+            "back_extended": extended}
     return {"s": s, "R": R, "t": t}, tuple(int(d) for d in dims), info

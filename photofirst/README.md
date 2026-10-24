@@ -81,23 +81,34 @@ views, perspective photos, front-end inputs, runs.
 | `data.py` | the completion model's input (seen solid, seen air, the seen blocks' colours; the TRELLIS pipeline's 5-channel layout, so `training`'s model and tiling apply) and training windows |
 | `train.py`, `evaluate.py` | test A: training and scoring, with the visible blocks alone and the TRELLIS pipeline on the same builds |
 | `front.py` | the front end: MoGe-2 points, the build frame (given, or from gravity and the walls), the depth stretch, blocks |
-| `render.py` | perspective photos of the evaluation builds (the smooth set's look, a 50-degree lens) |
+| `render.py` | perspective photos of the evaluation builds (the smooth set's look, a 50-degree lens); `--train-views` round the training builds; `--street`: eight street-level photos of every build (`street_views`: five across a street front, three round the back, at eye height on the build's own ground, a phone's lens, varied light, the base sometimes hidden behind cars or bushes and cut out with the background, blur, noise, JPEG) into `persp_street/` |
 | `evaluate_front.py` | test B: the front end against what the photo truly shows, and end to end |
 | `multiview.py` | several photos: each photo's front-end blocks fused (union, or space carving: `data.fuse_views`), then the completion model; the truth for the same photos as the ceiling |
 | `hybrid.py` | TRELLIS's geometry minus every block the photos show as empty space, as input alone and through the TRELLIS pipeline's model |
 | `front_mv.py` | the multi-photo front end: 2-4 photos reconstructed together (MapAnything; camera hints: rough poses from where each photo was taken), placed in the block grid (from known cameras, then against the target for pairs) and turned into blocks at 1 or 2 cells per block |
 | `front_da3.py` | Depth Anything 3 for the same front end, run in `r2m_da3` (numpy < 2): writes the per-photo arrays `front_mv` reads |
-| `evaluate_mv.py` | the multi-photo front end on the evaluation builds' corner photos: against what the photos truly show, the camera errors, end to end |
+| `evaluate_mv.py` | the multi-photo front end on the evaluation builds' corner photos (or `--renders persp_street --set street3` etc.): against what the photos truly show, the camera errors, end to end |
+| `eval_matrix.py` | one model through the street-photo protocols (three and two photos across the front, four round it; on the human build and as on real photos), one table |
 | `mv_pairs.py` | training pairs from the real front end: 2-4-photo sets of each training build's `render --train-views` photos |
 | `masked.py` | the masked (iterative) completion model: decided blocks as inputs, decoded over several passes, the surest first |
 | `evaluate_saved.py` | a model on saved front-end inputs: block scores, where the details are (`training.quality.parts`), quality stats |
 | `looks.py` | renders of outputs and human builds compared with DINOv2 image features: does it look like the human build |
-| `place.py` | placing a reconstruction in the block grid without a target (real photos): up from the cameras and the walls, walls along the grid, metric or chosen scale, ground at y = 0 |
+| `place.py` | placing a reconstruction in the block grid without a target (real photos): up from the cameras and the walls, walls along the grid, metric or chosen scale, the ground at eye height below the cameras (`ground_from_cameras`) or at the lowest visible point, `below` blocks above the grid's floor (where the training targets have it: the model reads each block's height above the floor) |
 | `real.py` | real photos: upright (EXIF orientation), the compass heading and 35 mm focal from EXIF, the app's background removal (run in `r2m_app`), the camera's tilt from the photo (MoGe-2) |
 | `schem.py` | a predicted build -> Sponge v2 `.schem` (1.21.11 block states, neighbour-dependent states finished), optionally hollowed to its shell |
 | `photos_to_schem.py` | 2-4 photo files -> `build.schem`, end to end, no human build anywhere |
 
 Tests: `tests/test_photofirst.py`, `tests/test_multiphoto.py`, `tests/test_real_photos.py`.
+
+## Round 4 (2026-10-22): street-level photos
+
+Trained on BuildDataCollector `data/real-schems-v2` (908 builds) with street-level photos
+(`render --street`, `mv_pairs --renders persp_street --placement oracle+free`); evaluated
+with `eval_matrix` / `evaluate_saved` on 3 and 2 street-side photos and 4 all round. pf-c1
+(default for real photos) looks most like the human builds; pf-c2b (2.25x wider) has the
+most accurate materials placed as real photos but is blander. `--shape-bias 0.5` makes as
+many stairs, slabs and thin parts as the human builds have. Details: BuildDataCollector
+`docs/phase5.md`, "Round 4".
 
 ## Real photos
 

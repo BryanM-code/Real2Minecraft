@@ -213,6 +213,24 @@ class Masked(unittest.TestCase):
         self.assertEqual((s.shape, s.dtype, m.dtype), ((12, 10, 8), np.uint8, np.uint16))
         self.assertTrue(((s == 0) == (m == 0)).all())
 
+    def test_shape_prior_keeps_the_geometry(self):
+        """predict_window's decoding calibration: a voxel is air or solid exactly as without the
+        prior; among solid voxels the favoured shape wins more often."""
+        import torch
+        from training.model import UNet3D, predict_window, valid_table
+        torch.manual_seed(0)
+        model = UNet3D((8, 16), 1).eval()
+        x = torch.rand(1, 6, 16, 16, 16)
+        valid = valid_table("cpu")
+        with torch.no_grad():
+            p0, _ = predict_window(model, x, valid)
+            prior = torch.ones(30)
+            prior[5] = 50.0                                      # favour one stair shape
+            p1, _ = predict_window(model, x, valid, prior=prior)
+        a0, a1 = p0.argmax(1), p1.argmax(1)
+        self.assertTrue(torch.equal(a0 == 0, a1 == 0))
+        self.assertGreater(int((a1 == 5).sum()), int((a0 == 5).sum()))
+
 
 @unittest.skipUnless(HAVE_TORCH, "needs torch (r2m_train)")
 class RealPairs(unittest.TestCase):

@@ -30,14 +30,18 @@ def input_from_pair(z) -> np.ndarray:
 
 @torch.no_grad()
 def predict_grid(model, inp: np.ndarray, target_dims, window: int = WINDOW, overlap: int = OVERLAP,
-                 device="cuda") -> tuple:
+                 device="cuda", shape_prior=None) -> tuple:
     """(shape uint8, material uint16) over the target frame `target_dims` for one input grid
-    (2X, 2Y, 2Z, 5) uint8."""
+    (2X, 2Y, 2Z, 5) uint8. `shape_prior` (N_SHAPES,): decoding calibration; a voxel's
+    solid shape is the argmax of probability x prior (`predict_window`), air against solid
+    decided as without it, so rare shapes (stairs, slabs, fences) win more of the voxels the
+    model already makes solid and the geometry stays."""
     from mcvoxel.tiling import assemble
     from mcvoxel.vocab import VALID
     model.eval()
     valid = valid_table(device)
     dims = tuple(int(d) for d in target_dims)
+    prior = None if shape_prior is None else torch.as_tensor(np.asarray(shape_prior, np.float32), device=device)
 
     def predict(start, gsl):
         x = np.zeros((2 * window,) * 3 + (inp.shape[-1],), np.uint8)
@@ -46,7 +50,7 @@ def predict_grid(model, inp: np.ndarray, target_dims, window: int = WINDOW, over
         x[:n[0], :n[1], :n[2]] = inp[sl]
         xt = torch.from_numpy(np.ascontiguousarray(np.moveaxis(x, -1, 0)))[None].to(device)
         with torch.autocast("cuda", dtype=torch.bfloat16, enabled=(device == "cuda")):
-            probs, mat = predict_window(model, features(xt, torch.tensor([int(start[1])])), valid)
+            probs, mat = predict_window(model, features(xt, torch.tensor([int(start[1])])), valid, prior=prior)
         return probs[0].cpu().numpy(), mat[0].cpu().numpy()
 
     shape, material, _ = assemble(dims, window, overlap, predict, N_SHAPES)

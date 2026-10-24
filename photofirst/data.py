@@ -159,6 +159,34 @@ def full_input(store: Store, bid: str, k: int, table=None) -> np.ndarray:
     return upsample(encode(tm, solid, air, material_rgb() if table is None else table))
 
 
+def window_start(ts, rng, size: int = D.WINDOW, min_solid: int = D.MIN_SOLID) -> np.ndarray:
+    """A random window start in target shapes `ts` with at least `min_solid` supervised solid
+    voxels (or the most solid of `training.data.TRIES` starts)."""
+    best = None
+    for _ in range(D.TRIES):
+        start = D.sample_start(ts.shape, rng, size)
+        hi = np.minimum(start + size, ts.shape)
+        w = np.asarray(ts[tuple(slice(a, b) for a, b in zip(start, hi))])
+        n = int(((w != D.IGNORE_SHAPE) & (w != 0)).sum())
+        if n >= min_solid:
+            return np.asarray(start, dtype=np.int64)
+        if best is None or n > best[0]:
+            best = (n, start)
+    return np.asarray(best[1], dtype=np.int64)
+
+
+def target_window(ts, tm, start, size: int = D.WINDOW) -> tuple:
+    """(shape, material, the slice taken) of the window at `start`, IGNORE past the grid."""
+    hi = np.minimum(np.asarray(start) + size, ts.shape)
+    sl = tuple(slice(a, b) for a, b in zip(start, hi))
+    n = tuple(b - a for a, b in zip(start, hi))
+    w_s = np.full((size,) * 3, D.IGNORE_SHAPE, np.uint8)
+    w_m = np.full((size,) * 3, D.IGNORE_MATERIAL, np.uint16)
+    w_s[:n[0], :n[1], :n[2]] = ts[sl]
+    w_m[:n[0], :n[1], :n[2]] = tm[sl]
+    return w_s, w_m, sl
+
+
 def window(store: Store, bid: str, k: int, rng, table, size: int = D.WINDOW,
            min_solid: int = D.MIN_SOLID, colour=COLOUR, start=None):
     """(input at block resolution, shape, material, start) for a random window of build `bid`
@@ -166,28 +194,9 @@ def window(store: Store, bid: str, k: int, rng, table, size: int = D.WINDOW,
     of `training.data.TRIES` starts), or the window at `start`; colours varied by `colour`
     (None: as they are)."""
     ts, tm = store.target(bid)
-    if start is None:
-        best = None
-        for _ in range(D.TRIES):
-            start = D.sample_start(ts.shape, rng, size)
-            hi = np.minimum(start + size, ts.shape)
-            sl = tuple(slice(a, b) for a, b in zip(start, hi))
-            w = np.asarray(ts[sl])
-            n = int(((w != D.IGNORE_SHAPE) & (w != 0)).sum())
-            if n >= min_solid:
-                best = (n, start)
-                break
-            if best is None or n > best[0]:
-                best = (n, start)
-        start = best[1]
-    start = np.asarray(start, dtype=np.int64)
-    hi = np.minimum(start + size, ts.shape)
-    sl = tuple(slice(a, b) for a, b in zip(start, hi))
-    n = tuple(b - a for a, b in zip(start, hi))
-    w_s = np.full((size,) * 3, D.IGNORE_SHAPE, np.uint8)
-    w_m = np.full((size,) * 3, D.IGNORE_MATERIAL, np.uint16)
-    w_s[:n[0], :n[1], :n[2]] = ts[sl]
-    w_m[:n[0], :n[1], :n[2]] = tm[sl]
+    start = window_start(ts, rng, size, min_solid) if start is None else np.asarray(start, dtype=np.int64)
+    w_s, w_m, sl = target_window(ts, tm, start, size)
+    n = tuple(s.stop - s.start for s in sl)
     solid, air = store.view(bid, k)
     w_i = np.zeros((size,) * 3 + (5,), np.uint8)
     w_i[:n[0], :n[1], :n[2]] = encode(w_m[:n[0], :n[1], :n[2]], solid[sl], air[sl], table,
@@ -279,12 +288,22 @@ class CompletionDataset:
         return D.to_tensors(upsample(w_i), w_s, w_m, start)
 
     def _real_item(self, rng):
-        """A window of one of the front end's real inputs of a build (a random photo set)."""
+        """A window of one of the front end's real inputs of a build (a random photo set). A pair
+        placed as on real photos (`mv_pairs --placement oracle+free`) carries its own target, the
+        human build moved into its frame; the others use the build's target."""
         bid = self.real_builds[int(rng.choice(len(self.real_builds), p=self.real_weights))]
         names = self.real[bid]
-        inp = np.load(self.real_dir / f"{names[int(rng.integers(len(names)))]}.npz")["input"]
-        _, w_s, w_m, start = window(self.store, bid, 0, rng, self.table, colour=None)
-        f = 2 if tuple(inp.shape[:3]) == tuple(2 * d for d in self.store.builds[bid]["dims"]) else 1
+        with np.load(self.real_dir / f"{names[int(rng.integers(len(names)))]}.npz") as z:
+            inp = z["input"]
+            own = (z["target_shape"], z["target_material"]) if "target_shape" in z.files else None
+        if own is not None:
+            start = window_start(own[0], rng)
+            w_s, w_m, _ = target_window(*own, start)
+            dims = own[0].shape
+        else:
+            _, w_s, w_m, start = window(self.store, bid, 0, rng, self.table, colour=None)
+            dims = self.store.builds[bid]["dims"]
+        f = 2 if tuple(inp.shape[:3]) == tuple(2 * d for d in dims) else 1
         size = f * D.WINDOW                      # 2: the input is at the model's resolution already
         hi = np.minimum(f * start + size, inp.shape[:3])
         n = tuple(b - a for a, b in zip(f * start, hi))

@@ -125,14 +125,22 @@ def valid_table(device) -> torch.Tensor:
 
 
 @torch.no_grad()
-def predict_window(model: UNet3D, x: torch.Tensor, valid: torch.Tensor, air_below: float = 0.9):
+def predict_window(model: UNet3D, x: torch.Tensor, valid: torch.Tensor, air_below: float = 0.9, prior=None):
     """One batch of windows -> (shape probabilities (B, 30, w, w, w) float32, material
     (B, w, w, w) int64). A material is chosen wherever a block is at all likely (air
     probability under `air_below`), not only where the window's own argmax is solid:
     blending windows can turn a voxel solid that this window thought was air. It is the
-    best material among those `vocab.VALID` allows for the most likely solid shape."""
+    best material among those `vocab.VALID` allows for the most likely solid shape.
+    `prior` (30,): which solid shape a voxel gets is the argmax of probability x prior, with the
+    most likely solid shape's probability (so air against solid is decided as without it: the
+    geometry stays; `predict.predict_grid`'s decoding calibration)."""
     logits, feats = model(x)
     probs = torch.softmax(logits.float(), dim=1)
+    if prior is not None:
+        solid = probs[:, 1:]
+        top = solid.max(dim=1, keepdim=True).values
+        pick = (solid * prior[1:].view(1, -1, *([1] * (probs.dim() - 2)))).argmax(dim=1, keepdim=True)
+        probs = torch.cat([probs[:, :1], torch.zeros_like(solid).scatter_(1, pick, top)], dim=1)
     maybe = probs[:, 0] < air_below
     material = torch.zeros(probs.shape[:1] + probs.shape[2:], dtype=torch.int64, device=probs.device)
     if maybe.any():

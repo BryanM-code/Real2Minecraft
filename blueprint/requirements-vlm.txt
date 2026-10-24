@@ -1,0 +1,13 @@
+# r2m_vlm: the local vision-language model for blueprint/describe.py (Python 3.10).
+# PyTorch and torchvision come from the CUDA 12.8 index:
+#   python -m venv r2m_vlm
+#   r2m_vlm\Scripts\python -m pip install torch==2.11.0 torchvision==0.26.0 --index-url https://download.pytorch.org/whl/cu128
+#   r2m_vlm\Scripts\python -m pip install -r blueprint\requirements-vlm.txt
+# The model (Qwen/Qwen3.5-9B, Apache 2.0, 19.3 GB) downloads into the Hugging Face cache on first use,
+# and so does blueprint/segment.py's segmentation model (tue-mps/ade20k_semantic_eomt_large_512, MIT,
+# 1.26 GB; transformers' EoMT; its training loss alone wants scipy, which segment.load skips).
+transformers==5.20.2
+accelerate==1.15.0
+bitsandbytes==0.50.2
+numpy==2.2.6
+pillow==12.3.0
