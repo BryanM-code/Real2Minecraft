@@ -15,6 +15,7 @@ r2m_app/
 r2m_train/
 r2m_da3/
 r2m_vlm/
+r2m_llama/
 # model weights are tracked separately
 models/
 

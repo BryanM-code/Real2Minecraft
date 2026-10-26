@@ -6,6 +6,11 @@
 # The model (Qwen/Qwen3.5-9B, Apache 2.0, 19.3 GB) downloads into the Hugging Face cache on first use,
 # and so does blueprint/segment.py's segmentation model (tue-mps/ade20k_semantic_eomt_large_512, MIT,
 # 1.26 GB; transformers' EoMT; its training loss alone wants scipy, which segment.load skips).
+# The larger model (describe.SERVER_MODELS: Qwen3.8-27B, Apache 2.0, unsloth's 3-bit GGUF UD-Q3_K_XL,
+# 13.2 GB, and its vision part mmproj-F16.gguf, 0.9 GB) runs in llama.cpp, not transformers: the
+# Windows CUDA build (llama-b11483-bin-win-cuda-13.4-x64.zip and cudart-llama-bin-win-cuda-13.4-x64.zip
+# from github.com/ggml-org/llama.cpp releases) unzipped into r2m_llama\ (untracked); describe.Server
+# starts llama-server.exe on port 8090 and downloads the GGUF files into the Hugging Face cache.
 transformers==5.20.2
 accelerate==1.15.0
 bitsandbytes==0.50.2

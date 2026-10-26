@@ -34,15 +34,11 @@ def render_views(shape: np.ndarray, material: np.ndarray, out_dir, views=VIEWS, 
     return paths
 
 
-def render_rgba(shape: np.ndarray, material: np.ndarray, yaw: float, pitch: float, size: int = 512,
-                labels: bool = False) -> np.ndarray | None:
+def render_rgba(shape: np.ndarray, material: np.ndarray, yaw: float, pitch: float, size: int = 512) -> np.ndarray | None:
     """The renderer's own RGBA frame (transparent background, not cropped) of (shape,
-    material) grids; with `labels` windows are drawn black, doors red and the rest white
-    (`label_name`), from the same camera, for the evaluator's window and door measures."""
+    material) grids."""
     from photofirst.schem import palette_grid
     grid, names = palette_grid(shape, material)
-    if labels:
-        names = [label_name(n) for n in names]
     blocks = np.ascontiguousarray(np.transpose(grid, (2, 0, 1)))
     if str(BDC) not in sys.path:
         sys.path.insert(0, str(BDC))
@@ -51,25 +47,74 @@ def render_rgba(shape: np.ndarray, material: np.ndarray, yaw: float, pitch: floa
     return None if im is None else np.array(im.convert("RGBA"))
 
 
-def label_name(name: str) -> str:
-    """A block name as the label view draws it: glass black, doors red, the rest white in
-    the same shape (stairs, slabs, fences and walls keep their states)."""
-    base, _, states = name.partition("[")
-    states = "[" + states if states else ""
-    if base == "minecraft:air":
-        return name
-    if base.endswith("_pane"):
-        return "minecraft:black_stained_glass_pane" + states
-    if "glass" in base:
-        return "minecraft:black_concrete"
-    if base.endswith("_door"):
-        return "minecraft:red_concrete"
-    for part, white in (("_stairs", "minecraft:quartz_stairs"), ("_slab", "minecraft:quartz_slab"),
-                        ("_fence_gate", "minecraft:birch_fence_gate"), ("_fence", "minecraft:birch_fence"),
-                        ("_wall", "minecraft:diorite_wall"), ("_trapdoor", "minecraft:birch_trapdoor")):
-        if base.endswith(part):
-            return white + states
-    return "minecraft:white_concrete"
+# colours of a code view: hues 45 degrees or more apart, so the renderer's face shading and edge
+# blending (which keep the hue) still tell them apart; code 0 is drawn white
+CODE_HUES = (0, 45, 90, 135, 180, 225, 270, 315)
+
+
+def _hue_rgb(h: float) -> tuple:
+    import colorsys
+    return tuple(int(round(c * 255)) for c in colorsys.hsv_to_rgb(h / 360.0, 1.0, 1.0))
+
+
+def render_codes(shape: np.ndarray, material: np.ndarray, codes: np.ndarray, colour_of: dict, yaw: float,
+                 pitch: float, size: int = 512) -> np.ndarray | None:
+    """(H, W) ints: for each pixel of the render (same camera and frame as `render_rgba`),
+    the code (`codes`, an (X, Y, Z) grid of small ints) of the block drawn there, -1 for
+    none. `colour_of` gives each code a slot: None for white, 0-7 for a hue of CODE_HUES.
+    Blocks keep their shapes; only their colours change."""
+    from photofirst.schem import palette_grid
+    if str(BDC) not in sys.path:
+        sys.path.insert(0, str(BDC))
+    import block_colors
+    from schemset.review import render
+    grid, names = palette_grid(shape, material)                      # (Y, Z, X)
+    c = np.transpose(codes, (1, 2, 0)).astype(np.int64)
+    combined = grid.astype(np.int64) * 256 + c
+    uniq, inv = np.unique(combined, return_inverse=True)
+    new_names, rgb = [], {}
+    for u in uniq:
+        name, code = names[int(u // 256)], int(u % 256)
+        if name in ("minecraft:air", "") or u // 256 == 0:
+            new_names.append("minecraft:air")
+            continue
+        base = name.split(":", 1)[-1]
+        label = f"minecraft:r2mcode{code}_{base}"
+        slot = colour_of.get(code)
+        rgb[label.split("[")[0].split(":", 1)[1]] = (255, 255, 255) if slot is None else _hue_rgb(CODE_HUES[slot])
+        new_names.append(label)
+    new_grid = inv.reshape(grid.shape).astype(np.int32)
+    new_grid[grid == 0] = 0
+    if new_names[0] != "minecraft:air":                              # palette index 0 must be air
+        new_names = ["minecraft:air"] + new_names
+        new_grid = np.where(grid == 0, 0, new_grid + 1)
+    original = block_colors.color_for
+
+    def coloured(state: str):
+        base = str(state).split("[")[0].split(":", 1)[-1]
+        return rgb.get(base) or original(state)
+    block_colors.color_for = coloured
+    try:
+        im = render(np.ascontiguousarray(np.transpose(new_grid, (2, 0, 1))), new_names, yaw=yaw, pitch=pitch, size=size)
+    finally:
+        block_colors.color_for = original
+    if im is None:
+        return None
+    a = np.array(im.convert("RGBA")).astype(float)
+    out = np.full(a.shape[:2], -1, np.int32)
+    v = a[..., :3].max(-1)
+    lit = (a[..., 3] > 127) & (v > 25)
+    r, g, b = (a[..., k] / np.maximum(v, 1) for k in range(3))     # brightness divided out: hue and saturation
+    mn = np.minimum(np.minimum(r, g), b)
+    d = np.maximum(1.0 - mn, 1e-6)
+    hue = np.where(r >= 1.0, ((g - b) / d) % 6, np.where(g >= 1.0, (b - r) / d + 2, (r - g) / d + 4)) * 60
+    chroma = lit & (1.0 - mn > 0.35)
+    out[lit & ~chroma] = next((code for code, s in colour_of.items() if s is None), -1)
+    slot = np.round(hue / 45.0).astype(int) % 8
+    for code, s in colour_of.items():
+        if s is not None:
+            out[chroma & (slot == s)] = code
+    return out
 
 
 def render_blocks(blocks: np.ndarray, names: list, yaw: float, pitch: float, size: int = 900):

@@ -7,8 +7,10 @@ repository's root:
     r2m_vlm\\Scripts\\python -m blueprint.describe blueprint house.jpg --out outputs\\vlm\\run1
 
 The model (default Qwen/Qwen3.5-9B, Apache 2.0) is loaded 4-bit (bitsandbytes NF4) with
-its vision encoder left in bf16, about 7 GB of GPU memory. Each answer is saved as
-<out>/<photo stem>.<mode>.json with the raw text, the parsed JSON and the timing.
+its vision encoder left in bf16, about 7 GB of GPU memory; `--model qwen3.8-27b` (Qwen3.8-27B,
+Apache 2.0, 3-bit GGUF) runs in a llama.cpp server instead (`Server`, `r2m_llama/`), about 15 GB.
+Each answer is saved as <out>/<photo stem>.<mode>.json with the raw text, the parsed JSON and
+the timing.
 """
 from __future__ import annotations
 
@@ -21,6 +23,7 @@ from pathlib import Path
 
 MODEL = "Qwen/Qwen3.5-9B"
 MAX_SIDE = 1024
+FORM_VERSION = 3
 
 SURVEY = """You are looking at a photo of a building. Answer about the main building only (ignore other
 buildings, cars, people and trees). Reply with JSON only, with exactly these keys:
@@ -121,21 +124,7 @@ def kind_question() -> str:
             '\nReply with JSON only: {"kind": "<one key from the list>"}')
 
 
-def form2(style: str, kind: str) -> str:
-    """The form for a building of this style and kind: the shared part, then the features
-    such buildings have (`styles.form_features`), each with its definition."""
-    from .styles import FEATURES, KINDS, ROOFS, STYLES, WINDOW_STYLES, form_features
-    st, kd = STYLES.get(style, STYLES["other"]), KINDS.get(kind, KINDS["other"])
-    feats = form_features(style, kind)
-    lines = ",\n ".join(FEATURES[f][0] for f in feats)
-    defs = "\n".join(f"- {f}: {FEATURES[f][1]}" for f in feats)
-    roofs, wins = "|".join(ROOFS), "|".join(WINDOW_STYLES)
-    return f"""Now fill in this form about the building, using the photo and your description. It is {kd['hint']}
-in the {style} style ({st['hint']}); such buildings often have {', '.join(st['roofs'])} roofs and
-{', '.join(st['windows'])} windows, but answer what the photo shows. Reply with JSON only:
-{{"parts": [ one entry per distinct part of the building, ordered left to right as seen in the photo
-            (the main block, each wing, each tower or turret, a lower annex):
-   {{"part": "main|wing|tower|annex",
+PART_V2 = """   {{"part": "main|wing|tower|annex",
     "share": <percent of the building's visible front width this part takes; the shares add up to about 100>,
     "storeys": <integer, above the front ground>,
     "level": "ground|half_below" (half_below: it also has a level partly below the front ground),
@@ -147,7 +136,56 @@ in the {style} style ({st['hint']}); such buildings often have {', '.join(st['ro
     "pitch": "low|medium|steep" (low: under 30 degrees, medium: about 45, steep: 60 or more),
     "windows_across": <integer: windows across the front of its top floor>,
     "window_style": "{wins}",
-    "front": {{"door": true|false, "ground_windows": <integer>, "wide_window": true|false}} }} ],
+    "front": {{"door": true|false, "ground_windows": <integer>, "wide_window": true|false}} }} ],"""
+
+# version 3: each part's size and place in metres, its roof's slope in degrees and its garage
+# doors, so the builder does not guess them (it made a wing 0.8 times the main block's depth,
+# "forward" 3 blocks, and "medium" 45 degrees where the model's own words said 30)
+PART_V3 = """   {{"part": "main|wing|tower|annex",
+    "share": <percent of the building's visible front width this part takes; the shares add up to about 100>,
+    "width_m": <metres across its front>,
+    "depth_m": <metres from its front wall to its back wall; your best estimate if the side is hidden>,
+    "storeys": <integer: its floors, counting a level partly below the ground>,
+    "eave_m": <metres from its lowest floor up to its eaves, where its roof starts>,
+    "floor_m": <metres its lowest floor is above (+) or below (-) the main block's ground floor; 0 when level>,
+    "forward_m": <metres its front wall stands in front of (+) or behind (-) the main block's front wall; 0 when flush>,
+    "shape": "box|round|octagonal",
+    "roof": "{roofs}|not_visible",
+    "roof_ends": "triangle|slope|none" (what closes the short ends of a gable or hip roof: a triangular wall, or a sloping face of the roof; none for other roofs),
+    "ridge": "parallel|perpendicular" (a gable's ridge compared with the front wall),
+    "pitch_deg": <its roof's slope in degrees: 0 flat, about 15 very low, 25-30 low, 45 medium, 60 or more steep>,
+    "windows_across": <integer: windows across the front of its top floor>,
+    "window_style": "{wins}",
+    "front": {{"door": true|false, "ground_windows": <integer>, "wide_window": true|false, "garage_doors": <integer>}},
+    "side_garage_doors": <integer: garage doors in its end wall that the photo shows>,
+    "base": "none|brick|stone|concrete" (a band of another material at the foot of its walls),
+    "base_m": <metres that band rises on its front wall>, "base_end_m": <and on its end wall the photo shows> }} ],"""
+
+RULERS = """- metres: measure with what the photo shows: a door is about 1 m wide and 2 m high, a storey about
+  3 m, a garage door about 2.5 m wide; a part's eave_m is about its storeys times 3 m"""
+
+
+def form2(style: str, kind: str, version: int = 2) -> str:
+    """The form for a building of this style and kind: the shared part, then the features
+    such buildings have (`styles.form_features`), each with its definition. Version 3 asks
+    each part's size, level and offset in metres, its roof's slope in degrees and its garage
+    doors (`compose` honours them, its own rules filling in what is missing)."""
+    from .styles import FEATURES, KINDS, ROOFS, STYLES, WINDOW_STYLES, form_features
+    st, kd = STYLES.get(style, STYLES["other"]), KINDS.get(kind, KINDS["other"])
+    feats = form_features(style, kind)
+    if version >= 3:                                   # each part has its own garage doors
+        feats = [f for f in feats if f != "garage"]
+    lines = ",\n ".join(FEATURES[f][0] for f in feats)
+    defs = "\n".join(f"- {f}: {FEATURES[f][1]}" for f in feats)
+    roofs, wins = "|".join(ROOFS), "|".join(WINDOW_STYLES)
+    part = (PART_V3 if version >= 3 else PART_V2).format(roofs=roofs, wins=wins)
+    rulers = ("\n" + RULERS) if version >= 3 else ""
+    return f"""Now fill in this form about the building, using the photo and your description. It is {kd['hint']}
+in the {style} style ({st['hint']}); such buildings often have {', '.join(st['roofs'])} roofs and
+{', '.join(st['windows'])} windows, but answer what the photo shows. Reply with JSON only:
+{{"parts": [ one entry per distinct part of the building, ordered left to right as seen in the photo
+            (the main block, each wing, each tower or turret, a lower annex):
+{part}
  "symmetric": true|false,
  {lines},
  "wall": {{"material": "wood_siding|brick|stone|stucco|concrete|glass|metal|logs|timber_frame", "colour": "<word>"}},
@@ -165,11 +203,82 @@ Definitions:
   steep lower slope, often with dormers, under a flat or gentle top; gambrel = a barn roof, two slopes on
   each side, the lower one steeper; dome; cone = a round pointed roof on a round tower; spire = a tall
   thin pointed roof; sawtooth = repeated one-sided slopes with glass faces; pagoda = stacked roofs with
-  upturned eaves
+  upturned eaves{rulers}
 {defs}"""
 
 
+ROOT = Path(__file__).resolve().parents[1]
+LLAMA_SERVER = ROOT / "r2m_llama" / "llama-server.exe"
+# models run by llama.cpp (too big for transformers on 16 GB): name -> (repo, weights, vision part)
+SERVER_MODELS = {"qwen3.8-27b": ("unsloth/Qwen3.8-27B-GGUF", "Qwen3.8-27B-UD-Q3_K_XL.gguf", "mmproj-F16.gguf")}
+
+
+class Server:
+    """A GGUF vision model in a llama.cpp server (`r2m_llama/`, started here, stopped at exit),
+    asked over its OpenAI-style HTTP API: how Qwen3.8-27B (3-bit, 13 GB) runs on a 16 GB card,
+    with llama.cpp's kernels for its linear-attention layers."""
+
+    def __init__(self, name: str, port: int = 8090, ctx: int = 16384):
+        import atexit
+        import subprocess
+        import urllib.request
+        from huggingface_hub import hf_hub_download
+        repo, weights, mmproj = SERVER_MODELS[name]
+        self.url = f"http://127.0.0.1:{port}"
+        self.name = name
+        # --image-min-tokens 1024: llama.cpp warns Qwen-VL models need it for boxes (a 1024 x 575
+        # photo is about 580 image tokens otherwise)
+        cmd = [str(LLAMA_SERVER), "-m", hf_hub_download(repo, weights), "--mmproj", hf_hub_download(repo, mmproj),
+               "-ngl", "99", "-c", str(ctx), "--port", str(port), "-fa", "on", "--jinja", "-np", "1",
+               "--image-min-tokens", "1024"]
+        self.log = open(ROOT / "outputs" / f"llama_server_{port}.log", "w", encoding="utf-8")
+        self.proc = subprocess.Popen(cmd, stdout=self.log, stderr=subprocess.STDOUT)
+        atexit.register(self.close)
+        for _ in range(600):                           # loading takes a minute or two
+            try:
+                with urllib.request.urlopen(self.url + "/health", timeout=2) as r:
+                    if r.status == 200:
+                        return
+            except OSError:
+                pass
+            if self.proc.poll() is not None:
+                raise RuntimeError(f"llama-server stopped (see {self.log.name})")
+            time.sleep(1)
+        raise RuntimeError("llama-server did not start in 10 minutes")
+
+    def chat(self, images: list, prompt: str, history: list | None, max_tokens: int, think: bool) -> str:
+        import base64
+        import io
+        import urllib.request
+        content = []
+        for im in images:
+            buf = io.BytesIO()
+            im.convert("RGB").save(buf, "JPEG", quality=92)
+            content.append({"type": "image_url",
+                            "image_url": {"url": "data:image/jpeg;base64," + base64.b64encode(buf.getvalue()).decode()}})
+        content.append({"type": "text", "text": prompt})
+        messages = [{"role": "user", "content": content}] + [{"role": r, "content": t} for r, t in history or []]
+        body = {"messages": messages, "max_tokens": max_tokens, "temperature": 0, "top_k": 1,
+                "chat_template_kwargs": {"enable_thinking": think}}
+        req = urllib.request.Request(self.url + "/v1/chat/completions", data=json.dumps(body).encode(),
+                                     headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=1800) as r:
+            answer = json.loads(r.read())["choices"][0]["message"]["content"] or ""
+        return re.sub(r"(?s)^.*</think>", "", answer).strip()
+
+    def close(self):
+        if self.proc.poll() is None:
+            self.proc.terminate()
+            try:
+                self.proc.wait(30)
+            except Exception:  # noqa: BLE001
+                self.proc.kill()
+
+
 def load_model(name: str = MODEL, bits: int = 4):
+    """(model, processor): a transformers model, or (Server, None) for SERVER_MODELS."""
+    if name in SERVER_MODELS:
+        return Server(name), None
     import torch
     from transformers import AutoModelForImageTextToText, AutoProcessor, BitsAndBytesConfig
     quant = None
@@ -194,8 +303,10 @@ def ask(model, processor, image, prompt: str, max_new_tokens: int = 1024, think:
         history: list | None = None) -> str:
     """The model's answer about `image` (or a list of images, shown in order before the
     prompt); `history` is (role, text) turns after the first."""
-    import torch
     images = list(image) if isinstance(image, (list, tuple)) else [image]
+    if isinstance(model, Server):
+        return model.chat(images, prompt, history, max_new_tokens, think)
+    import torch
     messages = [{"role": "user", "content": [*({"type": "image"} for _ in images), {"type": "text", "text": prompt}]}]
     messages += [{"role": role, "content": [{"type": "text", "text": t}]} for role, t in history or []]
     text = processor.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
@@ -255,9 +366,11 @@ def run_v2(model, processor, image, think: bool = False) -> dict:
     return out
 
 
-def run_read(model, processor, image, think: bool = False) -> dict:
+def run_read(model, processor, image, think: bool = False, version: int | None = None) -> dict:
     """The production reading (order B, the better one on the 50-photo test): describe, the
-    kind, the style, then the form for that style and kind."""
+    kind, the style, then the form for that style and kind (`form2`, FORM_VERSION unless
+    `version` says otherwise)."""
+    version = version or FORM_VERSION
     t0 = time.time()
     desc = ask(model, processor, image, DESCRIBE, 900, think)
     history = [("assistant", desc)]
@@ -267,10 +380,10 @@ def run_read(model, processor, image, think: bool = False) -> dict:
         text = ask(model, processor, image, DESCRIBE, 200, think, history)
         history.append(("assistant", text))
         answers[key] = (parse_json(text) or {}).get(key)
-    history.append(("user", form2(answers.get("style") or "other", answers.get("kind") or "other")))
-    text = ask(model, processor, image, DESCRIBE, 1200, think, history)
+    history.append(("user", form2(answers.get("style") or "other", answers.get("kind") or "other", version)))
+    text = ask(model, processor, image, DESCRIBE, 1600 if version >= 3 else 1200, think, history)
     return {"description": desc, "kind": answers.get("kind"), "style": answers.get("style"), "text": text,
-            "form": parse_json(text), "seconds": round(time.time() - t0, 1)}
+            "form": parse_json(text), "form_version": version, "seconds": round(time.time() - t0, 1)}
 
 
 def main(argv=None) -> int:

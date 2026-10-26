@@ -4,15 +4,19 @@ step runs in its own environment:
     r2m_app\\Scripts\\python -m blueprint.photo house.jpg --out outputs\\blueprint\\house [--rounds 4]
 
 1. r2m_vlm: the local model reads the photo (description, kind, style, form) and finds the
-   main building, the side it shows and its windows; the segmentation model finds its
-   pixels (`refine prepare`)                     -> <stem>.read.json, <stem>.photo.json, _work/<stem>/
-2. r2m_train: MapAnything measures the building  -> <stem>.measure.json
+   main building, the side it shows and its windows, doors and garage doors; the
+   segmentation model finds its pixels (`refine prepare`)
+                                                 -> <stem>.read.json, <stem>.photo.json, _work/<stem>/
+2. r2m_train: MapAnything measures the building and places each window and door on its
+   walls                                         -> <stem>.measure.json
 3. r2m_vlm: the evaluator builds, compares the build with the photo and corrects it
    (`refine run`)                                -> <stem>/first.*, <stem>/final.* (blueprint, view), <stem>.refine.json
 4. here: build.schem (the final build; Sponge v2, 1.21.11) and blueprint.json; with
    BuildDataCollector's environment present, preview renders from four sides.
 
---rounds 0 keeps the first reading's build (no corrections); --no-measure skips MapAnything.
+--rounds 0 keeps the first reading's build (no corrections); --no-measure skips MapAnything;
+--model picks the vision model (`describe.load_model`: Qwen/Qwen3.5-9B by default, or
+qwen3.8-27b through llama.cpp).
 """
 from __future__ import annotations
 
@@ -35,16 +39,18 @@ def main(argv=None) -> int:
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--rounds", type=int, default=4, help="the evaluator's correction rounds (0: none)")
     ap.add_argument("--no-measure", action="store_true", help="skip MapAnything (typical sizes for the kind)")
+    ap.add_argument("--model", default=None, help="the vision model (describe.load_model)")
     args = ap.parse_args(argv)
     out = args.out.resolve()
     out.mkdir(parents=True, exist_ok=True)
     photo = args.photo.resolve()
     stem = photo.parent.name if photo.name == "photo.jpg" else photo.stem      # as the stages name it
-    steps = [[str(VLM), "-m", "blueprint.refine", "prepare", str(photo), "--out", str(out)]]
+    model = ["--model", args.model] if args.model else []
+    steps = [[str(VLM), "-m", "blueprint.refine", "prepare", str(photo), "--out", str(out), *model]]
     if not args.no_measure:
         steps.append([str(TRAIN), "-m", "blueprint.measure", str(photo), "--out", str(out)])
     steps.append([str(VLM), "-m", "blueprint.refine", "run", str(photo), "--out", str(out), "--rounds", str(args.rounds),
-                  "--redo"])
+                  "--redo", *model])
     for cmd in steps:
         print(">", " ".join(cmd[1:]), flush=True)
         if subprocess.run(cmd, cwd=str(ROOT)).returncode != 0:
@@ -60,7 +66,8 @@ def main(argv=None) -> int:
     print(json.dumps({"schem": str(out / "build.schem"), "style": rec["final"]["state"]["style"],
                       "kind": rec["final"]["state"]["kind"], "measured": rec["measured"], "kept": rec["kept"],
                       "score": [rec["first"]["combined"], rec["final"]["combined"]],
-                      "blocks_per_m": bp["meta"]["blocks_per_m"], "gaps": [g["gap"] for g in rec["gaps"]]},
+                      "blocks_per_m": bp["meta"]["blocks_per_m"], "gaps": [g["gap"] for g in rec["gaps"]],
+                      "conflicts": rec.get("conflicts", {}).get("final", [])},
                      indent=1), flush=True)
     if BDC.is_file():
         subprocess.run([str(BDC), "-m", "blueprint", str(out / "blueprint.json"), "--out", str(out), "--render"],

@@ -448,9 +448,13 @@ class Score(unittest.TestCase):
     """The computer measures on made-up silhouettes."""
 
     def side(self, mask, win=None, hidden=None):
-        from blueprint.score import facts, frame_of
+        from blueprint.score import boxes_of, facts, frame_of
         rgb = np.full(mask.shape + (3,), 180, np.uint8)
-        return facts(rgb, mask, frame_of(mask | (hidden if hidden is not None else False)), hidden, win)
+        frame = frame_of(mask | (hidden if hidden is not None else False))
+        out = facts(rgb, mask, frame, hidden, win)
+        if win is not None:
+            out["openings"] = {"window": boxes_of(win, frame), "door": [], "garage": []}
+        return out
 
     def house(self, w=60, h=40, roof=15, flip=False):
         m = np.zeros((100, 100), bool)
@@ -535,9 +539,10 @@ class Edits(unittest.TestCase):
         edits, gaps = from_critique(crit, self.state(), {1: 1, 2: 0})          # shown mirrored
         names = {(e["op"], e.get("part"), e.get("value"), e.get("name")) for e in edits}
         for want in (("style", None, "tudor", None), ("width", None, None, None), ("roof", 1, "gambrel", None),
-                     ("pitch", 0, None, None), ("feature", None, None, "towers"), ("feature", None, None, "balconies"),
+                     ("feature", None, None, "towers"), ("feature", None, None, "balconies"),
                      ("mirror", None, None, None), ("windows", None, None, None), ("colour", None, "pale yellow", None)):
             self.assertIn(want, names)
+        self.assertFalse([e for e in edits if e["op"] == "pitch"])    # a roof's pitch is the roof pass's
         self.assertEqual(len(gaps), 3)                     # the onion dome, the clock face, the curved roof
         self.assertTrue(all(e["why"] == "vision" for e in edits))
 
@@ -582,12 +587,366 @@ class Vision(unittest.TestCase):
         self.assertEqual(_verify(pitch, {"resemblance": 6}, {"resemblance": 6}, 0.06), "kept")
         self.assertEqual(_verify(pitch, {"resemblance": 6}, {"resemblance": 6}, 0.01), "too small a gain")
 
-    def test_label_view_names(self):
-        from blueprint.render import label_name
-        self.assertEqual(label_name("minecraft:glass_pane[east=true]"), "minecraft:black_stained_glass_pane[east=true]")
-        self.assertEqual(label_name("minecraft:spruce_door[half=lower]"), "minecraft:red_concrete")
-        self.assertEqual(label_name("minecraft:stone_brick_stairs[facing=north]"), "minecraft:quartz_stairs[facing=north]")
-        self.assertEqual(label_name("minecraft:bricks"), "minecraft:white_concrete")
+
+class PerPart(unittest.TestCase):
+    """The form's version 3: each part's size, level, offset, roof slope and garage doors."""
+
+    FORM = {"parts": [
+        {"part": "main", "width_m": 8, "depth_m": 8, "storeys": 2, "eave_m": 6, "floor_m": 0, "forward_m": 0,
+         "roof": "gable", "ridge": "parallel", "pitch_deg": 30, "windows_across": 2,
+         "front": {"door": True, "ground_windows": 1, "garage_doors": 0}, "side_garage_doors": 0, "base": "none"},
+        {"part": "wing", "width_m": 12, "depth_m": 6, "storeys": 2, "eave_m": 4.5, "floor_m": -1.5, "forward_m": 1,
+         "roof": "gable", "ridge": "parallel", "pitch_deg": 14, "windows_across": 1,
+         "front": {"door": False, "wide_window": True, "garage_doors": 0}, "side_garage_doors": 2, "base": "brick"}],
+        "wall": {"material": "wood_siding", "colour": "white"}}
+
+    def compose(self, form=None, **kw):
+        import copy as _copy
+
+        from blueprint.compose import compose
+        bp = compose(_copy.deepcopy(form or self.FORM), "suburban", "house", **kw)
+        load(bp)
+        b = build(bp)
+        self.assertEqual(b["warnings"], [])
+        return bp
+
+    def test_parts_take_their_metres_and_degrees(self):
+        bp = self.compose()
+        main, wing = bp["masses"][:2]
+        self.assertAlmostEqual(wing["w"] / main["w"], 12 / 8, delta=0.2)          # widths by their metres
+        self.assertAlmostEqual(wing["d"] / wing["w"], 0.5, delta=0.1)             # depth by its own ratio
+        self.assertLess(wing["y"], 0)                                             # a split level, lower
+        self.assertLess(wing["walls"], main["walls"])
+        self.assertGreater(wing["z"] + wing["d"], main["z"] + main["d"])          # a metre forward
+        self.assertEqual((main["roof"]["pitch"], wing["roof"]["pitch"]), (0.5, 0.25))
+        self.assertEqual(wing["materials"]["wall_base"], "bricks")
+        garages = [o for o in bp["openings"] if o["kind"] == "garage"]
+        self.assertEqual([(o["mass"], o["side"]) for o in garages], [(wing["id"], "east")] * 2)
+        self.assertEqual(bp["meta"]["form_version"], 3)
+
+    def test_what_does_not_fit_is_reported_or_grown(self):
+        import copy as _copy
+        form = _copy.deepcopy(self.FORM)
+        form["parts"][1].update(depth_m=1.5, side_garage_doors=3)                # three doors on a short end wall
+        form["parts"][0].update(windows_across=30, ridge="perpendicular")
+        form["dormers"] = 2
+        bp = self.compose(form)
+        conflicts = " | ".join(bp["meta"]["conflicts"])
+        self.assertIn("garage doors need a wall", conflicts)
+        self.assertIn("windows across", conflicts)
+        self.assertIn("dormers", conflicts)
+        wing = bp["masses"][1]
+        self.assertEqual(sum(1 for o in bp["openings"] if o["kind"] == "garage" and o["mass"] == wing["id"]), 3)
+
+    def test_pitch_a_quarter_is_half_a_block_every_two(self):
+        b = build(house(pitch=0.25))
+        self.assertEqual(cell(b, 4, 4, 7), ("slab_bottom", "deepslate_tiles"))
+        self.assertEqual(cell(b, 4, 4, 5), ("slab_top", "deepslate_tiles"))
+        self.assertEqual(top(b), 5)
+
+
+class Placement(unittest.TestCase):
+    """The photo's openings, placed on the building by MapAnything, on the build's walls."""
+
+    def bp(self, wing_d=10):
+        from blueprint.compose import compose
+        return compose({"parts": [{"part": "main", "share": 60, "storeys": 2, "roof": "gable", "windows_across": 2,
+                                   "front": {"door": True}},
+                                  {"part": "wing", "share": 40, "storeys": 1, "roof": "gable"}]}, "suburban", "house",
+                       adjust={"parts": {"1": {"depth": wing_d / 10}}})
+
+    OPENINGS = [{"label": "window", "wall": "front", "along": 0.2, "up": 0.6, "w": 0.1, "h": 0.12, "up_wall": 0.75,
+                 "h_wall": 0.2, "into": 0.0},
+                {"label": "door", "wall": "front", "along": 0.35, "up": 0.15, "w": 0.04, "h": 0.15, "up_wall": 0.2,
+                 "h_wall": 0.3, "w_m": 0.9, "h_m": 2.0, "into": 0.0},
+                {"label": "door", "wall": "right", "along": 0.3, "up": 0.1, "w": 0.2, "h": 0.15, "along_wall": 0.3,
+                 "w_wall": 0.3, "up_wall": 0.25, "h_wall": 0.45, "w_m": 2.6, "h_m": 2.2},
+                {"label": "door", "wall": "right", "along": 0.7, "up": 0.1, "w": 0.2, "h": 0.15, "along_wall": 0.72,
+                 "w_wall": 0.3, "up_wall": 0.25, "h_wall": 0.45, "w_m": 2.6, "h_m": 2.2}]
+
+    def test_kinds(self):
+        from blueprint.facade import kind_of
+        self.assertEqual([kind_of(o) for o in self.OPENINGS], ["window", "door", "garage", "garage"])
+        self.assertEqual(kind_of({"label": "garage_door", "up": 0.1, "h": 0.2}), "garage")
+
+    def test_openings_land_on_their_walls(self):
+        from blueprint.facade import fractions, photo_fractions, place_openings_3d
+        from blueprint.score import match3d
+        bp, notes = place_openings_3d(self.bp(), self.OPENINGS, "right")
+        main, wing = bp["masses"][:2]
+        placed = [o for o in bp["openings"] if (o["mass"], o["side"]) in ((main["id"], "south"), (wing["id"], "east"))]
+        win = [o for o in placed if o["kind"] == "window" and o["mass"] == main["id"]]
+        self.assertTrue(win and all(o["y"] >= main["storey_h"] for o in win))     # on the upper floor
+        self.assertEqual([o["y"] for o in placed if o["kind"] == "door"], [1])
+        self.assertEqual(sum(1 for o in placed if o["kind"] == "garage" and o["mass"] == wing["id"]), 2)
+        b = build(bp)
+        s, pairs, missing, extra = match3d(photo_fractions(self.OPENINGS), fractions(bp, b, "right"))
+        self.assertEqual(missing, [])
+
+    def test_unseen_windows_stay_and_upstairs_doors_become_windows(self):
+        from blueprint.facade import place_openings_3d
+        bp0 = self.bp()
+        wing = bp0["masses"][1]["id"]
+        before = [o for o in bp0["openings"] if o["mass"] == wing and o["side"] == "south" and o["kind"] == "window"]
+        ops = [dict(self.OPENINGS[0]),                                            # a window on the main block only
+               {"label": "door", "wall": "front", "along": 0.15, "up": 0.6, "w": 0.05, "h": 0.12, "up_wall": 0.75,
+                "h_wall": 0.2, "w_m": 0.9, "h_m": 2.0, "into": 0.0}]               # a balcony's door upstairs
+        bp, notes = place_openings_3d(bp0, ops, "right")
+        after = [o for o in bp["openings"] if o["mass"] == wing and o["side"] == "south" and o["kind"] == "window"]
+        self.assertEqual(len(after), len(before))          # the photo shows no window on the wing: it keeps its own
+        main = bp["masses"][0]
+        self.assertFalse([o for o in bp["openings"] if o["kind"] == "door" and o["mass"] == main["id"] and o["y"] > 1])
+        self.assertEqual(notes["placed"]["door"], 0)
+
+    def test_garage_doors_that_do_not_fit_lengthen_the_wall(self):
+        from blueprint.facade import place_openings_3d
+        bp, notes = place_openings_3d(self.bp(wing_d=5), self.OPENINGS, "right")
+        wing = bp["masses"][1]
+        self.assertTrue(notes["grown"])
+        self.assertEqual(sum(1 for o in bp["openings"] if o["kind"] == "garage" and o["mass"] == wing["id"]), 2)
+        load(bp)
+
+
+class PartEdits(unittest.TestCase):
+    """The loop's corrections of one part, and the critique's answers that ask for them."""
+
+    def state(self):
+        from blueprint.edits import initial
+        return initial({"style": "suburban", "kind": "house", "form": {"parts": [
+            {"part": "main", "storeys": 2, "roof": "gable", "front": {"door": True}},
+            {"part": "wing", "storeys": 1, "roof": "gable", "side_garage_doors": 1}]}})
+
+    def test_each_correction_moves_its_part(self):
+        from blueprint.compose import compose
+        from blueprint.edits import apply
+        s0 = self.state()
+        base = compose(s0["form"], s0["style"], s0["kind"], adjust=s0["adjust"])["masses"][1]
+        for edit, check in (({"op": "part_height", "part": 1, "factor": 1.5}, lambda m: m["walls"] > base["walls"]),
+                            ({"op": "part_depth", "part": 1, "factor": 1.5}, lambda m: m["d"] > base["d"]),
+                            ({"op": "part_level", "part": 1, "delta": -2}, lambda m: m["y"] == base["y"] - 2),
+                            ({"op": "part_forward", "part": 1, "delta": 2},
+                             lambda m: m["z"] + m["d"] == base["z"] + base["d"] + 2)):
+            s, note = apply(s0, edit)
+            self.assertIsNone(note, edit)
+            m = compose(s["form"], s["style"], s["kind"], adjust=s["adjust"])["masses"][1]
+            self.assertTrue(check(m), edit)
+        s, _ = apply(s0, {"op": "garage_doors", "part": 1, "value": 2})
+        bp = compose(s["form"], s["style"], s["kind"], adjust=s["adjust"])
+        self.assertEqual(sum(1 for o in bp["openings"] if o["kind"] == "garage"), 2)
+
+    def test_conflicts_become_edits(self):
+        from blueprint.compose import compose
+        from blueprint.edits import apply, from_conflicts
+        s0 = self.state()
+        s0["form"]["parts"][1]["windows_across"] = 12                            # more than its wall holds
+        bp = compose(s0["form"], s0["style"], s0["kind"])
+        edits = from_conflicts(bp["meta"]["conflicts"], s0, bp)
+        widen = [e for e in edits if e["op"] == "share" and e["part"] == 1]
+        self.assertTrue(widen and widen[0]["factor"] > 1 and widen[0]["why"] == "conflict")
+        s1, _ = apply(s0, widen[0])
+        self.assertGreater(compose(s1["form"], s1["style"], s1["kind"])["masses"][1]["w"], bp["masses"][1]["w"])
+
+    def test_part_answers_become_part_edits(self):
+        from blueprint.edits import from_critique
+        crit = {"parts": [{"part": 1, "height": "ok", "level": "ok", "roof_ok": True},
+                          {"part": 2, "height": "too_tall", "level": "should_be_lower", "depth": "too_shallow",
+                           "roof_ok": False, "roof_type": "gable", "pitch": "flatter", "garage_doors": 2}]}
+        edits, gaps = from_critique(crit, self.state(), {1: 0, 2: 1})
+        got = {(e["op"], e.get("part"), e.get("shown")) for e in edits}
+        for want in (("part_height", 1, 2), ("part_level", 1, 2), ("part_depth", 1, 2), ("garage_doors", 1, 2),
+                     ("roof", 1, None)):
+            self.assertIn(want, got)
+        self.assertNotIn(("pitch", 1, None), got)
+
+
+class Check(unittest.TestCase):
+    """The photo-only check: its answers against the build become corrections."""
+
+    def setup(self):
+        from blueprint.compose import compose
+        from blueprint.edits import check_parts, initial
+        state = initial({"style": "suburban", "kind": "house", "form": {"parts": [
+            {"part": "main", "share": 50, "storeys": 2, "roof": "gable", "ridge": "perpendicular", "front": {"door": True}},
+            {"part": "wing", "share": 50, "storeys": 1, "roof": "hip"}]}})
+        bp = compose(state["form"], state["style"], state["kind"])
+        descs, numbers = check_parts(bp, state)
+        return state, bp, descs, numbers
+
+    def test_answers_that_differ_become_edits(self):
+        from blueprint.edits import from_check
+        state, bp, descs, numbers = self.setup()
+        self.assertEqual(descs, ["the main block", "a wing"])
+        check = {"parts": [{"part": 1, "roof_ends": "triangle", "ridge": "along_front", "floor": "same", "storeys": 2,
+                            "garage_doors": 0},
+                           {"part": 2, "roof_ends": "triangle", "ridge": "along_front", "floor": "lower", "storeys": 2,
+                            "garage_doors": 2, "garage_wall": "end"}], "tallest": 1}
+        got = {(e["op"], e.get("part"), e.get("value")) for e in from_check(check, state, bp, numbers)}
+        for want in (("ridge", 0, None), ("roof", 1, "gable"), ("part_level", 1, None), ("storeys", 1, None),
+                     ("garage_doors", 1, 2)):
+            self.assertIn(want, got)
+        self.assertNotIn(("ridge", 1, None), got)          # the hip wing's ridge already runs left to right
+        self.assertTrue(all(e["why"] == "check" for e in from_check(check, state, bp, numbers)))
+
+    def test_the_check_keeps_what_both_askings_agree_on(self):
+        import json as _json
+
+        from blueprint import vision
+        answers = iter([_json.dumps({"parts": [{"part": 1, "ridge": "along_front", "storeys": 2, "roof_ends": "slope"}],
+                                     "tallest": 1}),
+                        _json.dumps({"parts": [{"part": 1, "ridge": "along_front", "storeys": 3, "roof_ends": "slope"}],
+                                     "tallest": 1})])
+        saved = vision.ask
+        vision.ask = lambda *a, **k: next(answers)
+        try:
+            got = vision.check((None, None), None, ["the main block"])
+        finally:
+            vision.ask = saved
+        self.assertEqual(got["parts"], [{"part": 1, "ridge": "along_front", "roof_ends": "slope"}])
+        self.assertEqual(got["disagreed"], 1)
+        self.assertEqual(got["tallest"], 1)
+        self.assertIn("front_to_back|along_front", vision._flipped(vision.CHECK))
+
+    def test_only_answers_the_form_agrees_with_are_acted_on(self):
+        from blueprint.edits import agreed_with_form
+        state, bp, descs, numbers = self.setup()
+        check = {"parts": [{"part": 1, "ridge": "along_front", "roof_ends": "triangle", "storeys": 2},
+                           {"part": 2, "roof_ends": "slope", "storeys": 3}]}
+        got = agreed_with_form(check, state["form"], numbers)["parts"]
+        # the form read the main block's ridge perpendicular (front to back) and its wing hip with 1 storey
+        self.assertEqual(got[0], {"part": 1, "roof_ends": "triangle", "storeys": 2})
+        self.assertEqual(got[1], {"part": 2, "roof_ends": "slope"})
+
+    def test_doors_size_a_level_they_agree_with(self):
+        from blueprint.edits import from_check
+        from blueprint.facade import levels
+        state, bp, descs, numbers = self.setup()
+        openings = [{"label": "door", "wall": "front", "along": 0.25, "up": 0.3, "w": 0.05, "h": 0.2, "w_m": 1, "h_m": 2.1},
+                    {"label": "garage_door", "wall": "right", "along": 0.5, "along_wall": 0.5, "up": 0.08, "h": 0.2,
+                     "w": 0.2, "w_wall": 0.4}]
+        door_levels = levels(bp, openings)
+        wing = bp["masses"][1]["id"]
+        self.assertLessEqual(door_levels.get(wing, 0), -3)  # its garage door stands well below the entrance
+        check = {"parts": [{"part": 2, "floor": "lower"}]}
+        e = [e for e in from_check(check, state, bp, numbers, door_levels) if e["op"] == "part_level"][0]
+        self.assertTrue(e["doors_agree"])
+        self.assertEqual(e["delta"], door_levels[wing])
+
+
+class RoofPass(unittest.TestCase):
+    """Roofs as the photo shows them: the concrete questions' answers, and the parts they build."""
+
+    def form(self, **seen):
+        return {"parts": [{"part": "main", "width_m": 14, "depth_m": 9, "storeys": 2, "eave_m": 6, "roof": "gable",
+                           "ridge": "perpendicular", "pitch_deg": 30, "front": {"door": True}, "roof_seen": seen}]}
+
+    def compose(self, form, style="suburban", kind="house"):
+        from blueprint.compose import compose
+        bp = compose(form, style, kind)
+        load(bp)
+        b = build(bp)
+        self.assertEqual(b["warnings"], [])
+        return bp
+
+    def test_three_quarter_pitch_climbs_stairs_and_slabs(self):
+        b = build(house(pitch=0.75))
+        shapes = [cell(b, 4, y, z)[0] for z, y in ((7, 4), (6, 5), (5, 5))]
+        self.assertEqual(shapes[0][:6], "stairs")                 # the eave: a full step
+        self.assertEqual(shapes[1], "slab_bottom")                # then half a step
+        self.assertEqual(top(b), 7)
+
+    def test_the_front_top_sets_the_ridge_and_the_pitch_class_the_slope(self):
+        bp = self.compose(self.form(front_top="eave", pitch="medium"))
+        self.assertEqual((bp["masses"][0]["roof"]["ridge"], bp["masses"][0]["roof"]["pitch"]), ("x", 0.75))
+        bp = self.compose(self.form(front_top="triangle", pitch="low"))
+        self.assertEqual((bp["masses"][0]["roof"]["ridge"], bp["masses"][0]["roof"]["pitch"]), ("z", 0.5))
+        bp = self.compose(self.form(front_top="flat"))
+        self.assertEqual(bp["masses"][0]["roof"]["type"], "flat")
+        f = self.form(front_top="eave", pitch="medium")
+        f["parts"][0]["pitch_deg"] = 50                          # the form's steep kept where the pass said medium
+        self.assertEqual(self.compose(f)["masses"][0]["roof"]["pitch"], 1.0)
+        for deg, seen, want in ((45, "medium", 1.0), (60, "steep", 2.0), (30, "steep", 2.0)):
+            f = self.form(front_top="eave", pitch=seen)          # a steep style: the form's degrees first
+            f["parts"][0]["pitch_deg"] = deg
+            self.assertEqual(self.compose(f, "victorian")["masses"][0]["roof"]["pitch"], want, deg)
+
+    def test_a_gable_rising_from_the_eave_is_its_own_mass(self):
+        bp = self.compose(self.form(front_top="both", cross_at="left", pitch="medium"))
+        main, xg = bp["masses"][0], bp["masses"][1]
+        self.assertEqual(xg["id"], "x0")
+        self.assertEqual((xg["roof"]["type"], xg["roof"]["ridge"]), ("gable", "z"))
+        self.assertEqual(xg["z"] + xg["d"], main["z"] + main["d"] + 1)          # a block proud of the front
+        self.assertLess(xg["x"] - main["x"], main["w"] // 3)                     # at the left
+        self.assertTrue(any(o["mass"] == "x0" and o["kind"] == "window" for o in bp["openings"]))
+
+    def test_tower_tops(self):
+        for answer, roof, lantern in (("spire", "spire", False), ("lantern", "flat", True),
+                                      ("battlements", "flat", False), ("cone", "pyramid", False)):
+            form = {"parts": [{"part": "main", "storeys": 2, "roof": "gable"},
+                              {"part": "tower", "storeys": 5, "roof": "flat", "roof_seen": {"tower_top": answer}}]}
+            bp = self.compose(form, "gothic", "church")
+            tower = bp["masses"][1]
+            self.assertEqual(tower["roof"]["type"], roof, answer)
+            self.assertEqual(any(f["kind"] == "lantern" and f["mass"] == tower["id"] for f in bp["features"]), lantern)
+            if answer == "battlements":
+                self.assertTrue(tower["roof"]["battlements"])
+
+    def test_a_lighthouse_lantern_crowns_its_tower_not_the_house(self):
+        for seen in ({"tower_top": "lantern"}, {}):
+            form = {"parts": [{"part": "tower", "storeys": 4, "roof": "flat", "roof_seen": seen},
+                              {"part": "main", "storeys": 1, "roof": "gable", "pitch_deg": 40}]}
+            bp = self.compose(form, "victorian", "lighthouse")
+            tower, house = bp["masses"][0], bp["masses"][1]
+            self.assertEqual(house["roof"]["type"], "gable")
+            self.assertEqual([f["mass"] for f in bp["features"] if f["kind"] in ("lantern", "gallery")],
+                             [tower["id"], tower["id"]])
+
+    def test_open_lantern_has_posts_and_a_cap(self):
+        bp = {"masses": [{"id": "t", "x": 0, "z": 0, "w": 7, "d": 7, "y": 0, "walls": 10, "floors": [0],
+                          "roof": {"type": "flat", "overhang": 0}}],
+              "features": [{"kind": "lantern", "mass": "t", "h": 4, "open": True, "cap": "spire"}]}
+        b = build(bp)
+        self.assertEqual(cell(b, 1, 13, 1)[0], "full")           # a corner post
+        self.assertEqual(cell(b, 3, 12, 1)[0], "air")            # open between the posts
+        self.assertGreater(top(b), 15)                           # the spire on top
+
+    def test_the_roof_pass_asks_each_part_what_it_shows(self):
+        from blueprint import refine, vision
+        asked = []
+
+        def fake(vlm, photo, which, key):
+            asked.append((which, key))
+            return {"front_top": "both", "ends": "slope", "pitch": "steep", "cross_at": "right",
+                    "tower_top": "lantern"}[key]
+        saved = vision.roof_question, vision.roof_yes
+        vision.roof_question = fake
+        vision.roof_yes = lambda vlm, photo, which, key: asked.append((which, key)) or True
+        try:
+            read = {"form": {"parts": [{"part": "main", "roof": "gable"}, {"part": "tower", "roof": "flat"}]}}
+            out = refine.roof_pass(None, None, read)
+        finally:
+            vision.roof_question, vision.roof_yes = saved
+        self.assertEqual(out[0], {"front_top": "both", "ends": "slope", "pitch": "steep", "cross_at": "right"})
+        self.assertEqual(out[1], {"tower_top": "lantern"})
+        self.assertEqual(read["form"]["parts"][1]["roof_seen"], {"tower_top": "lantern"})
+        self.assertIn("its tower, the part at the right of the 2 parts it is made of", [w for w, _ in asked])
+        self.assertNotIn("slope", [k for _, k in asked])         # no flat roof against a pitched one: no tie-break
+
+    def test_a_disagreement_is_settled_by_a_yes_no_question(self):
+        from blueprint import refine, vision
+        saved = vision.roof_yes
+        try:
+            for seen, form, yes, key, want in (("eave", "flat", False, "slope", "flat"),
+                                               ("eave", "flat", True, "slope", "eave"),
+                                               ("flat", "triangle", True, "slope", "triangle"),
+                                               ("eave", "flat", None, "slope", "eave"),       # askings differ
+                                               ("both", "eave", False, None, "both"),          # no question
+                                               ("eave", "triangle", True, None, "eave")):
+                asked = []
+                vision.roof_yes = lambda vlm, photo, which, k, yes=yes: asked.append(k) or yes
+                self.assertEqual(refine.settle_front(None, None, "it", seen, form), want, (seen, form, yes))
+                self.assertEqual(asked, [key] if key else [])
+        finally:
+            vision.roof_yes = saved
 
 
 class Example(unittest.TestCase):

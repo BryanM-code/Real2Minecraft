@@ -41,7 +41,7 @@ FORMATS = ("blueprint-0", "blueprint-1")          # blueprint-1 adds shapes, roo
 SIDES = ("south", "north", "east", "west")
 ROOF_TYPES = ("gable", "hip", "shed", "flat", "pyramid", "cross_gable", "mansard", "gambrel", "sawtooth",
               "spire", "cone", "dome", "pagoda")
-PITCHES = (0.5, 1.0, 2.0, 3.0)
+PITCHES = (0.25, 0.5, 0.75, 1.0, 2.0, 3.0)  # rise per block of run: 14, 27, 37, 45, 63, 72 degrees
 SHAPES = ("box", "round", "octagon")
 DECOR = ("half_timber", "quoins", "bands", "pilasters", "buttresses", "curtain")
 WINDOW_STYLES = ("rect", "arched", "lancet")
@@ -100,7 +100,7 @@ FEATURE_DEFAULTS = {"chimney": {"w": 2, "d": 2, "cap": True}, "skylight": {"w": 
                     "awning": {"y": 4, "depth": 2},
                     "sails": {"length": 0},
                     "gallery": {},
-                    "lantern": {"h": 3},
+                    "lantern": {"h": 3, "open": False, "cap": "", "shrink": -1},
                     "finial": {"h": 0}}
 
 

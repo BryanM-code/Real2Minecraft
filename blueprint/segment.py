@@ -27,14 +27,16 @@ SKY = (2,)
 MIN_SHARE = 0.01            # a building smaller than this share of the photo is a failed cut-out
 
 
-def load():
-    """(processor, model) on the GPU in bf16."""
+def load(device: str = "cuda"):
+    """(processor, model) on the GPU in bf16, or on the CPU in fp32 (when a llama.cpp vision
+    model fills the GPU)."""
     import torch
     import transformers.models.eomt.modeling_eomt as E
     from transformers import AutoImageProcessor, EomtForUniversalSegmentation
     E.requires_backends = lambda *a, **k: None     # only the training loss needs scipy
     proc = AutoImageProcessor.from_pretrained(MODEL)
-    model = EomtForUniversalSegmentation.from_pretrained(MODEL, dtype=torch.bfloat16).to("cuda").eval()
+    dtype = torch.bfloat16 if device == "cuda" else torch.float32
+    model = EomtForUniversalSegmentation.from_pretrained(MODEL, dtype=dtype).to(device).eval()
     return proc, model
 
 

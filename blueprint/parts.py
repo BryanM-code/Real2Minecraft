@@ -91,11 +91,11 @@ def dome(cv: Canvas, mats: dict, m: dict | None, f: dict, ok=None) -> None:
                 block, shape = mats["window"], "pane"     # drum windows
             elif in_drum:
                 block = mats["wall"]
-            cv.put((x, y, z), shape, block, owner, ok)
+            cv.put((x, y, z), shape, block, owner, ok, label="window" if block == mats["window"] else None)
     if f.get("lantern") and tops:
         (x, z), top = max(tops.items(), key=lambda kv: kv[1])
         for y in range(top + 1, top + 3):
-            cv.put((x, y, z), "full", mats["window"], owner, _empty)
+            cv.put((x, y, z), "full", mats["window"], owner, _empty, label="window")
         cv.put((x, top + 3, z), "slab_bottom", mats["dome"], owner, _empty)
         cv.put((x, top + 4, z), "fence", mats["railing"], owner, _empty)
 
@@ -145,20 +145,22 @@ def decor(cv: Canvas, m: dict, mats: dict) -> None:
             length = wall_length(m, sides[0])
             if dec == "half_timber" and plain and j >= first:
                 if t % 3 == 0 or j in floors or j == rows - 1:
-                    cv.put(p, "full", mats["trim"], owner)
+                    cv.put(p, "full", mats["trim"], owner, label="trim")
             elif dec == "quoins" and corner and j >= 1:
-                cv.put(p, "full", mats["wall_base"] if mats["wall_base"] != mats["wall"] else mats["trim"], owner)
+                cv.put(p, "full", mats["wall_base"] if mats["wall_base"] != mats["wall"] else mats["trim"], owner,
+                       label="trim")
             elif dec == "quoins" and j % 2 == 0 and j >= 1 and (t in (1, length - 2)) and plain:
-                cv.put(p, "full", mats["wall_base"] if mats["wall_base"] != mats["wall"] else mats["trim"], owner)
+                cv.put(p, "full", mats["wall_base"] if mats["wall_base"] != mats["wall"] else mats["trim"], owner,
+                       label="trim")
             elif dec == "bands" and plain and j in floors and j > 0:
-                cv.put(p, "full", mats["trim"], owner)
+                cv.put(p, "full", mats["trim"], owner, label="trim")
             elif dec == "pilasters" and plain and not corner and t % 4 == 2 and 1 < t < length - 2:
-                cv.put(p, "full", mats["trim"], owner)
+                cv.put(p, "full", mats["trim"], owner, label="trim")
             elif dec == "curtain" and plain and not corner:
                 if t % 4 == 0 or j in floors:
-                    cv.put(p, "full", mats["trim"], owner)
+                    cv.put(p, "full", mats["trim"], owner, label="trim")
                 else:
-                    cv.put(p, "full", mats["window"], owner)
+                    cv.put(p, "full", mats["window"], owner, label="window")
         if dec == "buttresses" and m.get("shape", "box") == "box":
             top = max(2, rows * 2 // 3)
             for side in ("south", "north", "east", "west"):
@@ -265,7 +267,7 @@ def bay(cv: Canvas, m: dict, f: dict, mats: dict, pieces, floor) -> None:
                 if corner:
                     cv.put(local(m, side, t, j, o), "full", mats["frame"], owner, _free)
                 elif face:
-                    cv.put(local(m, side, t, j, o), "pane", mats["window"], owner, _free)
+                    cv.put(local(m, side, t, j, o), "pane", mats["window"], owner, _free, label="window")
 
 
 def awning(cv: Canvas, m: dict, f: dict, mats: dict, pieces, floor) -> None:
@@ -300,9 +302,10 @@ def dormer(cv: Canvas, m: dict, f: dict, mats: dict, pieces, floor) -> None:
                 cheek = t in (u - 1, u + w)
                 front = o == -1
                 if front and not cheek and base < j < top:
-                    cv.put(local(m, side, t, j, o), "pane", mats["window"], owner, can)
+                    cv.put(local(m, side, t, j, o), "pane", mats["window"], owner, can, label="window")
                 elif cheek or front:
-                    cv.put(local(m, side, t, j, o), "full", mats["frame"] if front else mats["wall"], owner, can)
+                    cv.put(local(m, side, t, j, o), "full", mats["frame"] if front else mats["wall"], owner, can,
+                           label="trim" if front else "wall")
                 else:
                     cv.put(local(m, side, t, j, o), "air", None, None, can)
     for t in range(u - 2, u + w + 2):               # its own little gable, ridge running back
@@ -377,18 +380,45 @@ def gallery(cv: Canvas, m: dict, f: dict, mats: dict, pieces, floor) -> None:
 
 
 def lantern(cv: Canvas, m: dict, f: dict, mats: dict, pieces, floor) -> None:
-    """A glass room on top of a mass (a lighthouse's), with a pointed cap."""
+    """A small room on top of a mass under a cap: glass all round (a lighthouse's lantern), or
+    `open`, posts at its corners and a rail at its foot (a belfry, a city hall tower's lantern).
+    `cap`: pyramid (the default; a cone on a round mass), dome or spire; `shrink`: blocks in from
+    the mass's sides (-1: one where the mass is 5 or more wide)."""
     from .build import _mass, _roof
     x0, x1, z0, z1 = mass_bounds(m)
-    shrink = 1 if min(m["w"], m["d"]) >= 5 else 0
+    shrink = int(f.get("shrink", -1))
+    if shrink < 0:
+        shrink = 1 if min(m["w"], m["d"]) >= 5 else 0
+    shrink = max(0, min(shrink, (min(m["w"], m["d"]) - 3) // 2))
+    round_ = m.get("shape", "box") != "box"
+    cap = str(f.get("cap") or "")
     mini = {"id": m["id"] + "_lantern", "x": x0 + shrink, "z": z0 + shrink, "w": m["w"] - 2 * shrink,
             "d": m["d"] - 2 * shrink, "y": m["y"] + wall_rows(m) + 1, "walls": int(f["h"]), "floors": [0],
             "plinth": {s: 0 for s in OUT}, "corner_trim": False, "shape": m.get("shape", "box"),
-            "roof": {"type": "cone" if m.get("shape", "box") != "box" else "pyramid", "pitch": 1.0, "overhang": 1,
-                     "ridge": "x", "high": "north", "parapet": 1}}
-    lmats = dict(mats, wall=mats["window"], wall_base=mats["window"])
-    _mass(cv, mini, lmats)
-    _roof(cv, mini, dict(lmats, roof=mats["dome"], roof_edge=mats["dome"], wall=mats["trim"]))
+            "roof": {"type": "spire" if cap == "spire" else "cone" if round_ else "pyramid", "pitch": 1.0,
+                     "overhang": 0 if cap == "spire" else 1, "ridge": "x", "high": "north", "parapet": 1}}
+    owner = ("roof", m["id"])
+    if f.get("open"):                                  # corner posts, a rail between them, a lintel ring
+        mx0, mx1, mz0, mz1 = mass_bounds(mini)
+        ring = perimeter(footprint(mini))
+        corners = {(mx0, mz0), (mx0, mz1), (mx1, mz0), (mx1, mz1)}
+        posts = corners if not round_ else {p for p in ring if (p[0] + p[1]) % 3 == 0}
+        top = mini["y"] + mini["walls"] - 1
+        for x, z in ring:
+            cv.put((x, mini["y"], z), "fence", mats["railing"], owner, _empty)
+            cv.put((x, top, z), "full", mats["trim"], owner, _empty)
+            if (x, z) in posts:
+                for y in range(mini["y"], top):
+                    cv.put((x, y, z), "full", mats["trim"], owner)
+        for x, z in footprint(mini):                   # its floor
+            cv.put((x, mini["y"] - 1, z), "full", mats["trim"], owner)
+    else:
+        lmats = dict(mats, wall=mats["window"], wall_base=mats["window"])
+        _mass(cv, mini, lmats)
+    if cap == "dome":
+        dome(cv, mats, mini, {"squash": 1.0})
+    else:
+        _roof(cv, mini, dict(mats, roof=mats["dome"], roof_edge=mats["dome"], wall=mats["trim"]))
 
 
 def dome_feature(cv: Canvas, m: dict, f: dict, mats: dict, pieces, floor) -> None:

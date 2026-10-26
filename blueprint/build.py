@@ -23,14 +23,23 @@ LEFT = {"south": "west", "north": "east", "east": "south", "west": "north"}     
 RIGHT = {v: k for k, v in LEFT.items()}
 
 
+# what each block is, for scoring a build part by part (`grids`' "labels"; code = index)
+LABELS = ("air", "wall", "base", "trim", "roof", "window", "door", "garage", "skylight", "chimney", "feature",
+          "floor", "site", "plant")
+OWNER_LABEL = {"wall": "wall", "roof": "roof", "frame": "trim", "out": "trim", "floor": "floor", "feature": "feature",
+               "portico": "feature", "porch": "feature", "dormer": "roof", "site": "site", "box": "site",
+               "plant": "plant", "open": "window"}
+
+
 class Canvas:
-    """Sparse blocks: (x, y, z) -> (shape name, block name, owner); owner is a tuple such
-    as ("wall", mass id), ("roof", mass id), ("site",)."""
+    """Sparse blocks: (x, y, z) -> (shape name, block name, owner, label); owner is a tuple
+    such as ("wall", mass id), ("roof", mass id), ("site",), and decides what may replace the
+    block; label says what the block is (LABELS), for the scores."""
 
     def __init__(self):
         self.cells = {}
 
-    def put(self, p, shape, block, owner, when=None) -> bool:
+    def put(self, p, shape, block, owner, when=None, label=None) -> bool:
         """Place (or with shape "air" clear) unless `when(current cell or None)` is false.
         A shape the block lacks falls back (stairs -> full, slab -> full, fence -> wall)."""
         if when is not None and not when(self.cells.get(p)):
@@ -41,7 +50,7 @@ class Canvas:
         shape = fit(shape, block)
         if shape is None:
             return False
-        self.cells[p] = (shape, block, owner)
+        self.cells[p] = (shape, block, owner, label or OWNER_LABEL.get(owner[0], "feature"))
         return True
 
 
@@ -135,7 +144,8 @@ def _mass(cv: Canvas, m: dict, mats: dict) -> None:
         corner = box and len(sides) == 2 and m["corner_trim"]
         for y in range(y0, y0 + rows):
             role = "wall_base" if y - y0 < base else "trim" if corner else "wall"
-            cv.put((x, y, z), "full", mats[role], ("wall", mid))
+            cv.put((x, y, z), "full", mats[role], ("wall", mid),
+                   label={"wall_base": "base", "trim": "trim", "wall": "wall"}[role])
     for f in m["floors"]:
         for x, z in cells:
             if (x, z) not in edge:
@@ -217,6 +227,26 @@ def _cross(m: dict, o: int, xa: int, xb: int, za: int, zb: int) -> dict:
     return out
 
 
+def _three_quarter(k: int, facing, e: int, x: int, z: int):
+    """A column of a 0.75 roof: its top 1.5 (k + 1) half blocks above the eave's row, rounded,
+    so the slope climbs a stair, then a slab, in turn; full blocks under it down to where the
+    column before it stood, so no gap opens under the steps."""
+    h2 = (3 * (k + 1) + 1) // 2                             # the top, in half blocks
+    prev = (3 * k + 1) // 2 if k else 0
+    if facing is None:                                      # the ridge: half a block over the last step
+        h2 = prev + 1
+    base = e - 1
+    lowest = base + prev // 2
+    if h2 % 2:                                              # a half step: a bottom slab on top
+        top = base + h2 // 2
+        cap = ((x, top, z), "slab_bottom")
+    else:
+        top = base + h2 // 2 - 1
+        cap = ((x, top, z), "full" if facing is None else "stairs_" + facing)
+    fill = [((x, y, z), "full") for y in range(min(lowest, top), top)]
+    return [cap] + fill, min([top] + [p[0][1] for p in fill])
+
+
 def _pieces_for(pitch: float, k: int, facing, e: int, x: int, z: int, kind: str, kbreak: int):
     """[(p, shape), ...] of one roof column (its surface piece first), and that piece's row."""
     if kind == "mansard" and k > kbreak:                    # the flat top over the steep sides
@@ -232,6 +262,11 @@ def _pieces_for(pitch: float, k: int, facing, e: int, x: int, z: int, kind: str,
     if pitch == 0.5:
         y = e - 1 + k // 2
         return [((x, y, z), "slab_bottom" if k % 2 == 0 else "slab_top")], y
+    if pitch == 0.25:                                       # half a block every two: about 14 degrees
+        y = e - 1 + k // 4
+        return [((x, y, z), "slab_bottom" if k % 4 < 2 else "slab_top")], y
+    if pitch == 0.75:                                       # three blocks every four: about 37 degrees
+        return _three_quarter(k, facing, e, x, z)
     p = int(pitch)
     top = e - 2 + p * (k + 1)                               # the stair's row
     if facing is None:                                      # a ridge: blocks and a slab cap
@@ -377,7 +412,7 @@ def _window(cv: Canvas, m: dict, o: dict, mats: dict) -> None:
                 facing = LEFT[side] if t == u else RIGHT[side]
                 cv.put((x, base + j, z), "stairs_top_" + facing, mats["frame"], ("frame", mid), _mine(mid))
             elif inside and t - u not in mullions:
-                cv.put((x, base + j, z), "pane", mats["window"], ("open", mid), _mine(mid))
+                cv.put((x, base + j, z), "pane", mats["window"], ("open", mid), _mine(mid), label="window")
             elif inside or o["frame"]:
                 cv.put((x, base + j, z), "full", mats["frame"], ("frame", mid), _mine(mid))
     if o["sill"]:
@@ -425,7 +460,7 @@ def _door(cv: Canvas, m: dict, o: dict, mats: dict) -> None:
             continue
         x, z = xz
         if u <= t < u + w:                                  # the upper half is derived on writing
-            cv.put((x, base + y, z), "door_" + side, mats["door"], ("open", mid), _mine(mid))
+            cv.put((x, base + y, z), "door_" + side, mats["door"], ("open", mid), _mine(mid), label="door")
             cv.put((x, base + y + 1, z), "air", None, None, _mine(mid))
             if o["frame"]:
                 cv.put((x, base + y + 2, z), "full", mats["frame"], ("frame", mid), _mine(mid))
@@ -448,7 +483,7 @@ def _garage(cv: Canvas, m: dict, o: dict, mats: dict) -> None:
             if u <= t < u + w and j < y + h:
                 if cv.put((x, base + j, z), "air", None, None, _mine(mid)):
                     cv.put((x - dx, base + j, z - dz), "full", mats["garage"], ("open", mid),
-                           lambda c: c is None or c[2][0] in ("site", "floor"))
+                           lambda c: c is None or c[2][0] in ("site", "floor"), label="garage")
             elif o["frame"]:
                 cv.put((x, base + j, z), "full", mats["frame"], ("frame", mid), _mine(mid))
 
@@ -474,9 +509,9 @@ def _chimney(cv: Canvas, f: dict, mats: dict, floor: int) -> None:
     for x in range(f["x"], f["x"] + f["w"]):
         for z in range(f["z"], f["z"] + f["d"]):
             for y in range(y0, f["top"]):
-                cv.put((x, y, z), "full", mats["chimney"], ("feature",))
+                cv.put((x, y, z), "full", mats["chimney"], ("feature",), label="chimney")
             if f["cap"]:
-                cv.put((x, f["top"], z), "slab_bottom", mats["cap"], ("feature",))
+                cv.put((x, f["top"], z), "slab_bottom", mats["cap"], ("feature",), label="chimney")
 
 
 def _skylight(cv: Canvas, m: dict, f: dict, mats: dict, pieces: dict) -> None:
@@ -494,7 +529,7 @@ def _skylight(cv: Canvas, m: dict, f: dict, mats: dict, pieces: dict) -> None:
         inside = f["u"] <= t < f["u"] + f["w"] and f["v"] <= k < f["v"] + f["h"]
         ring = f["u"] - 1 <= t <= f["u"] + f["w"] and f["v"] - 1 <= k <= f["v"] + f["h"]
         if inside:
-            cv.put((x, pc["y"], z), "full", mats["skylight"], ("roof", mid))
+            cv.put((x, pc["y"], z), "full", mats["skylight"], ("roof", mid), label="skylight")
         elif ring and f["frame"]:
             shape = pc["shape"] if shape_ok(pc["shape"], mats["frame"]) else "full"
             cv.put((x, pc["y"], z), shape, mats["frame"], ("roof", mid))
@@ -602,17 +637,24 @@ def build(src) -> dict:
         m = by_id.get(f.get("mass"))
         mm = mats[m["id"]] if m else glob
         if f["kind"] == "chimney":
-            _chimney(cv, f, glob, floor)
+            # from the foot of the mass it stands in, not the lowest one's: a split level's lower
+            # wing left a brick column hanging below the main block
+            under = [mm_["y"] for mm_ in masses if mm_["x"] <= f["x"] < mm_["x"] + mm_["w"]
+                     and mm_["z"] <= f["z"] < mm_["z"] + mm_["d"]]
+            _chimney(cv, f, glob, min(under) if under else floor)
         elif f["kind"] == "skylight":
             _skylight(cv, m, f, mm, pieces[m["id"]])
         else:
             parts.FEATURES[f["kind"]](cv, m, f, mm, pieces.get(m["id"]) if m else None, floor)
     _boxes(cv, site)
     _plants(cv, site)
-    return grids(cv)
+    return grids(cv, masses)
 
 
-def grids(cv: Canvas) -> dict:
+def grids(cv: Canvas, masses: list | None = None) -> dict:
+    """The canvas as (X, Y, Z) grids: "shape" and "material" (mcvox-v3), "labels" (an index
+    into LABELS: what each block is) and "part" (1 + the index in `masses` of the mass a block
+    belongs to, 0 for none), with "origin", "dims", "blocks", "warnings", "parts" (mass ids)."""
     if not cv.cells:
         raise ValueError("the blueprint built no blocks")
     pts = np.array(list(cv.cells), np.int64)
@@ -620,8 +662,13 @@ def grids(cv: Canvas) -> dict:
     dims = hi - lo + 1
     shape = np.zeros(dims, np.uint8)
     material = np.zeros(dims, np.uint16)
+    labels = np.zeros(dims, np.uint8)
+    part = np.zeros(dims, np.uint8)
+    ids = [m["id"] for m in masses or []]
+    index = {mid: k + 1 for k, mid in enumerate(ids)}
+    code = {name: k for k, name in enumerate(LABELS)}
     warnings = set()
-    for (x, y, z), (s, block, _) in cv.cells.items():
+    for (x, y, z), (s, block, owner, label) in cv.cells.items():
         mi = material_index(block)
         si = V.SHAPE_INDEX[s]
         if mi is None or not V.VALID[si, mi]:
@@ -629,7 +676,12 @@ def grids(cv: Canvas) -> dict:
             si = V.SHAPE_INDEX["full"]
             if mi is None or not V.VALID[si, mi]:
                 continue
-        shape[x - lo[0], y - lo[1], z - lo[2]] = si
-        material[x - lo[0], y - lo[1], z - lo[2]] = mi
-    return {"shape": shape, "material": material, "origin": lo.tolist(), "dims": dims.tolist(),
-            "blocks": int((shape != 0).sum()), "warnings": sorted(warnings)}
+        p = (x - lo[0], y - lo[1], z - lo[2])
+        shape[p] = si
+        material[p] = mi
+        labels[p] = code.get(label, code["feature"])
+        if len(owner) > 1:
+            part[p] = min(255, index.get(str(owner[1]).removesuffix("_lantern"), 0))
+    return {"shape": shape, "material": material, "labels": labels, "part": part, "parts": ids,
+            "origin": lo.tolist(), "dims": dims.tolist(), "blocks": int((shape != 0).sum()),
+            "warnings": sorted(warnings)}

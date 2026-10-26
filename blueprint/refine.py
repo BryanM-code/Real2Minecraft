@@ -1,17 +1,38 @@
 """The evaluator: a build is checked against its photo and corrected, one change at a time,
 until it is close enough or nothing more helps.
 
-Two evaluations, combined (`combined`, 0-1):
-- the computer measures (`score`): outline, proportions, roof line, windows and doors,
-  colours. Repeatable, but only as good as the segmentation and the camera angle;
-- the vision model (`vision`): it looks at a render of the build beside the photo, says what
-  is wrong in the builder's own terms (style, kind, proportions, roofs, missing or extra
-  features, mirrored, windows, colours) and how alike they are (0-10), and judges which of
-  two builds is closer.
+Every build the loop measures has the photo's windows, doors and garage doors where the photo
+has them (`facade.place_openings_3d`, from MapAnything's placing of the vision model's boxes),
+and lists what its form asked that it could not build ("conflicts").
 
-Each round every correction the critique asks for and every one the measures point to
-(`edits`) is built and measured (a build and two renders take about half a second). Three are
-tried in turn, the model's own first. A change of proportions the measures found is kept on
+Two evaluations, combined (`combined`, 0-1):
+- the computer measures (`score`): outline, proportions, roof line, each part's roof line,
+  windows, doors and garage doors placed on the building, colours. Repeatable, but only as
+  good as the segmentation and the camera angle;
+- the vision model (`vision`): it looks at a render of the build beside the photo, says what
+  is wrong in the builder's own terms (style, kind, proportions, each part's size, level, roof
+  and garage doors, missing or extra features, mirrored, windows, colours) and how alike they
+  are (0-10).
+
+Before the loop, `prepare` asks each part's roof its concrete questions (`roof_pass`; `roofs`
+adds them to older readings). The loop changes no pitch: on real photos neither the measures nor
+the critique told a right pitch from a wrong one.
+
+First, the photo-only check (`check_round`): the vision model answers about the photo alone,
+for each of the build's parts (whether the building has it, its roof's ends and ridge, its
+floor against the main block's, its storeys, its garage doors, its base band, which part is
+tallest), twice with the choices reversed, and the code compares the answers both give with
+the build; each correction they ask for is kept unless the measures find it much worse. (Shown
+the photo and a render together, the model described the render: on a house built with ten
+deliberate mistakes, the 9B and 27B models rated 8 of them 9 of 10, like the right build, and
+named 3 and 4. The measures tell right from wrong on renders standing in for photos, but on
+real photos hardly: see CHECK_GAIN.)
+
+Then each round every correction the critique asks for, every one the measures point to and
+every one that would let the build do what its form asked (its conflicts: a part too narrow
+for its windows) (`edits`) is built and measured (a build and its renders take about a
+second). Three are tried in turn, the model's own first; a conflict's is kept unless the
+measures find it worse. A change of proportions the measures found is kept on
 the measures; any other is checked by critiquing the candidate build on its own (`_verify`):
 kept when the model's complaint is gone, nothing in the new critique asks to undo it and its
 rating does not drop. (Asked instead which of two builds is closer, the 9B model picked the
@@ -27,9 +48,10 @@ says what to build next.
 
 Stages, from this repository's root, MapAnything (r2m_train) measuring in between:
 
-    r2m_vlm\\Scripts\\python -m blueprint.refine prepare photos... --out DIR
+    r2m_vlm\\Scripts\\python -m blueprint.refine prepare photos... --out DIR [--model qwen3.8-27b]
+    r2m_vlm\\Scripts\\python -m blueprint.refine roofs photos... --out DIR   (the roof pass on older readings)
     r2m_train\\Scripts\\python -m blueprint.measure photos... --out DIR
-    r2m_vlm\\Scripts\\python -m blueprint.refine run photos... --out DIR [--rounds 4]
+    r2m_vlm\\Scripts\\python -m blueprint.refine run photos... --out DIR [--rounds 4] [--model qwen3.8-27b]
     r2m_vlm\\Scripts\\python -m blueprint.refine judge photos... --out DIR
     r2m_vlm\\Scripts\\python -m blueprint.refine summary --out DIR
 """
@@ -55,11 +77,30 @@ SHORTLIST = 3           # corrections the vision model judges per round, at most
 # for the rest; a storey, the style, the kind or a mirror image of theirs only when the model
 # rates the result higher (a flip the measures wanted took a chalet's rating from 6 to 2)
 SHAPE_GAIN, CLEAR_GAIN, MEANING_GAIN = 0.02, 0.05, 0.08
-SHAPE_OPS = ("width", "height", "depth", "share")
+SHAPE_OPS = ("width", "height", "depth", "footprint", "share", "part_height", "part_depth", "part_level", "part_forward")
 MEANING_OPS = ("roof", "feature", "add_part", "remove_part", "units", "garage_wall", "skylights_on", "window_style",
-               "wall_material")
+               "wall_material", "garage_doors")
 MODEL_ONLY = ("storeys", "style", "kind", "mirror")
+# what a building is shaped like, which the measures do see: the critique's corrections of these
+# need the measures not to find them worse too (on its own, the critique of a candidate confirms
+# little: shown a render, the model describes it)
+STRUCTURE_OPS = SHAPE_OPS + ("roof", "pitch", "ridge", "storeys", "mirror", "add_part", "remove_part", "garage_doors")
 WORSE = -0.03           # a correction the measures find this much worse is not shown
+# a correction the photo-only check asks for (`vision.check`, asked twice, its answers kept where
+# both agree) is kept unless the measures find it this much worse. On builds rendered as their
+# own photos (`calibrate synthetic`, 50 buildings of 21 kinds) the measures told right corrections
+# from wrong ones well; on the 50 real photos, measured one by one from round 3's builds, hardly
+# (losing at most 0.005 they kept 10 of 16 right corrections and 69 of 117 wrong ones; at most
+# 0.05, 14 and 96): a stricter rule would only drop right corrections, the answers' own accuracy
+# decides. A drastic one (a part removed, the build mirrored) must not lose more than STRICT_GAIN
+CHECK_GAIN = -0.05
+STRICT_GAIN = -0.005
+# ... and a part's level the photo's answer and its doors agree on (`facade.levels`: two signals
+# from the photo) unless they find it this much worse: on real photos a silhouette judges levels
+# worst (bushes hide the walls' feet, the ground slopes, the photo's perspective is not the
+# render's; a split-level house's right level measured 0.065 worse), against a camera error
+# alone (right level changes measured no worse in 96% of the buildings above)
+DOORS_GAIN = -0.1
 # kinds whose windows and doors the vision model can box one by one (elsewhere they are too
 # many, or not windows: on a 9-storey pagoda it drew a grid that is not there, in 80 s)
 BOXED_KINDS = ("house", "mansion", "cottage", "townhouse", "shop", "restaurant", "barn", "gas_station", "warehouse",
@@ -105,6 +146,8 @@ def prepare(path: Path, out: Path, vlm, seg) -> dict:
     if read is None:
         read = {"photo": str(path), "mode": "read", **run_read(*vlm, image)}
         (out / f"{stem}.read.json").write_text(json.dumps(read, indent=1, ensure_ascii=False), encoding="utf-8")
+    if "roofs" not in read:
+        add_roofs(read, vlm, image, out / f"{stem}.read.json")
     t = time.time()
     loc = vision.locate(vlm, image)
     ops = {"boxes": [], "complete": False, "text": ""}
@@ -128,6 +171,75 @@ def prepare(path: Path, out: Path, vlm, seg) -> dict:
 
 
 # --- run: the loop ------------------------------------------------------------------------------
+
+def add_roofs(read: dict, vlm, image, path: Path) -> dict:
+    """The roof pass on a reading, saved with it."""
+    t = time.time()
+    read["roofs"] = roof_pass(vlm, image, read)
+    read["seconds_roofs"] = round(time.time() - t, 1)
+    path.write_text(json.dumps(read, indent=1, ensure_ascii=False), encoding="utf-8")
+    return read
+
+
+PITCHED_TOPS = ("triangle", "eave", "both")
+
+
+def form_front(p: dict) -> str | None:
+    """What a form part says tops its front wall, in the roof pass's words."""
+    roof = str(p.get("roof") or "").lower()
+    if roof == "flat":
+        return "flat"
+    if roof == "cross_gable":
+        return "both"
+    if roof in ("gable", "hip", "gambrel", "mansard", "shed"):
+        return "triangle" if p.get("ridge") == "perpendicular" else "eave"
+    return "other" if roof else None
+
+
+def settle_front(vlm, photo, which: str, seen: str | None, form: str | None) -> str | None:
+    """A part's front top where the roof pass and the form disagree on a flat roof against a
+    pitched one: a yes / no question decides (`vision.ROOF_CHECKS`); where its two askings
+    differ, the pass's answer stands. (The same for a gable rising from the eave fixed two of the
+    test photos' main blocks and broke two.)"""
+    from . import vision
+    if (seen in PITCHED_TOPS and form == "flat") or (seen == "flat" and form in PITCHED_TOPS):
+        yes = vision.roof_yes(vlm, photo, which, "slope")
+        if yes is not None:
+            return (seen if seen != "flat" else form) if yes else "flat"
+    return seen
+
+
+def roof_pass(vlm, photo, read: dict) -> list:
+    """Each part's roof as the photo shows it, one concrete question at a time
+    (`vision.ROOF_QUESTIONS`): what tops its front wall, what closes its ends, how steep its
+    slopes are, where a gable rising from its eave stands; a tower's top (`settle_front` where
+    the front top contradicts the form's). Written into the reading's form parts as "roof_seen"
+    (compose takes what `compose.ROOF_TRUST` says it reads better than the form; "front_first":
+    the pass's own answer where the tie-break changed it) and returned, a dict a part."""
+    from . import vision
+    form = read.get("form") if isinstance(read.get("form"), dict) else {}
+    parts = [p for p in form.get("parts") or [] if isinstance(p, dict)]
+    out = []
+    for k, p in enumerate(parts):
+        role = str(p.get("part") or "wing").lower()
+        which = vision.part_words(len(parts), k, role)
+        seen = {}
+        if role == "tower":
+            seen["tower_top"] = vision.roof_question(vlm, photo, which, "tower_top")
+        else:
+            first = vision.roof_question(vlm, photo, which, "front_top")
+            seen["front_top"] = settle_front(vlm, photo, which, first, form_front(p))
+            if seen["front_top"] != first:
+                seen["front_first"] = first
+            if seen["front_top"] in PITCHED_TOPS:
+                seen["ends"] = vision.roof_question(vlm, photo, which, "ends")
+                seen["pitch"] = vision.roof_question(vlm, photo, which, "pitch")
+            if seen["front_top"] == "both":
+                seen["cross_at"] = vision.roof_question(vlm, photo, which, "cross_at")
+        p["roof_seen"] = {key: v for key, v in seen.items() if v}
+        out.append(p["roof_seen"])
+    return out
+
 
 def trusted_measure(out: Path, stem: str, facts: dict | None) -> dict | None:
     """MapAnything's measurement when the building was segmented cleanly, with the frame's
@@ -153,22 +265,54 @@ def camera(facts: dict, measure: dict | None) -> tuple:
     return yaw, max(-25.0, min(50.0, pitch))
 
 
+# the label view's colours (`render.render_codes`): build.LABELS index -> hue slot, None = white;
+# windows, doors, garage doors and skylights each their own
+LABEL_COLOURS = {1: None, 11: None, 2: 1, 12: 1, 3: 6, 4: 0, 5: 5, 6: 3, 7: 4, 8: 7, 9: 2, 10: 2, 13: 2}
+
+
 def evaluate(state: dict, ctx: dict) -> dict:
-    """Compose, build, render and measure a state."""
+    """Compose a state, put the photo's windows, doors and garage doors where the photo has
+    them (`facade.place_openings_3d`, when MapAnything placed them), build, render (the build,
+    what each block is, which part it belongs to) and measure; the conflicts are what the
+    form asked that the build could not do."""
+    from .compose import compose
+    bp = compose(state["form"], state["style"], state["kind"], ctx["measure"], adjust=state["adjust"])
+    return evaluate_bp(bp, ctx, state)
+
+
+def evaluate_bp(bp: dict, ctx: dict, state: dict | None = None, place: bool = True) -> dict:
+    """`evaluate` of a blueprint: with `place` the photo's openings replace its own."""
     from . import score
     from .build import build
-    from .compose import compose
-    from .render import render_rgba
-    bp = compose(state["form"], state["style"], state["kind"], ctx["measure"], adjust=state["adjust"])
+    from .facade import fractions, place_openings_3d
+    from .render import render_codes, render_rgba
+    conflicts = list((bp.get("meta") or {}).get("conflicts") or [])
+    if place and ctx.get("openings3d"):
+        meta = bp.get("meta")
+        bp, notes = place_openings_3d(bp, ctx["openings3d"], ctx.get("side"), ctx.get("garages", True))
+        bp["meta"] = meta
+        conflicts += notes["grown"] + notes["lost"]
     b = build(bp)
     key = hashlib.md5(b["shape"].tobytes() + b["material"].tobytes() + str(b["dims"]).encode()).hexdigest()
-    rgba = render_rgba(b["shape"], b["material"], ctx["yaw"], ctx["pitch"], ctx["size"])
-    lab = render_rgba(b["shape"], b["material"], ctx["yaw"], ctx["pitch"], ctx["size"], labels=True)
-    bf = score.build_facts(rgba, lab[..., :3] if lab is not None else None) if rgba is not None else None
+    cam = (ctx["yaw"], ctx["pitch"], ctx["size"])
+    rgba = render_rgba(b["shape"], b["material"], *cam)
+    bf = None
+    if rgba is not None:
+        lab = render_codes(b["shape"], b["material"], b["labels"], LABEL_COLOURS, *cam)
+        n = min(8, len(b["parts"]))
+        parts = render_codes(b["shape"], b["material"], b["part"], {0: None, **{k: k - 1 for k in range(1, n + 1)}}, *cam)
+        bf = score.build_facts(rgba, lab, parts, n)
     pf = ctx["photo_facts"]
+    if bf is not None and pf is not None and pf.get("openings3d") is not None:
+        bf["openings3d"] = fractions(bp, b, ctx.get("side"))
+    if bf is not None and pf is not None and pf.get("plan"):
+        boxes = [m for m in bp["masses"] if m.get("shape", "box") == "box"] or bp["masses"]
+        wx = max(m["x"] + m["w"] for m in boxes) - min(m["x"] for m in boxes)
+        dz = max(m["z"] + m["d"] for m in boxes) - min(m["z"] for m in boxes)
+        bf["plan"] = dz / max(wx, 1)
     scores = score.compare(pf, bf) if bf is not None and pf is not None else {}
     return {"state": state, "bp": bp, "build": b, "key": key, "rgba": rgba, "scores": scores,
-            "measured": scores["total"][0] if scores else None,
+            "measured": scores["total"][0] if scores else None, "conflicts": conflicts,
             "diag": score.diagnose(pf, bf) if scores else {}}
 
 
@@ -195,8 +339,8 @@ def _kept(hist: list) -> list:
     for h in hist:
         if h.get("reverted") and h["reverted"] in out:
             out.remove(h["reverted"])
-        if h.get("accepted"):
-            out.append(h["accepted"])
+        acc = h.get("accepted")
+        out += acc if isinstance(acc, list) else [acc] if acc else []
     return out
 
 
@@ -224,9 +368,9 @@ def _verify(edit: dict, before: dict, after: dict, gain: float) -> str:
         still = edit.get("name") in {_feature_name(w) for w in (words if isinstance(words, list) else [words])}
     elif op in ("roof", "pitch"):
         want = {"pitch": "steeper" if edit.get("delta", 0) > 0 else "flatter"}.get(op)
-        still = any(isinstance(r, dict) and (str(r.get("pitch")).lower() == want if want else
-                                             (r.get("type_ok") is False and str(r.get("type")).lower() == edit.get("value")))
-                    for r in after.get("roofs") or [])
+        still = any(str(r.get("pitch")).lower() == want if want else
+                    (r.get("type_ok") is False and str(r.get("type")).lower() == edit.get("value"))
+                    for r in _roofs(after))
     elif op in ("style", "kind"):
         still = after.get(f"{op}_ok") is False
     elif op == "mirror":
@@ -234,6 +378,15 @@ def _verify(edit: dict, before: dict, after: dict, gain: float) -> str:
     elif op in ("width", "height", "depth", "storeys"):
         axis = "height" if op == "storeys" else op
         still = str((after.get("proportions") or {}).get(axis, "ok")).lower() != "ok"
+    elif op in ("part_height", "part_depth", "part_level", "part_forward", "garage_doors") or (
+            op == "share" and edit.get("part") is not None):
+        key = {"part_height": "height", "part_depth": "depth", "part_level": "level", "part_forward": "forward",
+               "share": "width", "garage_doors": "garage_doors"}[op]
+        entry = _part_entry(after, edit.get("shown"))
+        if entry is not None:
+            v = entry.get(key)
+            still = (v is not None and int(_num(v, -1)) != int(edit.get("value", -2))) if key == "garage_doors" \
+                else str(v or "ok").lower() != "ok"
     elif op == "windows":
         still = str(after.get("windows") or "ok").lower() != "ok"
     elif op == "colour":
@@ -243,6 +396,32 @@ def _verify(edit: dict, before: dict, after: dict, gain: float) -> str:
     elif op == "garage_wall":
         still = str(after.get("garage") or "ok").lower() == "other_side"
     return "complaint still there" if still else "kept"
+
+
+def _roofs(crit: dict) -> list:
+    """The critique's roof answers, from its "parts" (or an older answer's "roofs"), as
+    {"part", "type_ok", "type", "pitch"}."""
+    out = [r for r in (crit.get("roofs") or []) if isinstance(r, dict)]
+    for p in crit.get("parts") or []:
+        if isinstance(p, dict):
+            out.append({"part": p.get("part"), "type_ok": p.get("roof_ok"), "type": p.get("roof_type"),
+                        "pitch": p.get("pitch")})
+    return out
+
+
+def _num(v, default=0.0) -> float:
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return default
+
+
+def _part_entry(crit: dict, shown) -> dict | None:
+    """The critique's entry for the build's part shown as number `shown`."""
+    for p in crit.get("parts") or []:
+        if isinstance(p, dict) and shown is not None and int(_num(p.get("part"), -1)) == int(shown):
+            return p
+    return None
 
 
 def _contradicts(crit: dict, edit: dict) -> bool:
@@ -256,11 +435,19 @@ def _contradicts(crit: dict, edit: dict) -> bool:
         return edit.get("name") in {_feature_name(w) for w in (words if isinstance(words, list) else [words])}
     if op == "pitch":
         want = "flatter" if edit.get("delta", 0) > 0 else "steeper"
-        return any(isinstance(r, dict) and str(r.get("pitch")).lower() == want for r in crit.get("roofs") or [])
+        return any(str(r.get("pitch")).lower() == want for r in _roofs(crit))
     if op in ("style", "kind"):
         return crit.get(f"{op}_ok") is False
     if op == "mirror":
         return crit.get("mirrored") is True
+    opposite = {"part_height": ("height", "too_tall", "too_low"), "part_depth": ("depth", "too_deep", "too_shallow"),
+                "part_level": ("level", "should_be_higher", "should_be_lower"),
+                "part_forward": ("forward", "should_go_back", "should_come_forward")}
+    if op in opposite:                                 # raised, and now called too tall
+        key, after_up, after_down = opposite[op]
+        entry = _part_entry(crit, edit.get("shown"))
+        up = _num(edit.get("factor", edit.get("delta", 0)), 0) > (1 if "factor" in edit else 0)
+        return entry is not None and str(entry.get(key) or "").lower() == (after_up if up else after_down)
     return False
 
 
@@ -269,13 +456,13 @@ def _scores(res: dict) -> dict:
     return summary(res["scores"]) if res.get("scores") else {}
 
 
-def refine_one(stem: str, out: Path, vlm, rounds: int = 4, log=print) -> dict:
+def context(stem: str, out: Path) -> tuple:
+    """(ctx, photo, read): what `evaluate` measures builds of one prepared photo with: its
+    measures (`score.photo_facts`, and its openings on the building when MapAnything placed
+    them), its measurement, and the camera to render builds from."""
     from PIL import Image
 
-    from . import edits as E
-    from . import score, vision
-    from .spec import BlueprintError
-    t0 = time.time()
+    from . import score
     read = _json(out / f"{stem}.read.json")
     facts = _json(out / f"{stem}.photo.json") or {}
     work = out / "_work" / stem
@@ -289,10 +476,109 @@ def refine_one(stem: str, out: Path, vlm, rounds: int = 4, log=print) -> dict:
         pf = score.photo_facts(np.array(photo), seg, boxes if (facts.get("openings_complete") or len(boxes) >= 3)
                                else None)
     yaw, pitch = camera(facts, measure)
-    ctx = {"measure": measure, "photo_facts": pf, "yaw": yaw, "pitch": pitch, "size": 512}
+    side = ((facts or {}).get("locate") or {}).get("side", "none")
+    openings3d = (measure or {}).get("openings") or None
+    garages = has_garages((read or {}).get("form") or {})
+    if pf is not None and openings3d:
+        from .facade import photo_fractions
+        pf["openings3d"] = photo_fractions(openings3d, garages)
+    if pf is not None and measure and side in ("left", "right") and float(measure.get("corner_view_deg", 0)) >= 15 \
+            and float(measure.get("depth_m", 0)) <= 1.3 * float(measure.get("width_m", 1)):
+        # the photo sees a side wall: MapAnything's depth over width (compose keeps its front then)
+        pf["plan"] = float(measure["depth_m"]) / max(float(measure["width_m"]), 1e-3)
+    ctx = {"measure": measure, "photo_facts": pf, "yaw": yaw, "pitch": pitch, "size": 512,
+           "openings3d": openings3d, "side": side if side in ("left", "right") else None, "garages": garages}
+    return ctx, photo, read
+
+
+def has_garages(form: dict) -> bool:
+    """Whether a reading says the building has garage doors (or big doors), anywhere."""
+    def n(v):
+        try:
+            return int(v or 0)
+        except (TypeError, ValueError):
+            return 0
+    g = form.get("garage") if isinstance(form.get("garage"), dict) else {}
+    parts = [p for p in form.get("parts") or [] if isinstance(p, dict)]
+    return n(g.get("doors")) + n(form.get("big_doors")) + sum(
+        n((p.get("front") or {}).get("garage_doors") if isinstance(p.get("front"), dict) else 0) +
+        n(p.get("side_garage_doors")) for p in parts) > 0
+
+
+def check_round(cur: dict, ctx: dict, vlm, photo, log=print, mode: str = "agree") -> tuple:
+    """(build, log entry): the photo-only check (`vision.check`: each of the build's parts as
+    the photo shows it, asked of the photo alone) against the build, and each correction its
+    answers ask for (`edits.from_check`) kept in turn unless the measures find it CHECK_GAIN
+    worse; a mirror image last (it renumbers the parts). `mode` "agree" (the default) acts only on
+    the answers the form's reading agrees with (`edits.agreed_with_form`): on the 50 test photos,
+    acting on all of them fixed 7 part-level answers and broke 7 (146 of 185 either way), since
+    the model's two readings, where they disagree, are right about as often as wrong; "full" acts
+    on all (for a stronger model, or a person's answers: with right answers the check took round
+    3's builds from 144 to 155)."""
+    from . import edits as E
+    from . import vision
+    from .spec import BlueprintError
+    from .facade import levels
+    descs, numbers = E.check_parts(cur["bp"], cur["state"])
+    chk = vision.check(vlm, photo, descs)
+    door_levels = levels(cur["bp"], ctx["openings3d"]) if ctx.get("openings3d") else {}
+    use = chk if mode == "full" else E.agreed_with_form(chk, cur["state"]["form"], numbers)
+    cands = E.from_check(use, cur["state"], cur["bp"], numbers, door_levels)
+    # per-part corrections first, then removing parts (the highest first: the others keep their
+    # numbers), a mirror image last; after either, the part numbers the rest name have changed
+    cands.sort(key=lambda e: (e["op"] == "mirror", e["op"] == "remove_part",
+                              -int(e.get("part", 0)) if e["op"] == "remove_part" else 0))
+    entry = {"round": "check", "mode": mode, "check": {k: v for k, v in chk.items() if k not in ("text", "text2")},
+             "parts": descs,
+             "door_levels": door_levels, "measured": _scores(cur), "judged": []}
+    todo = list(cands)
+    for _ in range(3):                                 # again after a change: a split level needs its storey first
+        left, changed = [], False
+        for e in todo:
+            new, note = E.apply(cur["state"], e, cur["bp"])
+            if note or new == cur["state"]:
+                entry["judged"].append({"edit": E.label(e), "verdict": note or "already so"})
+                continue
+            try:
+                res = evaluate(new, ctx)
+            except (BlueprintError, ValueError, KeyError, TypeError, IndexError) as ex:
+                entry["judged"].append({"edit": E.label(e), "verdict": f"invalid: {type(ex).__name__}: {ex}"[:200]})
+                continue
+            gain = (res["measured"] - cur["measured"]) if res["measured"] is not None and cur["measured"] is not None                 else 0.0
+            need = DOORS_GAIN if e.get("doors_agree") else STRICT_GAIN if e["op"] in ("remove_part", "mirror") \
+                else CHECK_GAIN
+            if res["key"] != cur["key"] and gain >= need:
+                entry["judged"].append({"edit": E.label(e), "verdict": "kept", "gain": round(gain, 3)})
+                res["edit"] = e
+                cur, changed = res, True
+                log(f"  check: kept {E.label(e)} (measured gain {gain:+.3f})")
+                if e["op"] in ("remove_part", "mirror"):  # the parts are renumbered: no retries by number
+                    left = [(x, g) for x, g in left if x["op"] in ("remove_part", "mirror")]
+            elif res["key"] == cur["key"]:
+                entry["judged"].append({"edit": E.label(e), "verdict": "no change"})
+            else:
+                left.append((e, gain))
+        todo = [e for e, _ in left]
+        if not changed or not todo:
+            break
+    entry["judged"] += [{"edit": E.label(e), "verdict": "measured worse", "gain": round(g, 3)} for e, g in left]
+    entry["accepted"] = [j["edit"] for j in entry["judged"] if j["verdict"] == "kept"]
+    return cur, entry
+
+
+def refine_one(stem: str, out: Path, vlm, rounds: int = 4, log=print, check: str = "agree") -> dict:
+    from . import edits as E
+    from . import vision
+    from .spec import BlueprintError
+    t0 = time.time()
+    ctx, photo, read = context(stem, out)
+    measure, yaw, pitch, pf = ctx["measure"], ctx["yaw"], ctx["pitch"], ctx["photo_facts"]
     cur = evaluate(E.initial(read), ctx)
     first = cur
     hist, gaps, no_effect, limits, invalid = [], [], [], [], []
+    if vlm is not None and check != "off":
+        cur, entry = check_round(cur, ctx, vlm, photo, log, check)
+        hist.append(entry)
     tried = set()
     prev = None                                        # (the build before the last kept correction, that correction)
     scored = []                                        # every build the model rated: (round, build, its corrections)
@@ -305,7 +591,7 @@ def refine_one(stem: str, out: Path, vlm, rounds: int = 4, log=print) -> dict:
             cur["critique"] = (text, numbers, crit)
         cur["resemblance"] = crit.get("resemblance")
         entry = {"round": rnd, "measured": _scores(cur), "resemblance": cur["resemblance"], "combined": combined(cur),
-                 "critique": {k: v for k, v in crit.items() if k != "text"}}
+                 "critique": {k: v for k, v in crit.items() if k != "text"}, "conflicts": cur.get("conflicts") or []}
         scored.append((rnd, cur, _kept(hist)))
         hist.append(entry)
         log(f"  round {rnd}: combined {entry['combined']}, measured {entry['measured'].get('total')}, "
@@ -326,6 +612,7 @@ def refine_one(stem: str, out: Path, vlm, rounds: int = 4, log=print) -> dict:
         cands, g = E.from_critique(crit, cur["state"], numbers)
         gaps += [{"round": rnd, "gap": x} for x in g]
         cands += E.from_measures(cur["diag"], cur["state"], cur["bp"]) if cur["diag"] else []
+        cands += E.from_conflicts(cur.get("conflicts"), cur["state"], cur["bp"])
         evaluated = []
         for e in cands:
             name = E.label(e)
@@ -364,7 +651,10 @@ def refine_one(stem: str, out: Path, vlm, rounds: int = 4, log=print) -> dict:
         accepted = None
         for r in short:
             op, why = r["edit"]["op"], r["edit"].get("why")
-            if op in SHAPE_OPS and why != "vision":
+            if why == "conflict":
+                # what the form asked and the build could not do: kept unless the measures object
+                verdict = "kept" if r["gain"] >= CHECK_GAIN else "measured worse"
+            elif op in SHAPE_OPS and why != "vision":
                 # proportions the measures found are kept on the measures: the next critique and
                 # the best-build rule catch one the model finds worse
                 verdict = "kept" if r["gain"] >= SHAPE_GAIN else "too small a gain"
@@ -375,6 +665,8 @@ def refine_one(stem: str, out: Path, vlm, rounds: int = 4, log=print) -> dict:
                 crit_c = vision.critique(vlm, photo, view(r), text_c)
                 r["critique"] = (text_c, numbers_c, crit_c)
                 verdict = _verify(r["edit"], crit, crit_c, r["gain"])
+                if verdict == "kept" and why == "vision" and op in STRUCTURE_OPS and r["gain"] < STRICT_GAIN:
+                    verdict = "measured worse"             # the critique's own say-so is weak (it describes the render)
             entry.setdefault("judged", []).append({"edit": E.label(r["edit"]), "verdict": verdict,
                                                    "gain": round(r["gain"], 3),
                                                    "resemblance": (r.get("critique") or (0, 0, {}))[2].get("resemblance")})
@@ -405,7 +697,8 @@ def refine_one(stem: str, out: Path, vlm, rounds: int = 4, log=print) -> dict:
            "first": {"measured": _scores(first), "resemblance": first.get("resemblance"), "combined": combined(first)},
            "final": {"measured": _scores(cur), "resemblance": cur.get("resemblance"), "combined": combined(cur),
                      "state": cur["state"], "round": best_round},
-           "kept": kept, "rounds": hist, "gaps": gaps,
+           "kept": kept, "rounds": hist, "gaps": gaps, "conflicts": {"first": first.get("conflicts") or [],
+                                                                     "final": cur.get("conflicts") or []},
            "limits": limits, "no_effect": no_effect, "invalid": invalid, "seconds": round(time.time() - t0, 1)}
     (out / f"{stem}.refine.json").write_text(json.dumps(rec, indent=1, default=str), encoding="utf-8")
     return rec
@@ -469,11 +762,14 @@ def summary(out: Path) -> dict:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("stage", choices=("prepare", "run", "judge", "summary"))
+    ap.add_argument("stage", choices=("prepare", "roofs", "run", "judge", "summary"))
     ap.add_argument("photos", nargs="*", type=Path, help="photos, or folders of <id>/photo.jpg")
     ap.add_argument("--out", type=Path, required=True)
     ap.add_argument("--rounds", type=int, default=4)
     ap.add_argument("--redo", action="store_true", help="run photos that already have a result again")
+    ap.add_argument("--model", default=None, help="the vision model (describe.load_model; default its MODEL)")
+    ap.add_argument("--check", default="agree", choices=("agree", "full", "off"),
+                    help="the photo-only check: act on the answers the form agrees with, on all, or skip it")
     args = ap.parse_args(argv)
     if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace", line_buffering=True)
@@ -483,29 +779,38 @@ def main(argv=None) -> int:
         print(json.dumps(summary(out), indent=1))
         return 0
     photos = photos_of(args.photos)
-    suffix = {"prepare": "photo", "run": "refine", "judge": "judge"}[args.stage]
-    todo = [p for p in photos if args.redo or not (out / f"{stem_of(p)}.{suffix}.json").is_file()]
+    suffix = {"prepare": "photo", "run": "refine", "judge": "judge", "roofs": "read"}[args.stage]
+    if args.stage == "roofs":                          # readings that have no roof pass yet
+        todo = [p for p in photos if (out / f"{stem_of(p)}.read.json").is_file() and (
+            args.redo or "roofs" not in (_json(out / f"{stem_of(p)}.read.json") or {}))]
+    else:
+        todo = [p for p in photos if args.redo or not (out / f"{stem_of(p)}.{suffix}.json").is_file()]
     if not todo:
         return 0
-    from .describe import load_model
+    from .describe import MODEL, SERVER_MODELS, load_model
+    args.model = args.model or MODEL
     t = time.time()
-    vlm = load_model()
+    vlm = load_model(args.model)
     seg = None
     if args.stage == "prepare":
         from . import segment
-        seg = segment.load()
+        seg = segment.load("cpu" if args.model in SERVER_MODELS else "cuda")
     print(f"models loaded in {time.time() - t:.0f} s", flush=True)
     for p in todo:
         stem = stem_of(p)
         t = time.time()
         try:
-            if args.stage == "prepare":
+            if args.stage == "roofs":
+                from .describe import photo as load_photo
+                r = add_roofs(_json(out / f"{stem}.read.json"), vlm, load_photo(p), out / f"{stem}.read.json")
+                print(f"{stem}: {r['seconds_roofs']} s, {r['roofs']}", flush=True)
+            elif args.stage == "prepare":
                 f = prepare(p, out, vlm, seg)
                 print(f"{stem}: {time.time() - t:.0f} s, building {f['share']:.0%} of the photo, side {f['locate']['side']}, "
                       f"{len(f['openings'])} openings", flush=True)
             elif args.stage == "run":
                 print(f"{stem}:", flush=True)
-                r = refine_one(stem, out, vlm, args.rounds)
+                r = refine_one(stem, out, vlm, args.rounds, check=args.check)
                 print(f"{stem}: {r['first']['combined']} -> {r['final']['combined']} in {r['seconds']} s, "
                       f"kept {r['kept']}", flush=True)
             else:
