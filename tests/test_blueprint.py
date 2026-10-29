@@ -43,13 +43,14 @@ class Spec(unittest.TestCase):
 
     def test_every_problem_is_reported(self):
         bp = house(type="onion")
-        bp["materials"] = {"roof": "glass", "colour": "red"}
+        bp["materials"] = {"roof": "white_concrete", "colour": "red"}          # concrete has no slabs (glass may)
         bp["openings"] = [{"mass": "main", "side": "south", "kind": "window", "u": 7, "y": 1, "w": 4, "h": 2},
                           {"mass": "nope", "side": "south", "kind": "door", "u": 0, "y": 1}]
         with self.assertRaises(BlueprintError) as e:
             load(bp)
         msg = str(e.exception)
-        for part in ("roof.type", "'glass' has no", "materials.colour", "off the 9-block wall", "no mass 'nope'"):
+        for part in ("roof.type", "'white_concrete' has no", "materials.colour", "off the 9-block wall",
+                     "no mass 'nope'"):
             self.assertIn(part, msg)
 
 
@@ -170,7 +171,13 @@ class Describe(unittest.TestCase):
         from blueprint.describe import parse_json
         self.assertEqual(parse_json('Sure:\n```json\n{"storeys": 2, "dome": false}\n```'), {"storeys": 2, "dome": False})
         self.assertIsNone(parse_json("no json here"))
-        self.assertIsNone(parse_json('{"storeys": 2,'))
+        self.assertIsNone(parse_json('{"stor'))                                  # nothing complete in it
+        # what a model gets wrong: a cut-off end keeps its complete items, trailing commas go, and
+        # keys after a root object closed too early are still its own
+        self.assertEqual(parse_json('{"storeys": 2,'), {"storeys": 2})
+        self.assertEqual(parse_json('{"a": [1, 2,],}'), {"a": [1, 2]})
+        self.assertEqual(parse_json('{"parts": [{"part": "main"}]}, "porch": "front"}'),
+                         {"parts": [{"part": "main"}], "porch": "front"})
 
     def test_check_names_the_problem_or_none(self):
         from blueprint.describe import check
@@ -307,6 +314,42 @@ class Compose(unittest.TestCase):
         self.assertEqual((style_of("Georgian"), style_of("queen-anne"), style_of("??")), ("colonial", "victorian", "other"))
         self.check({}, None, None)
         self.check({"parts": "lots", "towers": [1], "dome": "yes"}, "baroque", "palace")
+
+    def test_narrow_parts_keep_their_shop_windows_off_the_door(self):
+        # a shopping mall measured a few metres wide (its cut-out only the entrance): parts 3 to 6 blocks
+        # wide, each with a door and a wide window; this blueprint failed to load
+        part = {"storeys": 1, "roof": "flat", "windows_across": 4, "window_style": "ribbon",
+                "front": {"door": True, "ground_windows": 4, "wide_window": True}}
+        form = {"parts": [{**part, "part": "wing", "share": 30, "width_m": 15},
+                          {**part, "part": "tower", "share": 25, "width_m": 12, "storeys": 2, "forward_m": 3},
+                          {**part, "part": "wing", "share": 45, "width_m": 22}]}
+        bp, _ = self.check(form, "modern", "shop", {"width_m": 2.7, "depth_m": 6.2, "height_m": 4.4, "mask_aspect": 1.02})
+        for m in bp["masses"]:
+            doors = [o for o in bp["openings"] if o["mass"] == m["id"] and o["side"] == "south" and o["kind"] == "door"]
+            wins = [o for o in bp["openings"] if o["mass"] == m["id"] and o["side"] == "south" and o["kind"] == "window"
+                    and o["y"] < 4]
+            for d in doors:
+                for o in wins:
+                    self.assertFalse(o["u"] < d["u"] + d["w"] and d["u"] < o["u"] + o["w"], (m["id"], d, o))
+
+    def test_a_part_made_lower_keeps_only_the_floors_under_its_top(self):
+        from blueprint.compose import compose
+        form = {"parts": [{"part": "main", "storeys": 4, "roof": "flat"}]}
+        bp = compose(form, "brutalist", "parking", adjust={"parts": {"0": {"height": 0.6}}})
+        m = bp["masses"][0]
+        self.assertTrue(m["floors"] and all(f < m["walls"] - 2 for f in m["floors"]), (m["floors"], m["walls"]))
+        load(bp)
+
+    def test_openings_that_do_not_fit_are_dropped_and_noted(self):
+        from blueprint.compose import _fit_openings
+        masses = [{"id": "a", "w": 3, "d": 5, "walls": 4}]
+        conflicts = []
+        kept = _fit_openings([{"mass": "a", "side": "south", "kind": "window", "u": 1, "y": 1, "w": 3, "h": 2},
+                              {"mass": "a", "side": "east", "kind": "window", "u": 1, "y": 1, "w": 3, "h": 2},
+                              {"mass": "a", "side": "east", "kind": "window", "u": 1, "y": 2, "w": 1, "h": 3}],
+                             masses, conflicts)
+        self.assertEqual([(o["side"], o["w"]) for o in kept], [("east", 3)])
+        self.assertEqual(len(conflicts), 2)
 
     def test_style_palettes_are_real_blocks(self):
         from blueprint.spec import material_index
@@ -539,11 +582,12 @@ class Edits(unittest.TestCase):
         edits, gaps = from_critique(crit, self.state(), {1: 1, 2: 0})          # shown mirrored
         names = {(e["op"], e.get("part"), e.get("value"), e.get("name")) for e in edits}
         for want in (("style", None, "tudor", None), ("width", None, None, None), ("roof", 1, "gambrel", None),
-                     ("feature", None, None, "towers"), ("feature", None, None, "balconies"),
+                     ("roof", 1, "onion_dome", None), ("feature", None, None, "towers"),
+                     ("feature", None, None, "clock"), ("feature", None, None, "balconies"),
                      ("mirror", None, None, None), ("windows", None, None, None), ("colour", None, "pale yellow", None)):
             self.assertIn(want, names)
         self.assertFalse([e for e in edits if e["op"] == "pitch"])    # a roof's pitch is the roof pass's
-        self.assertEqual(len(gaps), 3)                     # the onion dome, the clock face, the curved roof
+        self.assertEqual(gaps, ["the roof should curve"])  # the onion dome and the clock face are built now
         self.assertTrue(all(e["why"] == "vision" for e in edits))
 
 
@@ -967,3 +1011,368 @@ class Example(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def at(b, x, y, z):
+    """(shape, material) at blueprint coordinates, air outside the grid."""
+    ox, oy, oz = b["origin"]
+    i, j, k = x - ox, y - oy, z - oz
+    if not (0 <= i < b["shape"].shape[0] and 0 <= j < b["shape"].shape[1] and 0 <= k < b["shape"].shape[2]):
+        return "air", None
+    return cell(b, x, y, z)
+
+
+def column(b, x, z):
+    """The rows of (x, z) that hold a block."""
+    ox, oy, oz = b["origin"]
+    if not (0 <= x - ox < b["shape"].shape[0] and 0 <= z - oz < b["shape"].shape[2]):
+        return []
+    return [oy + j for j in np.nonzero(b["shape"][x - ox, :, z - oz])[0]]
+
+
+class Structures(unittest.TestCase):
+    """The builder's newer parts: barrel and butterfly roofs, clipped gables, a cut-flat top with a
+    rail, onion domes, open masses, decks, verandas, steps, clocks, turrets, tanks, fire escapes,
+    round windows."""
+
+    def mass(self, **kw):
+        m = {"id": "m", "x": 0, "z": 0, "w": 11, "d": 9, "walls": 6, "storey_h": 5, "corner_trim": False,
+             "roof": {"type": "flat"}}
+        m.update(kw)
+        return m
+
+    def test_a_barrel_roof_arcs_and_its_ends_follow_it(self):
+        b = build({"masses": [self.mass(roof={"type": "barrel", "pitch": 1.0, "overhang": 0})]})
+        tops = [max(column(b, 5, z)) for z in range(0, 9)]
+        self.assertEqual(tops, tops[::-1])                       # symmetric across the span
+        self.assertGreater(tops[4], tops[0] + 2)                 # higher in the middle
+        self.assertEqual(max(column(b, 0, 4)), tops[4])          # the end wall rises to the arc
+
+    def test_a_butterfly_roof_falls_to_a_valley(self):
+        b = build({"masses": [self.mass(roof={"type": "butterfly", "pitch": 0.5})]})
+        self.assertGreater(max(column(b, 5, 0)), max(column(b, 5, 4)))
+
+    def test_a_clipped_gable_cuts_its_peak_back(self):
+        plain = build({"masses": [self.mass(roof={"type": "gable", "ridge": "x", "pitch": 1.0})]})
+        clipped = build({"masses": [self.mass(roof={"type": "gable", "ridge": "x", "pitch": 1.0, "clip": 2})]})
+        self.assertLess(max(column(clipped, 0, 4)), max(column(plain, 0, 4)))     # the end wall's peak
+        self.assertEqual(max(column(clipped, 5, 4)), max(column(plain, 5, 4)))    # the ridge itself
+
+    def test_a_cut_hip_carries_a_railing(self):
+        b = build({"masses": [self.mass(w=11, d=11, roof={"type": "hip", "pitch": 1.0, "deck": 2, "rail": True})]})
+        fences = [p for p in zip(*np.nonzero(b["shape"] == V.SHAPE_INDEX["fence"]))]
+        self.assertTrue(fences)
+
+    def test_an_onion_dome_bulges_past_its_neck(self):
+        b = build({"masses": [self.mass(w=9, d=9, walls=4, roof={"type": "dome", "profile": "onion"})]})
+        widths = {}
+        for (x, y, z) in zip(*np.nonzero(b["shape"])):
+            yy = y + b["origin"][1]
+            if yy > 4:
+                widths.setdefault(yy, set()).add(x + b["origin"][0])
+        spans = [max(v) - min(v) for _, v in sorted(widths.items())]
+        self.assertGreater(max(spans), spans[0])                 # wider above its foot
+        self.assertGreater(len(spans), 9)                        # and taller than it is wide
+
+    def test_an_open_mass_stands_on_posts(self):
+        b = build({"masses": [self.mass(open=True, bay=5, rail=True)]})
+        self.assertEqual(at(b, 0, 2, 8)[0], "full")              # a corner post
+        self.assertEqual(at(b, 2, 3, 8)[0], "air")               # open between the posts
+        self.assertEqual(at(b, 2, 1, 8)[0], "fence")             # the rail at its foot
+        self.assertEqual(at(b, 2, 5, 8)[0], "full")              # the beam round its top
+
+    def test_a_deck_stands_on_posts_down_to_the_ground(self):
+        bp = {"masses": [self.mass(y=3)], "site": {"ground": [{"x0": -5, "x1": 20, "z0": -5, "z1": 20, "top": 0}]},
+              "features": [{"kind": "deck", "mass": "m", "side": "south", "u": 2, "w": 7, "depth": 3, "y": 0}]}
+        b = build(bp)
+        self.assertEqual(at(b, 2, 3, 11)[0], "full")             # the deck, level with the floor
+        self.assertEqual(at(b, 2, 1, 11)[0], "fence")            # a post under its edge
+        self.assertEqual(at(b, 5, 4, 11)[0], "fence")            # the railing on it
+
+    def test_a_veranda_has_a_floor_and_a_railing_on_each_level(self):
+        b = build({"masses": [self.mass(walls=11)],
+                   "features": [{"kind": "veranda", "mass": "m", "side": "south", "u": 0, "w": 11, "depth": 2,
+                                 "levels": 2}]})
+        self.assertEqual(at(b, 1, 5, 10)[0], "full")             # the upper floor
+        self.assertEqual(at(b, 1, 6, 10)[0], "fence")            # its railing
+
+    def test_steps_climb_to_a_raised_door(self):
+        b = build({"masses": [self.mass(walls=10)],
+                   "openings": [{"mass": "m", "side": "south", "kind": "door", "u": 5, "y": 3, "w": 1}],
+                   "features": [{"kind": "steps", "mass": "m", "side": "south", "u": 5, "w": 1, "top": 2,
+                                 "rise": 3}]})
+        self.assertEqual([at(b, 5, 2 - i, 9 + i)[0] for i in range(3)], ["stairs_north"] * 3)
+
+    def test_a_clock_face_and_its_hands(self):
+        b = build({"masses": [self.mass(w=7, d=7, walls=16)],
+                   "features": [{"kind": "clock", "mass": "m", "side": "south", "r": 2}]})
+        mats = {at(b, x, y, 6)[1] for x in range(0, 7) for y in range(8, 15)}
+        self.assertTrue({"smooth_quartz", "black_concrete"} <= mats)
+
+    def test_a_corner_turret_stands_out_from_the_corner_under_a_cone(self):
+        b = build({"masses": [self.mass(walls=10)],
+                   "features": [{"kind": "turret", "mass": "m", "corner": "front_right", "r": 2, "start": 4,
+                                 "top": 3}]})
+        self.assertNotEqual(at(b, 12, 6, 8)[0], "air")           # its wall, outside the mass's corner
+        self.assertEqual(at(b, 12, 2, 8)[0], "air")              # nothing under it: corbelled out
+        self.assertGreater(max(column(b, 10, 8)), 13)            # its cone over the eave
+
+    def test_a_water_tank_on_legs(self):
+        b = build({"masses": [self.mass(x=20)], "features": [{"kind": "tank", "x": 4, "z": 4, "r": 3, "h": 4, "y": 8}]})
+        self.assertEqual(at(b, 6, 3, 4)[0], "wall")              # a leg
+        self.assertNotEqual(at(b, 1, 10, 4)[0], "air")           # the drum
+
+    def test_a_fire_escape_has_a_landing_on_each_upper_floor(self):
+        b = build({"masses": [self.mass(walls=14, storey_h=4)],
+                   "features": [{"kind": "fire_escape", "mass": "m", "side": "south", "u": 2, "w": 4}]})
+        self.assertEqual([at(b, 3, fl, 10)[0] for fl in (4, 8)], ["slab_top"] * 2)     # the floors over the ground's
+
+    def test_a_jettied_storey_stands_out_and_its_windows_follow(self):
+        b = build({"masses": [self.mass(walls=10, jetty=1, jetty_sides=["south"],
+                                        roof={"type": "gable", "ridge": "x", "pitch": 1.0})],
+                   "openings": [{"mass": "m", "side": "south", "kind": "window", "u": 3, "y": 1, "w": 2, "h": 2},
+                                {"mass": "m", "side": "south", "kind": "window", "u": 3, "y": 6, "w": 2, "h": 2}]})
+        self.assertEqual(at(b, 1, 2, 8)[1], "birch_planks")      # the ground storey's front wall
+        self.assertEqual(at(b, 1, 7, 9)[1], "birch_planks")      # the one over it, a block out
+        self.assertEqual(at(b, 1, 7, 8)[0], "air")               # inside it
+        self.assertEqual((at(b, 3, 2, 8)[1], at(b, 3, 7, 9)[1]), ("glass", "glass"))   # each window in its wall
+        self.assertEqual(at(b, 5, 5, 9)[1], "spruce_planks")     # the beam under the overhang
+        self.assertEqual(max(column(b, 5, 10)), 9)               # the eave a block out from the jettied top
+
+    def test_a_round_window_rises_into_the_gable(self):
+        b = build({"masses": [self.mass(walls=6, roof={"type": "gable", "ridge": "z", "pitch": 1.0})],
+                   "openings": [{"mass": "m", "side": "south", "kind": "round", "u": 3, "y": 5, "w": 5, "h": 5}]})
+        self.assertEqual(at(b, 5, 7, 8)[1], "glass")             # glass above the walls' top row
+
+
+class ComposeStructures(unittest.TestCase):
+    """What the form's newer fields make: open sides, decks, verandas, steps, clocks, turrets, roof
+    decks, rose windows, tanks, eaves, and the new roof words."""
+
+    def compose(self, form, style="suburban", kind="house"):
+        from blueprint.compose import compose
+        bp = compose(form, style, kind)
+        load(bp)
+        b = build(bp)
+        self.assertEqual(b["warnings"], [])
+        return bp
+
+    def form(self, **flags):
+        f = {"parts": [{"part": "main", "width_m": 14, "depth_m": 9, "storeys": 2, "eave_m": 6, "roof": "hip",
+                        "ridge": "parallel", "pitch_deg": 30, "front": {"door": True}}]}
+        f.update(flags)
+        return f
+
+    def kinds(self, bp):
+        return [f["kind"] for f in bp["features"]]
+
+    def test_eaves(self):
+        self.assertEqual(self.compose(self.form(eaves="deep"))["masses"][0]["roof"]["overhang"], 2)
+        self.assertEqual(self.compose(self.form(eaves="flush"))["masses"][0]["roof"]["overhang"], 0)
+
+    def test_open_sides_and_car_parks_stand_on_posts_without_windows(self):
+        bp = self.compose(self.form(open_sides=True), "modern", "pavilion")
+        self.assertTrue(bp["masses"][0]["open"])
+        self.assertFalse([o for o in bp["openings"] if o["mass"] == bp["masses"][0]["id"]])
+        bp = self.compose({"parts": [{"part": "main", "storeys": 4, "roof": "flat"}]}, "modern", "parking")
+        self.assertTrue(bp["masses"][0]["open"] and bp["masses"][0]["rail"])
+
+    def test_a_deck_and_a_veranda(self):
+        self.assertIn("deck", self.kinds(self.compose(self.form(deck="side"))))
+        bp = self.compose(self.form(porch="front", veranda={"levels": 2}))
+        self.assertIn("veranda", self.kinds(bp))
+        self.assertNotIn("porch", self.kinds(bp))                # the veranda replaces the porch
+
+    def test_steps_raise_the_door_over_them(self):
+        plain = self.compose(self.form())
+        bp = self.compose(self.form(steps="stoop"))
+        door = lambda b: next(o for o in b["openings"] if o["kind"] == "door")      # noqa: E731
+        st = next(f for f in bp["features"] if f["kind"] == "steps")
+        self.assertGreater(door(bp)["y"], door(plain)["y"])
+        self.assertEqual(st["top"], door(bp)["y"] - 1)
+
+    def test_a_clock_goes_on_the_tower(self):
+        form = {"parts": [{"part": "main", "storeys": 2, "roof": "gable"}, {"part": "tower", "storeys": 5,
+                                                                          "roof": "pyramid"}], "clock": True}
+        bp = self.compose(form, "gothic", "church")
+        self.assertEqual(next(f for f in bp["features"] if f["kind"] == "clock")["mass"], bp["masses"][1]["id"])
+
+    def test_corner_turrets_a_roof_deck_a_rose_window(self):
+        bp = self.compose(self.form(corner_turrets=2, roof_deck=True, rose_window=True), "medieval", "castle")
+        self.assertEqual(self.kinds(bp).count("turret"), 2)
+        self.assertTrue(bp["masses"][0]["roof"].get("deck") or bp["masses"][0]["roof"].get("rail"))
+        self.assertTrue(any(o["kind"] == "round" for o in bp["openings"]))
+
+    def test_a_jetty(self):
+        self.assertEqual(self.compose(self.form(jetty=True), "tudor")["masses"][0]["jetty"], 1)
+
+    def test_a_marquee_over_the_door_and_a_glasshouse(self):
+        bp = self.compose(self.form(marquee=True), "art_deco", "theatre")
+        mq = next(f for f in bp["features"] if f["kind"] == "marquee")
+        door = next(o for o in bp["openings"] if o["kind"] == "door")
+        self.assertTrue(mq["u"] <= door["u"] < mq["u"] + mq["w"] and mq["y"] > door["y"])
+        bp = self.compose(self.form(), "victorian", "greenhouse")
+        self.assertEqual(bp["masses"][0]["materials"]["roof"], "glass")
+        self.assertIn("curtain", bp["masses"][0]["decor"])
+
+    def test_windows_either_side_of_a_middle_door(self):
+        f = self.form(symmetric=True)
+        f["parts"][0]["front"] = {"door": True, "ground_windows": 4}
+        bp = self.compose(f)
+        door = next(o for o in bp["openings"] if o["kind"] == "door")
+        ground = [o for o in bp["openings"] if o["kind"] == "window" and o["side"] == "south" and o["y"] < door["y"] + 2]
+        self.assertEqual(sum(o["u"] < door["u"] for o in ground), sum(o["u"] > door["u"] for o in ground))
+        self.assertEqual(len(ground), 4)
+
+    def test_without_a_main_part_the_biggest_takes_the_entrance(self):
+        form = {"parts": [{"part": "wing", "width_m": 10, "storeys": 2, "roof": "flat", "front": {"door": False}},
+                          {"part": "tower", "width_m": 6, "storeys": 5, "roof": "pyramid"},
+                          {"part": "wing", "width_m": 16, "storeys": 2, "roof": "flat", "front": {"door": True}}],
+                "portico": {"columns": 4, "pediment": True}, "steps": "wide"}
+        bp = self.compose(form, "beaux_arts", "government")
+        on = {f["kind"]: f["mass"] for f in bp["features"]}
+        self.assertEqual((on["portico"], on["steps"]), ("p2", "p2"))
+
+    def test_a_tower_in_the_middle_clears_the_ridge(self):
+        form = {"parts": [{"part": "main", "width_m": 18, "depth_m": 12, "storeys": 2, "roof": "gable",
+                           "ridge": "perpendicular", "pitch_deg": 45}],
+                "towers": {"count": 1, "where": "centre", "roof": "pyramid"}, "clock": True}
+        bp = self.compose(form, "victorian", "school")
+        main, tower = bp["masses"][0], bp["masses"][1]
+        ridge = main["walls"] + round((main["w"] / 2 + 1) * main["roof"]["pitch"])
+        self.assertGreater(tower["walls"], ridge)
+
+    def test_a_low_round_roof_keeps_its_slope_and_a_car_parks_tower_its_walls(self):
+        form = {"parts": [{"part": "main", "storeys": 2, "roof": "gable"},
+                          {"part": "wing", "storeys": 1, "shape": "round", "roof": "cone", "pitch_deg": 20}]}
+        self.assertTrue(self.compose(form, "romanesque", "church")["masses"][1]["roof"]["keep_pitch"])
+        form = {"parts": [{"part": "main", "storeys": 4, "roof": "flat"}, {"part": "tower", "storeys": 6, "roof": "flat"}]}
+        bp = self.compose(form, "modern", "parking")
+        self.assertEqual([bool(m.get("open")) for m in bp["masses"][:2]], [True, False])
+
+    def test_earth_coloured_stucco_and_adobe_beams(self):
+        f = self.form(wall={"material": "stucco", "colour": "tan"})
+        f["parts"][0]["roof"] = "flat"
+        bp = self.compose(f, "adobe")
+        self.assertEqual(bp["materials"]["wall"], "white_terracotta")
+        self.assertIn("vigas", bp["masses"][0]["decor"])
+
+    def test_a_bell_gable_deep_flat_eaves_and_a_portico_over_a_porch(self):
+        f = self.form(bell_gable=True)
+        f["parts"][0].update(roof="gable", ridge="perpendicular")
+        self.assertIn("bell_gable", self.kinds(self.compose(f, "mediterranean", "church")))
+        f = self.form(eaves="deep")
+        f["parts"][0]["roof"] = "flat"
+        self.assertEqual(self.compose(f, "modern")["masses"][0]["roof"]["overhang"], 2)
+        bp = self.compose(self.form(porch="front", portico={"columns": 6, "pediment": True}, veranda={"levels": 2}),
+                          "neoclassical", "mansion")
+        self.assertEqual([k for k in self.kinds(bp) if k in ("porch", "portico", "veranda")], ["portico"])
+
+    def test_tiers_for_any_kind_and_a_japanese_castles_stacked_roofs(self):
+        f = self.form(tiers=[1, 2, 3, 4])
+        f["parts"][0].update(storeys=8, roof="flat")
+        self.assertGreaterEqual(sum(1 for m in self.compose(f, "other", "mosque_temple")["masses"]
+                                    if str(m["id"]).startswith("tier")), 2)
+        f = self.form()
+        f["parts"][0].update(storeys=5, roof="pagoda")
+        self.assertGreater(len(self.compose(f, "japanese", "castle")["masses"]), 3)
+        # read with a hip-and-gable roof and a tower in the middle (its top tier): stacked, no tower
+        f = self.form(towers={"count": 1, "shape": "square", "roof": "spire", "where": "centre"})
+        f["parts"][0].update(storeys=5, roof="hip_and_gable")
+        bp = self.compose(f, "japanese", "castle")
+        self.assertGreater(len(bp["masses"]), 3)
+        self.assertFalse([m for m in bp["masses"] if str(m["id"]).startswith("tower")])
+
+    def test_a_belvedere_read_as_a_tower_and_a_cupola_is_the_cupola(self):
+        f = self.form(cupola=True, towers={"count": 1, "shape": "octagonal", "roof": "spire", "where": "centre"})
+        bp = self.compose(f, "victorian", "mansion")
+        self.assertFalse([m for m in bp["masses"] if str(m["id"]).startswith("tower")])
+        self.assertTrue(any(x["kind"] == "lantern" for x in bp["features"]))
+        bp = self.compose(f, "victorian", "government")                 # a town hall keeps its tower
+        self.assertTrue([m for m in bp["masses"] if str(m["id"]).startswith("tower")])
+
+    def test_a_bandstands_dome_is_its_low_roof(self):
+        # its ring of columns read as a portico too, its dome as a capitol's ("large, on a drum")
+        f = {"parts": [{"part": "main", "shape": "round", "width_m": 12, "storeys": 1, "roof": "dome"}],
+             "open_sides": True, "dome": {"size": "large", "drum": True}, "portico": {"columns": 12}}
+        bp = self.compose(f, "neoclassical", "pavilion")
+        d = next(x for x in bp["features"] if x["kind"] == "dome")
+        m = bp["masses"][0]
+        self.assertEqual((d["r"], d["drum"], d["squash"]), (min(m["w"], m["d"]) // 2, 0, 0.5))
+        self.assertNotIn("portico", self.kinds(bp))
+
+    def test_a_barrel_roofs_curved_end_faces_the_camera(self):
+        f = self.form()
+        f["parts"][0].update(roof="barrel", ridge="parallel", roof_seen={"front_top": "other"})
+        self.assertEqual(self.compose(f, "industrial", "warehouse")["masses"][0]["roof"]["ridge"], "z")
+        f["parts"][0]["roof_seen"] = {"front_top": "eave"}
+        self.assertEqual(self.compose(f, "industrial", "warehouse")["masses"][0]["roof"]["ridge"], "x")
+
+    def test_arches_in_plaster_have_no_frame(self):
+        f = self.form(arcade=True, wall={"material": "stucco", "colour": "white"})
+        bp = self.compose(f, "mediterranean")
+        arches = [o for o in bp["openings"] if o["kind"] == "arch"]
+        self.assertTrue(arches and all(o["frame"] is False for o in arches))
+        b = build(bp)
+        a, m = arches[0], bp["masses"][0]
+        z = m["z"] + m["d"] - 1                                           # the south wall
+        self.assertEqual(at(b, m["x"] + a["u"], m["y"] + a["y"] + a["h"] - 1, z)[1], bp["materials"]["wall"])
+        f["wall"] = {"material": "stone", "colour": "beige"}
+        self.assertTrue(all(o.get("frame", True) for o in self.compose(f, "romanesque")["openings"]
+                            if o["kind"] == "arch"))
+
+    def test_pink_walls_and_coloured_trim(self):
+        from blueprint.compose import palette
+        mats = palette({"wall": {"material": "stucco", "colour": "pink"}, "trim_colour": "blue"}, "mediterranean")
+        self.assertEqual((mats["wall"], mats["trim"]), ("white_terracotta", "warped_planks"))
+        self.assertEqual(mats["shutter"], "warped_planks")                    # blue shutters
+        mats = palette({"wall": {"material": "wood_siding", "colour": "pink"}, "trim_colour": "gold"}, "victorian")
+        self.assertEqual((mats["wall"], mats["trim"]), ("cherry_planks", "yellow_terracotta"))
+
+    def test_upper_windows_narrow_to_fit_the_count(self):
+        f = self.form()
+        f["parts"][0].update(width_m=5, windows_across=3)
+        bp = self.compose(f)
+        self.assertFalse([c for c in bp["meta"]["conflicts"] if "windows across" in c])
+
+    def test_a_cupola_stands_on_the_roof(self):
+        f = self.form(cupola=True)
+        bp = self.compose(f, "victorian", "mansion")
+        lan = next(x for x in bp["features"] if x["kind"] == "lantern")
+        self.assertTrue(lan["on_roof"] and lan["w"] in (3, 5))
+        b = build(bp)
+        m = bp["masses"][0]
+        cx, cz = m["x"] + m["w"] // 2, m["z"] + m["d"] // 2
+        self.assertGreater(max(column(b, cx, cz)), m["walls"] + 3)       # above the hip's peak
+
+    def test_a_water_tower(self):
+        bp = self.compose({"parts": [{"part": "main", "storeys": 6, "roof": "flat"}], "tank": True}, "industrial",
+                          "tower")
+        self.assertTrue(bp["masses"][0]["open"])
+        self.assertIn("tank", self.kinds(bp))
+        # a brick shaft carries its tank; the crown and cupola asked on it would stand inside the tank
+        bp = self.compose({"parts": [{"part": "tower", "shape": "round", "storeys": 3, "roof": "cone",
+                                      "roof_seen": {"tower_top": "lantern"}}],
+                           "tank": True, "crown": "spire", "cupola": True, "wall": {"material": "brick", "colour": "red"}},
+                          "victorian", "tower")
+        self.assertFalse(bp["masses"][0].get("open"))
+        self.assertEqual([m["id"] for m in bp["masses"]], ["p0"])
+        self.assertEqual(self.kinds(bp), ["tank"])
+
+    def test_the_new_roof_words(self):
+        for word, want in (("barrel", ("barrel", "round", 0)), ("clipped_gable", ("gable", "round", 2)),
+                           ("butterfly", ("butterfly", "round", 0))):
+            f = self.form()
+            f["parts"][0]["roof"] = word
+            r = self.compose(f)["masses"][0]["roof"]
+            self.assertEqual((r["type"], r.get("profile", "round"), r.get("clip", 0)), want, word)
+        f = self.form()
+        f["parts"][0]["roof"] = "onion_dome"                     # a main block's dome is a dome on a flat roof
+        bp = self.compose(f, "baroque", "church")
+        self.assertEqual([d.get("profile") for d in bp["features"] if d["kind"] == "dome"], ["onion"])
+
+    def test_an_onion_tower_top(self):
+        form = {"parts": [{"part": "main", "storeys": 2, "roof": "gable"},
+                          {"part": "tower", "storeys": 5, "roof": "flat", "roof_seen": {"tower_top": "onion"}}]}
+        r = self.compose(form, "baroque", "church")["masses"][1]["roof"]
+        self.assertEqual((r["type"], r["profile"]), ("dome", "onion"))

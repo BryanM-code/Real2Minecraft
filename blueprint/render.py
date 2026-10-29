@@ -40,11 +40,31 @@ def render_rgba(shape: np.ndarray, material: np.ndarray, yaw: float, pitch: floa
     from photofirst.schem import palette_grid
     grid, names = palette_grid(shape, material)
     blocks = np.ascontiguousarray(np.transpose(grid, (2, 0, 1)))
+    im = _render(blocks, names, yaw=yaw, pitch=pitch, size=size)
+    return None if im is None else np.array(im.convert("RGBA"))
+
+
+def _render(blocks: np.ndarray, names: list, **kw):
+    """BuildDataCollector's render of an (X, Y, Z) palette grid, in the game's colours: its own
+    table tints the dyed families from the dye (white terracotta comes out grey, plain terracotta
+    its fallback grey, light blue terracotta bright blue where the game's is a greyish violet),
+    so the blocks `mcvoxel`'s palette has (its textures' averages) take that palette's colour."""
     if str(BDC) not in sys.path:
         sys.path.insert(0, str(BDC))
+    import block_colors
     from schemset.review import render
-    im = render(blocks, names, yaw=yaw, pitch=pitch, size=size)
-    return None if im is None else np.array(im.convert("RGBA"))
+
+    from mcvoxel.block_palette import BLOCK_PALETTE
+    original = block_colors.color_for
+
+    def game(state: str):
+        base = str(state).split("[")[0]
+        return BLOCK_PALETTE.get(base if ":" in base else "minecraft:" + base) or original(state)
+    block_colors.color_for = game
+    try:
+        return render(blocks, names, **kw)
+    finally:
+        block_colors.color_for = original
 
 
 # colours of a code view: hues 45 degrees or more apart, so the renderer's face shading and edge
@@ -119,11 +139,7 @@ def render_codes(shape: np.ndarray, material: np.ndarray, codes: np.ndarray, col
 
 def render_blocks(blocks: np.ndarray, names: list, yaw: float, pitch: float, size: int = 900):
     """RGB image of an (X, Y, Z) palette grid, cropped to the build and scaled to `size`."""
-    from PIL import Image
-    if str(BDC) not in sys.path:
-        sys.path.insert(0, str(BDC))
-    from schemset.review import render
-    im = render(blocks, names, yaw=yaw, pitch=pitch, size=2 * size)
+    im = _render(blocks, names, yaw=yaw, pitch=pitch, size=2 * size)
     if im is None:
         return None
     return finish(im, size)

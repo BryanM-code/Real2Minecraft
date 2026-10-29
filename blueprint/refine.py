@@ -128,7 +128,15 @@ def _json(path: Path):
 
 # --- prepare: the photo's reading, its building's pixels, windows and doors --------------------
 
-def prepare(path: Path, out: Path, vlm, seg) -> dict:
+# what the roof pass shows of each part (`vision.part_view`). The whole photo: on the 50 test
+# photos a close-up of each part read the main blocks' front tops 38 of 48 (the photo 37) and
+# their pitch 13 of 21 (14), and the parts it read differently no better (10 of 18 tops, 2 of 8
+# pitches against 10 and 3); a red box round the part, 38 and 14, 11 and 5, but more gables rising
+# from an eave that is not there; the builds came out the same (roofs 138, 137, 137 of 157)
+ROOF_VIEW = "full"
+
+
+def prepare(path: Path, out: Path, vlm, seg, roof_view: str = ROOF_VIEW) -> dict:
     """The local model's reading (`describe.run_read`), the main building's box and visible
     side, its windows and doors (BOXED_KINDS only), and its pixels;
     saved as <stem>.read.json, <stem>.photo.json and _work/<stem>/ (photo, masks, white.png
@@ -146,8 +154,6 @@ def prepare(path: Path, out: Path, vlm, seg) -> dict:
     if read is None:
         read = {"photo": str(path), "mode": "read", **run_read(*vlm, image)}
         (out / f"{stem}.read.json").write_text(json.dumps(read, indent=1, ensure_ascii=False), encoding="utf-8")
-    if "roofs" not in read:
-        add_roofs(read, vlm, image, out / f"{stem}.read.json")
     t = time.time()
     loc = vision.locate(vlm, image)
     ops = {"boxes": [], "complete": False, "text": ""}
@@ -167,15 +173,18 @@ def prepare(path: Path, out: Path, vlm, seg) -> dict:
              "openings": ops["boxes"], "openings_complete": ops["complete"], "openings_text": ops["text"][-300:],
              "seconds": round(time.time() - t, 1)}
     (out / f"{stem}.photo.json").write_text(json.dumps(facts, indent=1), encoding="utf-8")
+    if "roofs" not in read:                            # after the segmentation: a part's view needs its pixels
+        add_roofs(read, vlm, image, out / f"{stem}.read.json", sb["mask"], roof_view)
     return facts
 
 
 # --- run: the loop ------------------------------------------------------------------------------
 
-def add_roofs(read: dict, vlm, image, path: Path) -> dict:
+def add_roofs(read: dict, vlm, image, path: Path, mask=None, view: str = "full") -> dict:
     """The roof pass on a reading, saved with it."""
     t = time.time()
-    read["roofs"] = roof_pass(vlm, image, read)
+    read["roofs"] = roof_pass(vlm, image, read, mask, view)
+    read["roofs_view"] = view if mask is not None else "full"
     read["seconds_roofs"] = round(time.time() - t, 1)
     path.write_text(json.dumps(read, indent=1, ensure_ascii=False), encoding="utf-8")
     return read
@@ -191,7 +200,7 @@ def form_front(p: dict) -> str | None:
         return "flat"
     if roof == "cross_gable":
         return "both"
-    if roof in ("gable", "hip", "gambrel", "mansard", "shed"):
+    if roof in ("gable", "hip", "gambrel", "mansard", "shed", "barrel", "butterfly", "clipped_gable"):
         return "triangle" if p.get("ridge") == "perpendicular" else "eave"
     return "other" if roof else None
 
@@ -209,11 +218,13 @@ def settle_front(vlm, photo, which: str, seen: str | None, form: str | None) -> 
     return seen
 
 
-def roof_pass(vlm, photo, read: dict) -> list:
+def roof_pass(vlm, photo, read: dict, mask=None, view: str = "full") -> list:
     """Each part's roof as the photo shows it, one concrete question at a time
     (`vision.ROOF_QUESTIONS`): what tops its front wall, what closes its ends, how steep its
     slopes are, where a gable rising from its eave stands; a tower's top (`settle_front` where
-    the front top contradicts the form's). Written into the reading's form parts as "roof_seen"
+    the front top contradicts the form's), each part shown as `view` says (`vision.part_view`:
+    the whole photo, a close-up of the part, or the photo with a box round it; `mask` is the
+    building's pixels). Written into the reading's form parts as "roof_seen"
     (compose takes what `compose.ROOF_TRUST` says it reads better than the form; "front_first":
     the pass's own answer where the tie-break changed it) and returned, a dict a part."""
     from . import vision
@@ -222,20 +233,20 @@ def roof_pass(vlm, photo, read: dict) -> list:
     out = []
     for k, p in enumerate(parts):
         role = str(p.get("part") or "wing").lower()
-        which = vision.part_words(len(parts), k, role)
+        image, which = vision.part_view(photo, mask, parts, k, role, view)
         seen = {}
         if role == "tower":
-            seen["tower_top"] = vision.roof_question(vlm, photo, which, "tower_top")
+            seen["tower_top"] = vision.roof_question(vlm, image, which, "tower_top")
         else:
-            first = vision.roof_question(vlm, photo, which, "front_top")
-            seen["front_top"] = settle_front(vlm, photo, which, first, form_front(p))
+            first = vision.roof_question(vlm, image, which, "front_top")
+            seen["front_top"] = settle_front(vlm, image, which, first, form_front(p))
             if seen["front_top"] != first:
                 seen["front_first"] = first
             if seen["front_top"] in PITCHED_TOPS:
-                seen["ends"] = vision.roof_question(vlm, photo, which, "ends")
-                seen["pitch"] = vision.roof_question(vlm, photo, which, "pitch")
+                seen["ends"] = vision.roof_question(vlm, image, which, "ends")
+                seen["pitch"] = vision.roof_question(vlm, image, which, "pitch")
             if seen["front_top"] == "both":
-                seen["cross_at"] = vision.roof_question(vlm, photo, which, "cross_at")
+                seen["cross_at"] = vision.roof_question(vlm, image, which, "cross_at")
         p["roof_seen"] = {key: v for key, v in seen.items() if v}
         out.append(p["roof_seen"])
     return out
@@ -768,6 +779,8 @@ def main(argv=None) -> int:
     ap.add_argument("--rounds", type=int, default=4)
     ap.add_argument("--redo", action="store_true", help="run photos that already have a result again")
     ap.add_argument("--model", default=None, help="the vision model (describe.load_model; default its MODEL)")
+    ap.add_argument("--roof-view", default=ROOF_VIEW, choices=("full", "crop", "box"),
+                    help="what the roof pass shows of each part (vision.part_view)")
     ap.add_argument("--check", default="agree", choices=("agree", "full", "off"),
                     help="the photo-only check: act on the answers the form agrees with, on all, or skip it")
     args = ap.parse_args(argv)
@@ -801,11 +814,16 @@ def main(argv=None) -> int:
         t = time.time()
         try:
             if args.stage == "roofs":
+                from PIL import Image
+
                 from .describe import photo as load_photo
-                r = add_roofs(_json(out / f"{stem}.read.json"), vlm, load_photo(p), out / f"{stem}.read.json")
+                mf = out / "_work" / stem / "mask.png"
+                mask = np.array(Image.open(mf)) > 127 if mf.is_file() else None
+                r = add_roofs(_json(out / f"{stem}.read.json"), vlm, load_photo(p), out / f"{stem}.read.json", mask,
+                              args.roof_view)
                 print(f"{stem}: {r['seconds_roofs']} s, {r['roofs']}", flush=True)
             elif args.stage == "prepare":
-                f = prepare(p, out, vlm, seg)
+                f = prepare(p, out, vlm, seg, args.roof_view)
                 print(f"{stem}: {time.time() - t:.0f} s, building {f['share']:.0%} of the photo, side {f['locate']['side']}, "
                       f"{len(f['openings'])} openings", flush=True)
             elif args.stage == "run":

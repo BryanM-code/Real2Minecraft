@@ -203,7 +203,11 @@ Definitions:
   steep lower slope, often with dormers, under a flat or gentle top; gambrel = a barn roof, two slopes on
   each side, the lower one steeper; dome; cone = a round pointed roof on a round tower; spire = a tall
   thin pointed roof; sawtooth = repeated one-sided slopes with glass faces; pagoda = stacked roofs with
-  upturned eaves{rulers}
+  upturned eaves; barrel = a curved roof like half a tube lying on its side; butterfly = two slopes
+  falling to a valley in the middle (a V); onion_dome = a bulb-shaped dome that swells out and ends in a
+  point; clipped_gable = a gable whose peak is cut back by a small sloping triangle at each end;
+  hip_and_gable = a hip roof whose top part ends in a small triangular gable at each end (East Asian
+  temples and houses){rulers}
 {defs}"""
 
 
@@ -319,14 +323,66 @@ def ask(model, processor, image, prompt: str, max_new_tokens: int = 1024, think:
 
 
 def parse_json(text: str):
-    """The first {...} block in `text`, or None."""
-    m = re.search(r"(?s)\{.*\}", text)
+    """The first {...} block in `text`, or None. Tolerant of the slips a model makes: trailing
+    commas, a root object closed too early (`{"parts": [...]}, "symmetric": false, ...}`: the
+    keys after it are its own), and an end cut off (the open brackets closed)."""
+    m = re.search(r"(?s)\{.*", text)
     if not m:
         return None
+    s = m.group(0)
+    s = s[:s.rfind("}") + 1] or s
+    for candidate in (s, re.sub(r",\s*([}\]])", r"\1", s)):
+        try:
+            return json.loads(candidate)
+        except json.JSONDecodeError:
+            pass
+    dec = json.JSONDecoder()
+    s = re.sub(r",\s*([}\]])", r"\1", s)
     try:
-        return json.loads(m.group(0))
+        obj, end = dec.raw_decode(s)
     except json.JSONDecodeError:
+        closed = _close_json(m.group(0))
+        try:
+            return json.loads(closed) if closed else None
+        except json.JSONDecodeError:
+            return None
+    rest = s[end:].strip()
+    while isinstance(obj, dict) and rest.startswith(","):        # more of the root's keys
+        more_text = "{" + rest[1:].lstrip()
+        try:
+            more, used = dec.raw_decode(more_text)
+        except json.JSONDecodeError:
+            break
+        if not isinstance(more, dict):
+            break
+        obj.update({k: v for k, v in more.items() if k not in obj})
+        rest = more_text[used:].strip()
+    return obj
+
+
+def _close_json(s: str) -> str | None:
+    """`s` cut off inside a JSON value: its last complete item kept and its open brackets closed."""
+    stack, in_str, esc, cut = [], False, False, None
+    for i, ch in enumerate(s):
+        if in_str:
+            esc = (ch == "\\") and not esc
+            if ch == '"' and not esc:
+                in_str = False
+            continue
+        if ch == '"':
+            in_str = True
+        elif ch in "{[":
+            stack.append("}" if ch == "{" else "]")
+        elif ch in "}]" and stack:
+            stack.pop()
+            if not stack:
+                return None                                   # complete: not a cut-off text
+        elif ch == ",":
+            cut = (i, list(stack))
+    if not stack or cut is None:
         return None
+    i, open_at_cut = cut
+    return s[:i] + "".join(reversed(open_at_cut))
 
 
 def check(bp) -> str | None:

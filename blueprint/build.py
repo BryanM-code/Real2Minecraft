@@ -73,8 +73,34 @@ def _empty(c) -> bool:
 
 # --- footprints -------------------------------------------------------------------------
 
-def footprint(m: dict) -> set:
-    """The (x, z) columns a mass stands on: its box, or the round / octagonal shape inside it."""
+def _jet(m: dict, side: str, j) -> int:
+    """How far out the wall on `side` stands at row j: a jettied mass's storeys over its first
+    each `jetty` blocks further out than the one below, on its `jetty_sides`."""
+    jet = int(m.get("jetty", 0))
+    if not jet or j is None or side not in m.get("jetty_sides", ("south",)):
+        return 0
+    return jet * sum(1 for f in m["floors"] if 0 < f <= j)
+
+
+def _top(m: dict) -> dict:
+    """The mass as its top storey stands: a jettied mass's roof and roof features sit on that."""
+    if not int(m.get("jetty", 0)):
+        return m
+    j = wall_rows(m) - 1
+    x0, x1, z0, z1 = mass_bounds(m)
+    x0, x1 = x0 - _jet(m, "west", j), x1 + _jet(m, "east", j)
+    z0, z1 = z0 - _jet(m, "north", j), z1 + _jet(m, "south", j)
+    return dict(m, x=x0, z=z0, w=x1 - x0 + 1, d=z1 - z0 + 1, jetty=0)
+
+
+def footprint(m: dict, j=None) -> set:
+    """The (x, z) columns a mass stands on: its box, or the round / octagonal shape inside it;
+    with a row `j`, a jettied box's at that row."""
+    if j is not None and int(m.get("jetty", 0)) and m.get("shape", "box") == "box":
+        x0, x1, z0, z1 = mass_bounds(m)
+        x0, x1 = x0 - _jet(m, "west", j), x1 + _jet(m, "east", j)
+        z0, z1 = z0 - _jet(m, "north", j), z1 + _jet(m, "south", j)
+        return {(x, z) for x in range(x0, x1 + 1) for z in range(z0, z1 + 1)}
     x0, x1, z0, z1 = mass_bounds(m)
     shape = m.get("shape", "box")
     cells = set()
@@ -107,12 +133,15 @@ def _ring(x0, x1, z0, z1):
                 yield x, z, sides
 
 
-def _along(m: dict, side: str, t: int):
+def _along(m: dict, side: str, t: int, j=None):
     """(x, z) of the wall column `t` blocks from the wall's left end, seen from outside
-    (round masses: the outermost column of their shape there), or None."""
+    (round masses: the outermost column of their shape there), or None; at row `j` a jettied
+    wall's plane stands out (t keeps the first storey's frame, so openings line up)."""
     x0, x1, z0, z1 = mass_bounds(m)
     if m.get("shape", "box") == "box":
-        return {"south": (x0 + t, z1), "north": (x1 - t, z0), "east": (x1, z1 - t), "west": (x0, z0 + t)}[side]
+        x, z = {"south": (x0 + t, z1), "north": (x1 - t, z0), "east": (x1, z1 - t), "west": (x0, z0 + t)}[side]
+        off = _jet(m, side, j)
+        return (x + OUT[side][0] * off, z + OUT[side][1] * off) if off else (x, z)
     cells = footprint(m)
     if side in ("south", "north"):
         x = x0 + t if side == "south" else x1 - t
@@ -128,6 +157,7 @@ def local(m: dict, side: str, t: int, j: int, o: int) -> tuple:
     outside, `j` rows above the mass's base, `o` blocks out from the wall's plane."""
     x0, x1, z0, z1 = mass_bounds(m)
     y = m["y"] + j
+    o += _jet(m, side, j)                               # a jettied storey's wall stands out
     return {"south": (x0 + t, y, z1 + o), "north": (x1 - t, y, z0 - o),
             "east": (x1 + o, y, z1 - t), "west": (x0 - o, y, z0 + t)}[side]
 
@@ -139,6 +169,12 @@ def _mass(cv: Canvas, m: dict, mats: dict) -> None:
     cells = footprint(m)
     edge = perimeter(cells)
     box = m.get("shape", "box") == "box"
+    if m.get("open"):
+        _open_mass(cv, m, mats, cells, edge)
+        return
+    if int(m.get("jetty", 0)) and box:
+        _jetty_mass(cv, m, mats)
+        return
     for (x, z), sides in edge.items():
         base = max(m["plinth"][s] for s in sides)
         corner = box and len(sides) == 2 and m["corner_trim"]
@@ -147,6 +183,76 @@ def _mass(cv: Canvas, m: dict, mats: dict) -> None:
             cv.put((x, y, z), "full", mats[role], ("wall", mid),
                    label={"wall_base": "base", "trim": "trim", "wall": "wall"}[role])
     for f in m["floors"]:
+        for x, z in cells:
+            if (x, z) not in edge:
+                cv.put((x, y0 + f, z), "full", mats["floor"], ("floor", mid))
+
+
+def _rings(m: dict) -> dict:
+    """{row: (cells, perimeter)} of a jettied mass, each storey's own."""
+    out, seen = {}, {}
+    for j in range(wall_rows(m)):
+        key = tuple(_jet(m, s, j) for s in ("south", "north", "east", "west"))
+        if key not in seen:
+            cells = footprint(m, j)
+            seen[key] = (cells, perimeter(cells))
+        out[j] = seen[key]
+    return out
+
+
+def _jetty_mass(cv: Canvas, m: dict, mats: dict) -> None:
+    """A jettied mass: each storey's walls on its own footprint, a beam (trim) under the strip a
+    storey stands out over the one below, floors right out to its walls."""
+    y0, mid = m["y"], m["id"]
+    rings = _rings(m)
+    for j, (cells, edge) in rings.items():
+        for (x, z), sides in edge.items():
+            base = max(m["plinth"][s] for s in sides)
+            corner = len(sides) == 2 and m["corner_trim"]
+            role = "wall_base" if j < base else "trim" if corner else "wall"
+            cv.put((x, y0 + j, z), "full", mats[role], ("wall", mid),
+                   label={"wall_base": "base", "trim": "trim", "wall": "wall"}[role])
+    for f in m["floors"]:
+        cells, edge = rings.get(f, rings[0])
+        under = rings[f - 1][0] if f > 0 else cells
+        for x, z in cells:
+            if (x, z) not in edge:
+                cv.put((x, y0 + f, z), "full", mats["trim"] if (x, z) not in under else mats["floor"],
+                       ("floor", mid))
+
+
+def _open_mass(cv: Canvas, m: dict, mats: dict, cells: set, edge: dict) -> None:
+    """Posts (columns) instead of walls: at the corners and every `bay` blocks along each wall
+    (a round mass's spread round it), its base rows solid, a beam round its top row, floors
+    right out to the edge, and with `rail` a railing between the posts on every floor: a
+    pavilion, a bandstand, a market hall, a temple's colonnade, a car park, a water tower's legs."""
+    y0, rows, mid = m["y"], wall_rows(m), m["id"]
+    x0, x1, z0, z1 = mass_bounds(m)
+    bay = max(2, int(m.get("bay", 3)))
+    box = m.get("shape", "box") == "box"
+    base = max(m["plinth"].values())
+    floors = sorted(set(m["floors"]))
+    railed = {f + 1 for f in floors if f >= base} | ({base} if base else set())
+    for (x, z), sides in edge.items():
+        if box:
+            t = x - x0 if sides[0] in ("south", "north") else z - z0
+            end = x1 - x0 if sides[0] in ("south", "north") else z1 - z0
+            post = len(sides) >= 2 or t % bay == 0 or t == end
+        else:
+            post = (x + z) % bay == 0
+        for y in range(y0, y0 + rows):
+            j = y - y0
+            if j < base:
+                cv.put((x, y, z), "full", mats["wall_base"], ("wall", mid), label="base")
+            elif j == rows - 1:
+                cv.put((x, y, z), "full", mats["trim"], ("wall", mid), label="trim")
+            elif post:
+                cv.put((x, y, z), "full", mats["column"], ("wall", mid), label="trim")
+            elif j in floors and j > 0:
+                cv.put((x, y, z), "full", mats["floor"], ("floor", mid))
+            elif m.get("rail") and j in railed:
+                cv.put((x, y, z), "fence", mats["railing"], ("wall", mid), label="trim")
+    for f in floors:
         for x, z in cells:
             if (x, z) not in edge:
                 cv.put((x, y0 + f, z), "full", mats["floor"], ("floor", mid))
@@ -172,7 +278,7 @@ def _slopes(roof: dict, xa: int, xb: int, za: int, zb: int) -> dict:
     """{(x, z): (k, facing)}: k rows up from the roof's outer edge; facing is the way the
     slope climbs (its stairs face that way), None on a ridge where two slopes meet."""
     t = roof["type"]
-    if t in ("gable", "gambrel"):
+    if t in ("gable", "gambrel", "barrel", "butterfly"):
         keys = ("north", "south") if roof["ridge"] == "x" else ("east", "west")
     elif t == "shed":
         keys = (roof["high"],)
@@ -187,7 +293,41 @@ def _slopes(roof: dict, xa: int, xb: int, za: int, zb: int) -> dict:
             best = [f for f in keys if d[f] == k]
             ridge = any(BACK[a] == b for a in best for b in best)
             out[(x, z)] = (k, None if ridge else best[0])
+    kmax = max(k for k, _ in out.values())
+    if t == "butterfly":                                      # two slopes falling to a valley in the middle
+        out = {p: (kmax - k, BACK[f] if f else BACK[keys[0]]) for p, (k, f) in out.items()}
+    clip = int(roof.get("clip", 0))
+    if t == "gable" and clip > 0:                             # the ends hipped over the top `clip` rows
+        for (x, z), (k, f) in list(out.items()):
+            if roof["ridge"] == "x":
+                d_end, climb = min(x - xa, xb - x), "east" if x - xa <= xb - x else "west"
+            else:
+                d_end, climb = min(z - za, zb - z), "south" if z - za <= zb - z else "north"
+            kc = kmax - clip + d_end
+            if kc < k:
+                out[(x, z)] = (kc, climb)
+    gablet = int(roof.get("gablet", 0))
+    if gablet > 0 and t == "hip":                            # hip-and-gable: the top rows end in small gables
+        long_keys = ("north", "south") if roof["ridge"] == "x" else ("east", "west")
+        ends = ("east", "west") if roof["ridge"] == "x" else ("north", "south")
+        kg_max = max(min(_dist(x, z, f, xa, xb, za, zb) for f in long_keys) for (x, z) in out)
+        line = max(1, kg_max - gablet)                        # where the end slopes stop and the gablets stand
+        for (x, z) in list(out):
+            kg = min(_dist(x, z, f, xa, xb, za, zb) for f in long_keys)
+            d_end = min(_dist(x, z, f, xa, xb, za, zb) for f in ends)
+            if d_end >= line and kg > out[(x, z)][0]:
+                best = [f for f in long_keys if _dist(x, z, f, xa, xb, za, zb) == kg]
+                out[(x, z)] = (kg, None if len(best) > 1 else best[0])
+    deck = int(roof.get("deck", 0))
+    if deck > 0 and t in ("hip", "gable", "mansard"):         # cut flat below the peak
+        flat = max(1, kmax - deck)
+        out = {p: (flat, None) if k >= flat else (k, f) for p, (k, f) in out.items()}
     return out
+
+
+def _dist(x: int, z: int, f: str, xa: int, xb: int, za: int, zb: int) -> int:
+    """Rows up from the roof's edge for a slope climbing `f` (climbing north starts at the south edge)."""
+    return {"north": zb - z, "south": z - za, "east": x - xa, "west": xb - x}[f]
 
 
 def _radial(m: dict, o: int) -> dict:
@@ -247,8 +387,32 @@ def _three_quarter(k: int, facing, e: int, x: int, z: int):
     return [cap] + fill, min([top] + [p[0][1] for p in fill])
 
 
-def _pieces_for(pitch: float, k: int, facing, e: int, x: int, z: int, kind: str, kbreak: int):
+def _barrel(pitch: float, k: int, kmax: int, facing, e: int, x: int, z: int):
+    """A column of a barrel roof: an arc across the span, as high as `pitch` times half the span
+    (1: a half circle), in half blocks; full blocks under it down to where the column before it
+    stood, a stair where the arc climbs steeply."""
+    K = kmax + 0.5
+    rise = K * min(1.0, max(0.25, pitch))
+
+    def h2(kk):
+        c = (K - (kk + 0.5)) / K
+        return int(round(2 * rise * math.sqrt(max(0.0, 1.0 - c * c))))
+    top2, prev2 = max(1, h2(k)), (max(1, h2(k - 1)) if k > 0 else 0)
+    base = e - 1
+    if top2 % 2:
+        top, cap = base + top2 // 2, "slab_bottom"
+    else:
+        top = base + top2 // 2 - 1
+        cap = "stairs_" + facing if facing is not None and top2 - prev2 >= 2 else "full"
+    lowest = base + prev2 // 2
+    fill = [((x, y, z), "full") for y in range(min(lowest, top), top)]
+    return [((x, top, z), cap)] + fill, min([top] + [p[0][1] for p in fill])
+
+
+def _pieces_for(pitch: float, k: int, facing, e: int, x: int, z: int, kind: str, kbreak: int, kmax: int = 0):
     """[(p, shape), ...] of one roof column (its surface piece first), and that piece's row."""
+    if kind == "barrel":
+        return _barrel(pitch, k, kmax, facing, e, x, z)
     if kind == "mansard" and k > kbreak:                    # the flat top over the steep sides
         y = e + 2 * kbreak
         return [((x, y, z), "full")], y
@@ -295,14 +459,14 @@ def _roof(cv: Canvas, m: dict, mats: dict) -> dict:
         parts.flat_roof(cv, m, mats, ok)
         return {}
     if t == "dome":
-        parts.dome(cv, mats, m, {"squash": r.get("squash", 1.0)}, ok)
+        parts.dome(cv, mats, m, {"squash": r.get("squash", 1.0), "profile": r.get("profile", "round")}, ok)
         return {}
     if t == "sawtooth":
         parts.sawtooth(cv, m, mats, ok)
         return {}
     o = int(r["overhang"]) + (1 if t == "pagoda" else 0)
     xa, xb, za, zb = x0 - o, x1 + o, z0 - o, z1 + o
-    pitch = {"spire": 3.0, "cone": 2.0}.get(t, r["pitch"])
+    pitch = r["pitch"] if r.get("keep_pitch") else {"spire": 3.0, "cone": 2.0}.get(t, r["pitch"])
     if shape != "box":
         slopes = _radial(m, o)
     elif t == "cross_gable":
@@ -328,7 +492,7 @@ def _roof(cv: Canvas, m: dict, mats: dict) -> dict:
         block = mats["roof_edge" if k == 0 or rake else "roof"]
         if t == "spire" and r.get("material_spire"):
             block = r["material_spire"]
-        cells, y = _pieces_for(pitch, k, facing, e, x, z, t, kbreak)
+        cells, y = _pieces_for(pitch, k, facing, e, x, z, t, kbreak, kmax)
         placed = [cv.put(p, s, block, ("roof", mid), ok) for p, s in cells]
         if placed[0]:
             pieces[(x, z)] = {"k": k, "facing": facing, "y": cells[0][0][1], "low": y, "shape": cells[0][1],
@@ -356,6 +520,23 @@ def _roof(cv: Canvas, m: dict, mats: dict) -> dict:
             cv.put((x, y, z), "full", mats["wall"], ("wall", mid), _empty)
     if t == "gable" and r.get("gable_end") == "stepped":
         _stepped_gables(cv, m, pieces, mats)
+    if int(r.get("gablet", 0)) > 0 and t in ("hip", "pagoda"):
+        for (x, z), pc in pieces.items():                   # under a gablet column, down to the end slope
+            for dx, dz in OUT.values():
+                nb = pieces.get((x + dx, z + dz))
+                if nb is not None and nb["k"] < pc["k"] - 1 and nb["facing"] in ("north", "south", "east", "west") \
+                        and (dx, dz) == OUT[BACK[nb["facing"]]]:
+                    for y in range(nb["y"] + 1, pc["low"]):
+                        cv.put((x, y, z), "full", mats["wall"], ("roof", mid), _empty)
+    if int(r.get("deck", 0)) > 0 and r.get("rail"):          # a railing round the cut top (a widow's walk)
+        top = {p for p, pc in pieces.items() if pc["facing"] is None}
+        high = {}
+        for (x, y, z), c in cv.cells.items():
+            if (x, z) in top and c[2] == ("roof", mid):
+                high[(x, z)] = max(high.get((x, z), y), y)
+        for (x, z) in top:
+            if (x, z) in high and any((x + dx, z + dz) not in top for dx, dz in OUT.values()):
+                cv.put((x, high[(x, z)] + 1, z), "fence", mats["railing"], ("roof", mid), _empty)
     return pieces
 
 
@@ -395,7 +576,7 @@ def _window(cv: Canvas, m: dict, o: dict, mats: dict) -> None:
     mullions = set(o["mullions"])
     style = o.get("style", "rect")
     for t in range(u - 1, u + w + 1):
-        xz = _along(m, side, t)
+        xz = _along(m, side, t, o["y"])
         if xz is None:
             continue
         x, z = xz
@@ -417,13 +598,13 @@ def _window(cv: Canvas, m: dict, o: dict, mats: dict) -> None:
                 cv.put((x, base + j, z), "full", mats["frame"], ("frame", mid), _mine(mid))
     if o["sill"]:
         for t in range(u - 1, u + w + 1):
-            xz = _along(m, side, t)
+            xz = _along(m, side, t, o["y"])
             if xz is not None:
                 cv.put((xz[0] + dx, base + y - 1, xz[1] + dz), "stairs_top_" + BACK[side], mats["sill"], ("out", mid),
                        _empty)
     if o["shutters"]:
         for t in (u - 1, u + w):
-            xz = _along(m, side, t)
+            xz = _along(m, side, t, o["y"])
             if xz is None:
                 continue
             for j in range(y, y + h):
@@ -432,11 +613,13 @@ def _window(cv: Canvas, m: dict, o: dict, mats: dict) -> None:
 
 
 def _arch(cv: Canvas, m: dict, o: dict, mats: dict) -> None:
-    """An open arch (an arcade bay or a gateway): no glass, shoulders of stairs at the top."""
+    """An open arch (an arcade bay or a gateway): no glass, shoulders of stairs at the top. Without
+    a frame (an arch cut in plaster) the shoulders are the wall's own block."""
     mid, side, base = m["id"], o["side"], m["y"]
     u, y, w, h = o["u"], o["y"], o["w"], o["h"]
+    shoulder, owner = (mats["frame"], ("frame", mid)) if o["frame"] else (mats["wall"], ("wall", mid))
     for t in range(u - 1, u + w + 1):
-        xz = _along(m, side, t)
+        xz = _along(m, side, t, o["y"])
         if xz is None:
             continue
         x, z = xz
@@ -444,10 +627,29 @@ def _arch(cv: Canvas, m: dict, o: dict, mats: dict) -> None:
             inside = u <= t < u + w and j < y + h
             if inside and j == y + h - 1 and t in (u, u + w - 1) and w >= 2:
                 facing = LEFT[side] if t == u else RIGHT[side]
-                cv.put((x, base + j, z), "stairs_top_" + facing, mats["frame"], ("frame", mid), _mine(mid))
+                cv.put((x, base + j, z), "stairs_top_" + facing, shoulder, owner, _mine(mid))
             elif inside:
                 cv.put((x, base + j, z), "air", None, None, _mine(mid))
             elif o["frame"]:
+                cv.put((x, base + j, z), "full", mats["frame"], ("frame", mid), _mine(mid))
+
+
+def _round(cv: Canvas, m: dict, o: dict, mats: dict) -> None:
+    """A round window (a rose window, an oculus): glass inside a circle as wide as the opening,
+    a frame round it."""
+    mid, side, base = m["id"], o["side"], m["y"]
+    u, y, w, h = o["u"], o["y"], o["w"], o["h"]
+    cu, cj, r = u + (w - 1) / 2, y + (h - 1) / 2, min(w, h) / 2
+    for t in range(u - 1, u + w + 1):
+        xz = _along(m, side, t, o["y"])
+        if xz is None:
+            continue
+        x, z = xz
+        for j in range(y - 1, y + h + 1):
+            d = math.hypot(t - cu, j - cj)
+            if d <= r - 0.5:
+                cv.put((x, base + j, z), "pane", mats["window"], ("open", mid), _mine(mid), label="window")
+            elif d <= r + 0.5 and o["frame"]:
                 cv.put((x, base + j, z), "full", mats["frame"], ("frame", mid), _mine(mid))
 
 
@@ -455,7 +657,7 @@ def _door(cv: Canvas, m: dict, o: dict, mats: dict) -> None:
     mid, side, base = m["id"], o["side"], m["y"]
     u, y, w = o["u"], o["y"], o["w"]
     for t in range(u - 1, u + w + 1):
-        xz = _along(m, side, t)
+        xz = _along(m, side, t, o["y"])
         if xz is None:
             continue
         x, z = xz
@@ -475,7 +677,7 @@ def _garage(cv: Canvas, m: dict, o: dict, mats: dict) -> None:
     dx, dz = OUT[side]
     u, y, w, h = o["u"], o["y"], o["w"], o["h"]
     for t in range(u - 1, u + w + 1):
-        xz = _along(m, side, t)
+        xz = _along(m, side, t, o["y"])
         if xz is None:
             continue
         x, z = xz
@@ -492,14 +694,16 @@ def _panel(cv: Canvas, m: dict, o: dict, mats: dict) -> None:
     mid, base = m["id"], m["y"]
     block = o["material"] or mats["wall_base"]
     for t in range(o["u"], o["u"] + o["w"]):
-        xz = _along(m, o["side"], t)
+        xz = _along(m, o["side"], t, o["y"])
         if xz is None:
             continue
         for j in range(o["y"], o["y"] + o["h"]):
             cv.put((xz[0], base + j, xz[1]), "full", block, ("wall", mid), _mine(mid))
 
 
-DRAW = {"window": _window, "door": _door, "garage": _garage, "panel": _panel, "arch": _arch}
+# features on a mass's roof or top: a jettied mass's top storey carries them
+ROOF_FEATURES = ("dormer", "lantern", "dome", "finial", "gallery", "turret", "tank", "bell_gable")
+DRAW = {"window": _window, "door": _door, "garage": _garage, "panel": _panel, "arch": _arch, "round": _round}
 
 
 # --- features ---------------------------------------------------------------------------
@@ -626,7 +830,7 @@ def build(src) -> dict:
         parts.decor(cv, m, mats[m["id"]])
     pieces = {}
     for m in sorted(masses, key=lambda m: m["y"] + wall_rows(m)):
-        pieces[m["id"]] = _roof(cv, m, mats[m["id"]])
+        pieces[m["id"]] = _roof(cv, _top(m), mats[m["id"]])
     by_id = {m["id"]: m for m in masses}
     for o in sorted(bp["openings"], key=lambda o: o["kind"] != "panel"):
         m = by_id[o["mass"]]
@@ -643,9 +847,10 @@ def build(src) -> dict:
                      and mm_["z"] <= f["z"] < mm_["z"] + mm_["d"]]
             _chimney(cv, f, glob, min(under) if under else floor)
         elif f["kind"] == "skylight":
-            _skylight(cv, m, f, mm, pieces[m["id"]])
+            _skylight(cv, _top(m), f, mm, pieces[m["id"]])
         else:
-            parts.FEATURES[f["kind"]](cv, m, f, mm, pieces.get(m["id"]) if m else None, floor)
+            on = _top(m) if m and f["kind"] in ROOF_FEATURES else m   # on the roof: the top storey's frame
+            parts.FEATURES[f["kind"]](cv, on, f, mm, pieces.get(m["id"]) if m else None, floor)
     _boxes(cv, site)
     _plants(cv, site)
     return grids(cv, masses)

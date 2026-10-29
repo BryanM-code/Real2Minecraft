@@ -17,13 +17,18 @@ front is the south side. Units are blocks. A blueprint is plain JSON:
 A mass is a box of walls: footprint `x`, `z` (its north-west corner), `w` (along x) by `d`
 (along z), base row `y` (its ground floor), walls `storeys` x `storey_h` rows high (or
 `walls` rows), floor plates at `floors` (row offsets; default every storey). `plinth` rows
-at the bottom are the base material (a number, or one per side). Its roof starts on the row
-above the walls.
+at the bottom are the base material (a number, or one per side). An `open` mass has posts
+instead of walls, every `bay` blocks, and with `rail` a railing between them on every floor.
+Its roof starts on the row above the walls: `ROOF_TYPES`, with `clip` (a gable's ends hipped
+over its top rows), `deck` (a hip cut flat below its peak), `rail` (a railing round a flat
+roof or a cut top) and `profile` (a dome's: round, onion, pointed).
 
 An opening sits on one wall of a mass: `u` counts blocks from the wall's left end as seen
 from outside, `y` rows above the mass's base row, `w` x `h` the clear opening (a door is
-always 2 high). Kinds: window, door, garage (recessed one block), panel (a patch of another
-material, e.g. brick round an entrance).
+always 2 high). Kinds: window, door, garage (recessed one block), arch, round (a rose window:
+it may rise into the gable over the walls), panel (a patch of another material, e.g. brick
+round an entrance). Features (`FEATURE_KINDS`, defaults in `FEATURE_DEFAULTS`): the wall ones
+(`WALL_FEATURES`) take a `side`, `u` and `w`; a clock a `side`; a turret a `corner`.
 
 Block names drop the "minecraft:" prefix; every role must be a block the vocabulary
 (mcvox-v3, 1.21.11) has in the shapes the role needs.
@@ -40,17 +45,20 @@ FORMAT = "blueprint-1"
 FORMATS = ("blueprint-0", "blueprint-1")          # blueprint-1 adds shapes, roofs, parts, decor
 SIDES = ("south", "north", "east", "west")
 ROOF_TYPES = ("gable", "hip", "shed", "flat", "pyramid", "cross_gable", "mansard", "gambrel", "sawtooth",
-              "spire", "cone", "dome", "pagoda")
+              "spire", "cone", "dome", "pagoda", "barrel", "butterfly")
+DOME_PROFILES = ("round", "onion", "pointed")
 PITCHES = (0.25, 0.5, 0.75, 1.0, 2.0, 3.0)  # rise per block of run: 14, 27, 37, 45, 63, 72 degrees
 SHAPES = ("box", "round", "octagon")
-DECOR = ("half_timber", "quoins", "bands", "pilasters", "buttresses", "curtain")
+DECOR = ("half_timber", "quoins", "bands", "pilasters", "buttresses", "curtain", "vigas")
 WINDOW_STYLES = ("rect", "arched", "lancet")
-OPENING_KINDS = ("window", "door", "garage", "panel", "arch")
+OPENING_KINDS = ("window", "door", "garage", "panel", "arch", "round")
 FEATURE_KINDS = ("chimney", "skylight", "portico", "porch", "balcony", "dormer", "bay", "dome", "stack", "canopy",
-                 "awning", "sails", "gallery", "lantern", "finial")
+                 "awning", "sails", "gallery", "lantern", "finial", "deck", "veranda", "steps", "clock", "turret",
+                 "tank", "fire_escape", "marquee", "bell_gable")
+TURRET_CORNERS = ("front_left", "front_right", "back_left", "back_right")
 GABLE_ENDS = ("plain", "stepped")                  # stepped: crow-stepped gable walls rising above the roof
 # features attached to one wall of a mass: (mass, side, u along it, w wide)
-WALL_FEATURES = ("portico", "porch", "balcony", "bay", "awning")
+WALL_FEATURES = ("portico", "porch", "balcony", "bay", "awning", "deck", "veranda", "steps", "fire_escape", "marquee")
 
 # role -> (default block, shapes the builder may draw it in)
 ROLES = {
@@ -73,23 +81,41 @@ ROLES = {
     "railing": ("dark_oak_planks", ()),                 # a fence, else a wall, else full blocks
     "dome": ("oxidized_cut_copper", ("full",)),
     "awning": ("red_nether_bricks", ("slab_bottom",)),
+    "dial": ("smooth_quartz", ("full",)),                # a clock's face
+    "hands": ("black_concrete", ("full",)),              # a clock's hands
+    "metal": ("polished_blackstone", ("full", "slab_bottom", "slab_top")),     # fire escapes, a tank's legs
+    "bars": ("iron_block", ("pane",)),                   # iron railings (iron bars)
+    "lights": ("sea_lantern", ("full",)),                # a marquee's bulbs
 }
 FALLBACK = {"roof_edge": "roof", "frame": "trim", "sill": "trim", "shutter": "trim"}
+GLASS_ROOF_ROLES = ("roof", "roof_edge")             # glass may cover a roof without the slabs a roof needs
 
-MASS_DEFAULTS = {"y": 0, "storeys": 1, "storey_h": 5, "plinth": 0, "corner_trim": True, "shape": "box"}
+MASS_DEFAULTS = {"y": 0, "storeys": 1, "storey_h": 5, "plinth": 0, "corner_trim": True, "shape": "box",
+                 "open": False,            # posts (columns) instead of walls: a pavilion, a market hall, a car park
+                 "bay": 3,                 # an open mass's posts: every this many blocks along each wall
+                 "rail": False,            # an open mass's railing between its posts, on every floor
+                 "jetty": 0,               # each storey over the first stands out this many blocks further
+                 "jetty_sides": ["south"]}  # the walls that stand out (a jettied timber-framed house's street side)
 ROOF_DEFAULTS = {"type": "gable", "pitch": 1.0, "overhang": 1, "parapet": 1, "high": "north",
                  "battlements": False, "squash": 1.0,
                  "skirt": 0,               # > 0: only this many rows of slope from the eave (a pagoda tier's)
-                 "gable_end": "plain"}
+                 "gable_end": "plain",
+                 "clip": 0,                # a gable's ends hipped over their top rows (a jerkinhead)
+                 "gablet": 0,              # a hip's (or pagoda's) top rows ending in small gables (hip-and-gable)
+                 "deck": 0,                # a hip or pyramid cut flat this many rows below its peak
+                 "rail": False,            # a railing round a flat roof's edge or a cut roof's deck
+                 "profile": "round",       # a dome roof's: round, onion or pointed
+                 "keep_pitch": False}      # a cone or spire at its own pitch (else 63 / 72 degrees)
 OPENING_DEFAULTS = {
     "window": {"w": 2, "h": 3, "mullions": [], "frame": True, "sill": True, "shutters": False, "style": "rect"},
     "arch": {"w": 3, "h": 4, "frame": True},
     "door": {"w": 1, "frame": True},
     "garage": {"w": 5, "h": 4, "frame": True},
     "panel": {"material": None},
+    "round": {"w": 3, "h": 3, "frame": True},
 }
 FEATURE_DEFAULTS = {"chimney": {"w": 2, "d": 2, "cap": True}, "skylight": {"w": 3, "h": 3, "frame": True},
-                    "portico": {"depth": 3, "columns": 0, "pediment": True, "height": 0},
+                    "portico": {"depth": 3, "columns": 0, "pediment": True, "height": 0, "lift": 0},
                     "porch": {"depth": 3, "height": 4, "railing": True, "wrap": False, "wrap_side": "right"},
                     "balcony": {"depth": 1, "y": 0},
                     "dormer": {"w": 3, "h": 2},
@@ -100,8 +126,17 @@ FEATURE_DEFAULTS = {"chimney": {"w": 2, "d": 2, "cap": True}, "skylight": {"w": 
                     "awning": {"y": 4, "depth": 2},
                     "sails": {"length": 0},
                     "gallery": {},
-                    "lantern": {"h": 3, "open": False, "cap": "", "shrink": -1},
-                    "finial": {"h": 0}}
+                    "lantern": {"h": 3, "open": False, "cap": "", "shrink": -1, "w": 0, "on_roof": False},
+                    "finial": {"h": 0},
+                    "deck": {"depth": 3, "y": 0, "stairs": "right", "rail": True},
+                    "veranda": {"depth": 3, "levels": 2, "roof": "shed"},
+                    "steps": {"top": 0, "rise": 1, "rail": False},
+                    "clock": {"r": 1, "j": -1, "t": -1},
+                    "turret": {"corner": "front_right", "r": 2, "start": -1, "top": 3, "cap": "cone"},
+                    "tank": {"r": 3, "h": 4, "legs": 6, "y": -1},
+                    "fire_escape": {"depth": 2},
+                    "marquee": {"y": 3, "depth": 3, "h": 2},
+                    "bell_gable": {"w": 7, "h": 6, "bells": 2}}
 
 
 class BlueprintError(ValueError):
@@ -208,6 +243,12 @@ def load(src) -> dict:
             errors.append(f"{where}.roof.gable_end: one of {GABLE_ENDS}, got {roof['gable_end']!r}")
         if int(roof["skirt"]) < 0:
             errors.append(f"{where}.roof.skirt: 0 or more rows, got {roof['skirt']!r}")
+        if int(m.get("jetty", 0)) < 0 or any(s not in SIDES for s in m.get("jetty_sides", [])):
+            errors.append(f"{where}: jetty is 0 or more blocks, jetty_sides some of {SIDES}")
+        if roof["profile"] not in DOME_PROFILES:
+            errors.append(f"{where}.roof.profile: one of {DOME_PROFILES}, got {roof['profile']!r}")
+        if int(roof["clip"]) < 0 or int(roof["deck"]) < 0 or int(roof["gablet"]) < 0:
+            errors.append(f"{where}.roof: clip, deck and gablet are 0 or more rows")
     by_id = {m["id"]: m for m in masses if isinstance(m.get("w"), int) and isinstance(m.get("d"), int)}
     for i, o in enumerate(bp.setdefault("openings", [])):
         where = f"openings[{i}]"
@@ -233,7 +274,8 @@ def load(src) -> dict:
             continue
         if o["u"] < 0 or o["u"] + o["w"] > wall_length(m, o["side"]) or o["w"] < 1:
             errors.append(f"{where}: u {o['u']} + w {o['w']} is off the {wall_length(m, o['side'])}-block wall")
-        if o["y"] < 0 or o["y"] + o["h"] > wall_rows(m) or o["h"] < 1:
+        # a round window may rise into the gable over the walls (a rose window): it only replaces wall
+        if o["y"] < 0 or (kind != "round" and o["y"] + o["h"] > wall_rows(m)) or o["h"] < 1:
             errors.append(f"{where}: y {o['y']} + h {o['h']} is off the {wall_rows(m)}-row wall")
         if kind == "window":
             if o["style"] not in WINDOW_STYLES:
@@ -253,19 +295,23 @@ def load(src) -> dict:
             f.setdefault(k, v)
         need = {"chimney": ("x", "z", "top"), "stack": ("x", "z", "top"), "canopy": ("x0", "z0", "x1", "z1", "top"),
                 "skylight": ("u", "v"), "dormer": ("u",), "sails": (), "gallery": ("y",), "lantern": (), "dome": (),
-                "finial": ()}
+                "finial": (), "clock": (), "turret": (), "tank": (), "bell_gable": ()}
         need.update({k: ("u", "w") for k in WALL_FEATURES})
         for k in need[kind]:
             if not isinstance(f.get(k), int):
                 errors.append(f"{where}.{k}: an integer is needed")
-        if kind in ("chimney", "stack", "canopy") or (kind == "dome" and "mass" not in f):
-            if kind == "dome" and not all(isinstance(f.get(k), int) for k in ("x", "z", "r", "y")):
-                errors.append(f"{where}: a dome needs a mass, or x, z, r and y")
+        if kind in ("chimney", "stack", "canopy") or (kind in ("dome", "tank") and "mass" not in f):
+            if kind in ("dome", "tank") and not all(isinstance(f.get(k), int) for k in ("x", "z", "r", "y")):
+                errors.append(f"{where}: a {kind} needs a mass, or x, z, r and y")
             continue
+        if kind == "turret" and f["corner"] not in TURRET_CORNERS:
+            errors.append(f"{where}.corner: one of {TURRET_CORNERS}, got {f['corner']!r}")
+        if kind == "dome" and f.get("profile", "round") not in DOME_PROFILES:
+            errors.append(f"{where}.profile: one of {DOME_PROFILES}, got {f.get('profile')!r}")
         m = by_id.get(f.get("mass"))
         if m is None:
             errors.append(f"{where}.mass: no mass {f.get('mass')!r}")
-        elif kind in ("skylight", "dormer", "sails", *WALL_FEATURES) and f.get("side") not in SIDES:
+        elif kind in ("skylight", "dormer", "sails", "clock", "bell_gable", *WALL_FEATURES) and f.get("side") not in SIDES:
             errors.append(f"{where}.side: one of {SIDES}, got {f.get('side')!r}")
     site = bp.setdefault("site", {})
     for k in ("ground", "boxes", "bushes", "trees"):
@@ -300,7 +346,9 @@ def load(src) -> dict:
                 errors.append(f"{where}.{role}: unknown role (roles: {', '.join(ROLES)})")
                 continue
             for shape in ROLES[role][1]:
-                if not shape_ok(shape, block):
+                # a glass roof (a glasshouse's) has no slabs: its slopes step in full blocks
+                if not shape_ok(shape, block) and not (role in GLASS_ROOF_ROLES and "glass" in block and
+                                                       shape_ok("full", block)):
                     errors.append(f"{where}.{role}: {block!r} has no {shape!r} block")
     for g in site["ground"]:
         for k in ("material", "under"):

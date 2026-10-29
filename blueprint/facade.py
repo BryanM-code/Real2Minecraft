@@ -62,7 +62,7 @@ def _wall_top(b: dict, k: int, m: dict, side: str, t: float) -> tuple:
 def _shown(bp: dict, side_seen: str | None) -> set:
     """(mass id, side) of the walls a photo from the front (and `side_seen`) shows: the front
     walls and that side's walls not wholly behind another mass."""
-    ms = [m for m in bp["masses"] if m.get("shape", "box") == "box"]
+    ms = [m for m in bp["masses"] if m.get("shape", "box") == "box" and not m.get("open")]
     out = set()
     for m in ms:
         ahead = [o for o in ms if o is not m and o["z"] + o["d"] > m["z"] + m["d"]]
@@ -108,8 +108,8 @@ def _locate(o: dict, bp: dict, b: dict, e: dict):
     blocks along the wall. None when no mass is there."""
     W, D, H = e["x1"] - e["x0"], max(1, e["front"] - e["back"]), max(1, e["top"] - e["foot"])
     index = {m["id"]: k for k, m in enumerate(bp["masses"])}
-    boxes = [m for m in bp["masses"] if m.get("shape", "box") == "box"]
-    if not boxes:                                      # round towers only: no flat wall to put it on
+    boxes = [m for m in bp["masses"] if m.get("shape", "box") == "box" and not m.get("open")]
+    if not boxes:                                      # round towers (or posts) only: no flat wall to put it on
         return None
     y_global = e["foot"] + float(o["up"]) * H
     if o["wall"] == "front":
@@ -230,6 +230,17 @@ def place_openings_3d(bp: dict, openings: list, side_seen: str | None = None, ga
     kinds = {o["kind"] for o in tidy}
     keep = [o for o in bp["openings"] if not (o["kind"] == "window" and (o["mass"], o["side"]) in hit or
                                               o["kind"] in kinds - {"window"} and (o["mass"], o["side"]) in shown)]
+    # an arcade's arches stay open: what the photo shows through one is the wall behind it (a window
+    # framed in an arch filled a whitewashed loggia with trim)
+    arches = [a for a in keep if a["kind"] == "arch"]
+    clear = []
+    for o in tidy:
+        if any(a["mass"] == o["mass"] and a["side"] == o["side"] and o["u"] < a["u"] + a["w"] and a["u"] < o["u"] + o["w"]
+               and o["y"] < a["y"] + a["h"] and a["y"] < o["y"] + o["h"] for a in arches):
+            lost.append(f"{o['kind']} on {o['mass']}'s {o['side']} wall at {o['u']}: in an arch (the wall behind it)")
+        else:
+            clear.append(o)
+    tidy = clear
     bp["openings"] = keep + tidy
     placed = {k: sum(1 for o in tidy if o["kind"] == k) for k in ("window", "door", "garage")}
     return bp, {"placed": placed, "lost": lost, "grown": grown}

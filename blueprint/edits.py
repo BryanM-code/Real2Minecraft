@@ -33,18 +33,33 @@ FEATURE_ON = {"porch": "front", "portico": {"columns": 4, "pediment": True}, "ga
               "arcade": True, "curtain_wall": True, "tiers": "setbacks", "crown": "stepped", "half_timbering": True,
               "battlements": True, "smokestacks": 1, "sawtooth": True, "big_doors": 1, "silo": True,
               "flared_eaves": True, "awning": True, "canopy": True, "sails": True, "gallery": True, "lantern": True,
-              "podium": {"storeys": 3}, "units": 4, "gables": "front"}
+              "podium": {"storeys": 3}, "units": 4, "gables": "front", "deck": "side",
+              "veranda": {"levels": 2, "wraparound": False}, "steps": "stoop", "clock": True, "corner_turrets": 2,
+              "eaves": "deep", "fire_escapes": True, "roof_deck": True, "open_sides": True, "rose_window": True,
+              "tank": True, "jetty": True, "marquee": True, "glass_roof": True, "bell_gable": True, "cupola": True}
 FEATURE_OFF = {"porch": "none", "portico": {"columns": 0}, "garage": {"doors": 0, "wall": "none"},
                "balconies": "none", "towers": {"count": 0}, "dome": {"size": "none"}, "tiers": [], "crown": "flat",
-               "podium": {"storeys": 0}, "units": 1, "gables": "side"}
+               "podium": {"storeys": 0}, "units": 1, "gables": "side", "deck": "none", "veranda": {"levels": 0},
+               "steps": "none", "eaves": "normal"}
 # what the model may call a feature, as the list's name
 FEATURE_SYNONYMS = {"turret": "towers", "turrets": "towers", "tower": "towers", "steeple": "spire", "columns": "portico",
                     "colonnade": "portico", "veranda": "porch", "verandah": "porch", "balcony": "balconies",
                     "dormer": "dormers", "chimney": "chimneys", "bay_window": "bay_windows", "bay": "bay_windows",
                     "skylight": "skylights", "minaret": "minarets", "setbacks": "tiers", "arches": "arcade",
-                    "garage_door": "garage", "garage_doors": "garage", "cupola": "dome", "smokestack": "smokestacks",
+                    "garage_door": "garage", "garage_doors": "garage", "cupola": "cupola", "belvedere": "cupola",
+                    "smokestack": "smokestacks",
                     "glass_facade": "curtain_wall", "crenellations": "battlements", "pinnacles": "crown",
-                    "row_of_houses": "units", "row": "units", "terrace": "units", "terraced_houses": "units"}
+                    "row_of_houses": "units", "row": "units", "terrace": "units", "terraced_houses": "units",
+                    "stoop": "steps", "stairs": "steps", "staircase": "steps", "entrance_steps": "steps",
+                    "clock_face": "clock", "clocks": "clock", "corbelled_turrets": "corner_turrets",
+                    "widows_walk": "roof_deck", "roof_terrace": "roof_deck", "rooftop_terrace": "roof_deck",
+                    "fire_escape": "fire_escapes", "water_tank": "tank", "water_tower": "tank",
+                    "rose": "rose_window", "oculus": "rose_window", "round_window": "rose_window",
+                    "overhang": "eaves", "overhangs": "eaves", "deep_eaves": "eaves", "decking": "deck",
+                    "open_walls": "open_sides", "posts": "open_sides", "gallery_porch": "veranda",
+                    "two_storey_porch": "veranda", "walkways": "veranda", "jettied": "jetty",
+                    "overhanging_floors": "jetty", "jetties": "jetty", "espadana": "bell_gable", "belfry_wall": "bell_gable",
+                    "bell_wall": "bell_gable", "bell_tower_wall": "bell_gable"}
 
 
 def initial(read: dict) -> dict:
@@ -115,6 +130,12 @@ def _is_on(name: str, v) -> bool:
 
 def roof_menu() -> str:
     return "|".join(ROOF_KINDS)
+
+
+def _roof_word(t) -> str:
+    """A roof type as the critique writes it ("onion dome", "barrel roof") in the builder's words."""
+    t = str(t or "").strip().lower().replace(" ", "_").replace("-", "_")
+    return t[:-5] if t.endswith("_roof") and t[:-5] in ROOF_KINDS else t
 
 
 def feature_menu() -> list:
@@ -362,7 +383,7 @@ def from_critique(crit: dict, state: dict, numbers: dict) -> tuple:
         had = int((fp.get("front") or {}).get("garage_doors") or 0) + int(fp.get("side_garage_doors") or 0)             if isinstance(fp, dict) and isinstance(fp.get("front") or {}, dict) else 0
         if isinstance(g, (int, float)) and not isinstance(g, bool) and 0 <= g <= 6 and (g > 0 or had):
             edits.append({"op": "garage_doors", "part": i, "value": int(g), "shown": shown})
-        t = str(r.get("roof_type") or "").lower()
+        t = _roof_word(r.get("roof_type"))
         if r.get("roof_ok") is False or r.get("roof_type_ok") is False:
             if t in ROOF_KINDS:
                 edits.append({"op": "roof", "part": i, "value": t})
@@ -375,7 +396,7 @@ def from_critique(crit: dict, state: dict, numbers: dict) -> tuple:
         i = part(r.get("part"))
         if i is None:
             continue
-        t = str(r.get("type") or "").lower()
+        t = _roof_word(r.get("type"))
         if r.get("type_ok") is False:
             if t in ROOF_KINDS:
                 edits.append({"op": "roof", "part": i, "value": t})

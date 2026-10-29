@@ -219,8 +219,9 @@ Reply with JSON only: {"answer": "small|half|equal|taller|none"}""", ("small", "
 - "lantern": a small open or glazed room with columns or windows all round, with a little roof or dome on it
 - "battlements": a flat top behind a notched parapet
 - "flat": a plain flat top
-Reply with JSON only: {"answer": "spire|cone|pyramid|dome|lantern|battlements|flat"}""",
-                  ("spire", "cone", "pyramid", "dome", "lantern", "battlements", "flat")),
+- "onion": a bulb-shaped dome that swells out wider than its base and ends in a point
+Reply with JSON only: {"answer": "spire|cone|pyramid|dome|lantern|battlements|flat|onion"}""",
+                  ("spire", "cone", "pyramid", "dome", "lantern", "battlements", "flat", "onion")),
     "cross_at": ("""Look at the building in this photo: WHICH. Along the top of its front wall a triangular gable rises
 from the roof's level edge over part of the wall. Where along the front wall is that gable?
 Reply with JSON only: {"answer": "left|centre|right"}""", ("left", "centre", "right")),
@@ -262,9 +263,72 @@ def part_words(n: int, k: int, role: str = "wing") -> str:
     """How a question names part k (0 = leftmost) of n."""
     if n <= 1:
         return "the whole building"
-    pos = "the left" if k == 0 else "the right" if k == n - 1 else ("the middle" if n == 3 else f"number {k + 1} from the left")
-    name = {"main": "its main block", "tower": "its tower", "annex": "its low annex"}.get(role, "the wing")
+    name, pos = _part_name(role), _part_pos(n, k)
     return f"{name}, the part at {pos} of the {n} parts it is made of"
+
+
+def _part_name(role: str) -> str:
+    return {"main": "its main block", "tower": "its tower", "annex": "its low annex"}.get(role, "the wing")
+
+
+def _part_pos(n: int, k: int) -> str:
+    return "the left" if k == 0 else "the right" if k == n - 1 else ("the middle" if n == 3 else
+                                                                      f"number {k + 1} from the left")
+
+
+def part_box(mask, parts: list, k: int) -> tuple | None:
+    """Part k's box in the photo, (x0, y0, x1, y1): the building's pixels (`mask`) split left to
+    right in proportion to the parts' widths (the form's metres, else their shares), widened by
+    a margin on each side; from a little above the part's highest pixel to the building's foot.
+    At least half as wide as tall, so a tower's top keeps its surroundings. None without pixels."""
+    import numpy as np
+    cols = np.flatnonzero(mask.any(axis=0))
+    if len(cols) == 0:
+        return None
+    h_img, w_img = mask.shape
+    x0, x1 = int(cols[0]), int(cols[-1]) + 1
+    widths = [float(p.get("width_m") or 0) for p in parts]
+    if not all(w > 0 for w in widths):
+        widths = [float(p.get("share") or 0) or 1.0 for p in parts]
+    total = sum(widths) or 1.0
+    a = x0 + (x1 - x0) * sum(widths[:k]) / total
+    b = x0 + (x1 - x0) * sum(widths[:k + 1]) / total
+    margin = max(0.06 * (x1 - x0), 0.2 * (b - a))
+    pa, pb = max(0, int(a - margin)), min(w_img, int(b + margin) + 1)
+    rows = np.flatnonzero(mask[:, int(a):max(int(a) + 1, int(b))].any(axis=1))
+    rows_all = np.flatnonzero(mask.any(axis=1))
+    top = int(rows[0]) if len(rows) else int(rows_all[0])
+    foot = int(rows_all[-1]) + 1
+    top = max(0, int(top - 0.12 * (foot - top)))
+    foot = min(h_img, int(foot + 0.04 * (foot - top)))
+    need = (foot - top) // 2 - (pb - pa)                # at least half as wide as tall
+    if need > 0:
+        pa, pb = max(0, pa - need // 2 - 1), min(w_img, pb + need // 2 + 1)
+    return pa, top, pb, foot
+
+
+def part_view(photo, mask, parts: list, k: int, role: str, view: str = "full"):
+    """What a part's question is shown and how it names the part: "full" the whole photo
+    (`part_words`); "crop" a close-up cut out around the part (`part_box`); "box" the whole
+    photo with a red box drawn round the part. Falls back to "full" without the building's pixels
+    or a box; a one-part building's close-up is the building itself."""
+    n = len(parts)
+    box = part_box(mask, parts, k) if view != "full" and mask is not None else None
+    if box is None:
+        return photo, part_words(n, k, role)
+    if view == "crop":
+        if n <= 1:
+            return photo.crop(box), "the building in this close-up"
+        return photo.crop(box), (f"{_part_name(role)}, the part in the middle of this close-up (cut out of a "
+                                 f"photo of the whole building, which is made of {n} parts; this is the one at "
+                                 f"{_part_pos(n, k)})")
+    from PIL import ImageDraw
+    im = photo.convert("RGB").copy()
+    d = ImageDraw.Draw(im)
+    d.rectangle(box, outline=(255, 0, 0), width=max(3, im.width // 250))
+    if n <= 1:
+        return im, "the whole building, inside the red box"
+    return im, f"{_part_name(role)}, the part inside the red box ({_part_pos(n, k)} of the {n} parts it is made of)"
 
 
 def critique(vlm, photo, render, state_text: str) -> dict:

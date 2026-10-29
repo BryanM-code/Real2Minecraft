@@ -22,11 +22,11 @@ front is the south side. Units are blocks. Full reference: `spec.py`'s docstring
 
 | Part | What | Main fields |
 | --- | --- | --- |
-| `materials` | role -> block (`wall`, `wall_base`, `trim`, `roof`, `roof_edge`, `window`, `frame`, `sill`, `shutter`, `door`, `garage`, `floor`, `chimney`, `cap`, `skylight`, `column`, `railing`, `dome`, `awning`) | per mass overrides too; a shape a block lacks falls back (stairs and slabs to full, fence to wall) |
-| `masses` | walls on a `shape`: box, round, octagon | `x z w d y`, `storeys` x `storey_h` or `walls`, `floors`, `plinth` (number or per side), `corner_trim`, `decor` (half_timber, quoins, bands, pilasters, buttresses, curtain) |
-| `masses[].roof` | gable (ridge `x` or `z`), cross_gable, hip, pyramid, shed (`high` side), flat (`parapet`, `battlements`), mansard, gambrel, sawtooth, spire, cone, dome, pagoda | `pitch` 0.25 or 0.5 (slabs), 0.75 (a stair, then a slab), 1, 2 or 3 (stairs), `overhang` 0-3; round masses get round roofs; `skirt` (rows of slope from the eave only: a pagoda tier's eave, its corners curled up); `gable_end` plain / stepped (crow-stepped gable walls above the roof) |
-| `openings` | window (frame, `mullions`, `sill`, `shutters`, `style` rect / arched / lancet), door (2 high), garage (recessed), arch (open, an arcade bay), panel (a patch of another block) | `mass side u y w h`; `u` from the wall's left end seen from outside |
-| `features` | chimney, skylight; on a wall: portico (columns, pediment), porch (posts, railing, lean-to, `wrap` to `wrap_side`), balcony, bay window, awning; on a roof: dormer, dome (drum, lantern), finial (a mast with rings); free: smokestack (`stack`), canopy; others: windmill sails, gallery, lantern (glass, or `open` on corner posts like a belfry; a pyramid, dome or spire `cap`) | `parts.py` |
+| `materials` | role -> block (`wall`, `wall_base`, `trim`, `roof`, `roof_edge`, `window`, `frame`, `sill`, `shutter`, `door`, `garage`, `floor`, `chimney`, `cap`, `skylight`, `column`, `railing`, `dome`, `awning`, `dial`, `hands`, `metal`, `bars`) | per mass overrides too; a shape a block lacks falls back (stairs and slabs to full, fence to wall) |
+| `masses` | walls on a `shape`: box, round, octagon; or `open`: posts (`column`) at the corners and every `bay` blocks, a beam round the top, `rail` between the posts on every floor (a pavilion, bandstand, market hall, colonnade, car park, a water tower's legs) | `x z w d y`, `storeys` x `storey_h` or `walls`, `floors`, `plinth` (number or per side), `corner_trim`, `decor` (half_timber, quoins, bands, pilasters, buttresses, curtain) |
+| `masses[].roof` | gable (ridge `x` or `z`; `clip`: its ends hipped over the top rows, a jerkinhead), cross_gable, hip, pyramid, shed (`high` side), flat (`parapet`, `battlements`, `rail`), mansard, gambrel, sawtooth, spire, cone, dome (`profile` round, onion or pointed), pagoda, barrel (an arc, `pitch` its rise: 1 a half circle), butterfly (two slopes to a valley) | `pitch` 0.25 or 0.5 (slabs), 0.75 (a stair, then a slab), 1, 2 or 3 (stairs), `overhang` 0-3; round masses get round roofs; `skirt` (rows of slope from the eave only: a pagoda tier's eave, its corners curled up); `gable_end` plain / stepped (crow-stepped gable walls above the roof); `deck` (a hip cut flat that many rows below its peak) with `rail` (a widow's walk) |
+| `openings` | window (frame, `mullions`, `sill`, `shutters`, `style` rect / arched / lancet), door (2 high), garage (recessed), arch (open, an arcade bay), round (a rose window or oculus, may rise into the gable), panel (a patch of another block) | `mass side u y w h`; `u` from the wall's left end seen from outside |
+| `features` | chimney, skylight; on a wall: portico (columns, pediment, `lift`: its floor raised over steps), porch (posts, railing, lean-to, `wrap` to `wrap_side`), veranda (a porch on `levels` floors: galleries, a motel's walkways), deck (a railed platform on posts, steps down at an end), steps (a flight up to a raised door), balcony, fire escape (iron landings on every upper floor, a ladder), bay window, awning, clock (a dial and hands); on a roof: dormer, dome (drum, lantern, `profile`), finial (a mast with rings); on a corner: turret (round, corbelled out, a cone, spire or dome cap); free or on a roof: tank (a water tank on braced legs); free: smokestack (`stack`), canopy; others: windmill sails, gallery, lantern (glass, or `open` on corner posts like a belfry; a pyramid, dome or spire `cap`) | `parts.py` |
 | `site` | `ground` pads (a lower pad digs a higher one away), `boxes`, `bushes`, `trees` | optional |
 
 Parts are drawn in a fixed order (ground, walls and floors, roofs from the lowest eave up,
@@ -129,14 +129,15 @@ for a folder of `<id>/photo.jpg` photos:
 ```
 r2m_vlm\Scripts\python -m blueprint.refine prepare outputs\vlm\test50 --out outputs\vlm\run4 --model qwen3.8-27b
 r2m_train\Scripts\python -m blueprint.measure outputs\vlm\test50 --out outputs\vlm\run4
-r2m_vlm\Scripts\python -m blueprint.refine roofs outputs\vlm\test50 --out outputs\vlm\run4 --model qwen3.8-27b [--redo]
+r2m_vlm\Scripts\python -m blueprint.refine roofs outputs\vlm\test50 --out outputs\vlm\run4 --model qwen3.8-27b [--redo] [--roof-view full|crop|box]
 r2m_vlm\Scripts\python -m blueprint.refine run outputs\vlm\test50 --out outputs\vlm\run4 --rounds 3 --model qwen3.8-27b
 r2m_vlm\Scripts\python -m blueprint.refine judge outputs\vlm\test50 --out outputs\vlm\run4
 r2m_vlm\Scripts\python -m blueprint.refine summary --out outputs\vlm\run4
 ```
 
 `prepare` runs the roof pass on new readings; `roofs` runs it on readings made before it (or,
-with `--redo`, again on all of them). `judge` asks the vision model, first build against the
+with `--redo`, again on all of them); `--roof-view` shows the model each part in the whole photo
+(the default), a crop round it, or the whole photo with a box round it (round 6). `judge` asks the vision model, first build against the
 corrected one, twice with the order swapped; `summary` gives the scores, the corrections kept
 and the capability gaps.
 
@@ -424,6 +425,174 @@ dormers, a terrace's repeated gables); the builder's vocabulary for landmark top
 gables. A roof classifier trained on the builder's own renders was the step held back for a
 plateau. It would not reach these: what remains is ambiguity in single photos and roofs the
 builder cannot draw, and renders of blocks are far from photos.
+
+## Round 6: parts up close, more shapes, new photos (2026-10-25 to 10-28)
+
+**Asking about each part on a close-up of it** (`vision.part_view`, `refine roofs --roof-view`).
+Each part's box comes from the building's pixels, split left to right by the parts' widths
+(`vision.part_box`). Three views of the 50 test photos were compared: the whole photo, a crop
+round the part, and the whole photo with a red box round it. Parts on which the views gave the
+same answers are equally right or wrong in all three, so only the parts where they differed
+were labelled (`outputs/vlm/report4/views/part_labels.json`).
+
+| | Whole photo | Crop | Red box |
+| --- | ---: | ---: | ---: |
+| Main blocks: front top (48) / pitch (21) / tower top (7) | 37 / 14 / 6 | 38 / 13 / 6 | 38 / 14 / 6 |
+| The other parts they read differently: top (18) / pitch (8) | 10 / 3 | 10 / 2 | 11 / 5 |
+| The builds: roof labels (157) / part-level answers (185) | 138 / 161 | 137 / 161 | 137 / 162 |
+
+Zooming in does not help: a crop cuts away the surroundings that show how a roof slopes. The
+red box keeps them and reads wings' and towers' tops a little better (the cathedral's flat
+tower top, a gas station canopy under the main hip roof, the woodland house's wing). But it
+sees a gable rising from the eave wherever a neighbouring part's gable falls inside the box.
+The builds come out the same, so the whole photo stays the default.
+
+**More shapes** (all general; `parts.py`, `build.py`; asked by the form where common):
+
+- Roofs: barrel (diners, hangars, Quonset huts, market halls), butterfly, a clipped gable
+  (jerkinhead), hip-and-gable (`gablet`: East Asian roofs, by style), a hip cut flat with a
+  railing (a widow's walk), a railed flat roof (a roof terrace), onion and pointed domes, and
+  "onion" as a tower top.
+- Masses: `open`, posts or columns instead of walls (pavilions, bandstands, market halls,
+  colonnades, car parks, a water tower's legs); `jetty`, each storey standing out over the one
+  below (timber-framed houses), its windows on its own wall.
+- Features: decks on posts with steps, verandas on several floors (galleries, a motel's
+  walkways), entrance steps with the door raised over them (a stoop, or across a raised
+  portico), clock faces, corbelled corner turrets, water tanks, fire escapes, rose windows, a
+  theatre's marquee, a bell gable, a cupola on the roof's top (`lantern` `w`, `on_roof`), glass
+  roofs, and deep or flush eaves (on a flat roof, a slab standing out).
+- The new shapes are off unless asked: the 100 stored blueprints of the 50-photo test
+  (`outputs/vlm/run6b`) still build block for block the same at the end of the round, and its
+  graded roof labels and part-level answers are unchanged (138 of 157, 161 of 185).
+
+**84 new photos** (`outputs/vlm/new100`: Wikimedia Commons, free licences, licence and author in
+each folder's `meta.json`; one each of 84 building types the first test did not have: homes in
+other styles, civic, religious and cultural buildings, shops, transport, industry, pavilions,
+towers). Their first builds were reviewed photo by photo while they were read. What failed, and
+what changed for every building:
+
+- **Forms lost to one stray brace.** The model closed the form after its parts list
+  (`]}, "symmetric": ...`), and 11 of the first 66 readings came back empty: 17%, against none
+  of the 50 before the form grew its new questions. `describe.parse_json` now keeps a root
+  object's keys after an early close, drops trailing commas and closes a cut-off end; the lost
+  readings were parsed again from the model's text (nothing was lost but the brace).
+- Earth-coloured stucco (tan, brown, ochre, terracotta) was built white, pink stucco beige and
+  pink or red stone grey, black or dark wood tan: the colour tables have them now. There is an
+  adobe style (earth walls, flat roofs, the roof beams' ends).
+- A door in the middle of a front put all the ground-floor windows on one side of it, or none.
+  Windows now go either side and get narrower before fewer, on every floor.
+- A tower in the middle of a hall (a clock tower) stood inside the hall's roof, its clock hidden:
+  it clears the ridge.
+- Where no part is called main, the portico, steps and porch went on the first wing: now on the
+  biggest part, and steps find the part with the door.
+- A row's stoop went on its first house only: each house has its own, railed.
+- A low round roof (an apse) was given a turret's 63-degree cone: low cones keep their slope.
+- A car park's stair tower was left open: it keeps its walls.
+- A portico read as a porch or a veranda too: a classical building keeps the portico, a house
+  its porch.
+- Tiers the reader gives (a gopuram's) counted only for tall kinds: now for any kind.
+- A Japanese castle's keep had one roof: it stacks like a pagoda. A two-storey shrine was
+  stacked like a pagoda: pagodas need three storeys.
+- A domed corner turret made a second dome on the main block: one dome.
+- A single building's stepped gable was drawn plain: stepped, as a row's.
+- Deep eaves on a flat roof: a slab standing out two blocks.
+- New questions for what the photos showed: jettied floors (a timber house's, or a modern
+  building whose floors step out), a theatre's marquee, glass roofs (glasshouses, market halls,
+  train sheds), a bell gable (an espadana), a cupola standing on the roof (an Italianate
+  house's belvedere was read as a tower with a spire). The fire-escape question now says what a
+  fire escape is not (a stoop's railing was taken for one), and the veranda's levels count the
+  ground floor (a motel's two walkways were read as one).
+
+**All 84 read again with the final reader, before and after** (`outputs/vlm/report6/compare`:
+each photo; the build the code before round 6 makes of its first reading; today's first and
+final builds). Before round 6, 11 of the 84 first readings lost their whole form (a plain box
+was built) and one photo crashed the chain; today none. Of the 84 re-readings, 11 (13%) needed
+the tolerant parser (the same stray brace) and all kept their forms. What the before-and-after
+review found, and what changed for every building:
+
+- **A blueprint that failed to load.** A shopping mall was measured 2.7 m wide: its cut-out took
+  only the entrance block, and the wings ran off the photo. Its parts came out 3 to 6 blocks
+  wide, and a shop window ran off a 3-block wall. Compose now puts a narrow part's shop window
+  beside the door (on parts 5 or 6 blocks wide it was over the door), and drops and notes any
+  opening that does not fit its wall, so no reading crashes the chain.
+- **The previews' colours were not the game's.** BuildDataCollector's renderer tints the dyed
+  families from the dye: plain terracotta (the adobe's walls) came out its fallback grey, white
+  terracotta grey, and light blue terracotta bright blue, where the game's is a greyish violet.
+  Renders (the previews and the evaluator's colour measures) now take the game's colours from
+  `mcvoxel`'s palette. BuildDataCollector is unchanged.
+- **Wall and trim colours in the game.** Pink stucco was the game's pink terracotta, a dull
+  brick red: it is white terracotta's pale pink beige now, and pink siding is cherry planks. Blue,
+  teal, yellow and gold trim had no block and fell back to dark oak: they are now warped planks
+  (the one blue-green block with the stairs, slabs and trapdoors trim needs), birch planks and
+  yellow terracotta.
+- A whitewashed house's arcade had a trim frame round each arch, and the front came out dark:
+  arches in plaster are now cut in the wall, their shoulders in the wall's own block. The photo's
+  windows seen through the arches had been placed in them too; they are on the wall behind, so
+  the placement leaves an arch open (`facade.place_openings_3d`).
+- **Sizes from the cut-out alone.** Where MapAnything's height cannot be used, the cut-out's
+  height over width sets the width from the storeys' height. A storey too few, a dome making the
+  cut-out tall, or a cut-out of the entrance only shrank buildings far below the reader's own
+  metres: a 23 m house to 6 m, the 49 m mall to 7 m. The width now stays within a factor of two
+  of the parts' metres. This touches 4 of the 50 test photos and 12 of the 84 new ones. Their
+  measures' total rose from 0.472 to 0.516 on the 4 and fell from 0.480 to 0.455 on the 12, so
+  about even. The mall's fall is its cut-out's (the entrance only), and the White House, read
+  130 m wide, came out flatter.
+- A brick water tower was built as a tank on legs, with floors between the legs, and its
+  "crown" and cupola stood inside the tank. A brick, stone, concrete or stucco shaft now carries
+  its tank, legs (steel or timber) have no floors, and the tank is the tower's top.
+- A bandstand's shallow dome was read as a capitol's ("large, on a drum"), and its ring of
+  columns as a portico too: the dome rose 14 rows over 8-row posts, behind a twelve-column porch.
+  A dome that is the roof of a building open on its sides now covers the whole ring, low and
+  without a drum (6 rows), and its posts are the colonnade.
+- An Italianate house's belvedere was read both as a tower in the middle and as a cupola, and
+  built twice, the tower nearly twice the house's height. On a house or a barn that is one
+  thing: the cupola.
+- A Japanese castle's keep read with the new hip-and-gable word lost its stacked roofs, and its
+  top tier became a tower with a spire. Any hipped roof now stacks for a Japanese or Chinese castle
+  or palace of three storeys or more, and a tower in the middle is its top tier.
+- A barrel roof whose curved end faces the camera was built running along the front. All 5
+  barrels whose front top was answered "other" (to the question an arch is "something else")
+  showed their curved end; the 3 answered "eave" showed their side.
+- Where the loop made a part lower, its upper floors stayed where they were: a car park's decks
+  floated over it. A part's floors are now only those under its walls' top (no first build
+  changes; it shows on parts the loop corrects).
+
+**The 84 through the whole chain** (`refine run --rounds 3`, Qwen3.8-27B, 2.5 minutes a photo,
+3.6 hours; the bandstand run again after its fix). The measures' total over the 83 photos that
+have both builds (the code before round 6 crashed on the mall):
+
+| | Before round 6 | Now: first build | Now: after the loop |
+| --- | ---: | ---: | ---: |
+| All 83 | 0.466 | 0.477 | 0.535 |
+| The 11 whose first reading the old parser lost | 0.430 | 0.517 | 0.547 |
+
+The first builds measure better than before on 25 photos, worse on 20, and within 0.01 on
+38. The vision model's resemblance went from 6.36 to 6.80 out of 10 in the loop, and the
+combined score from 0.555 to 0.607. The loop kept corrections on 61 of the 84: the footprint
+46 times, a part's height 30, the height 13, the depth 11, a feature 11, a colour 3, a roof 2.
+
+The measures do not see most of what the review fixed: a lost form built as a plain box
+scores close to a house with the right roof. Most of the drops are the second reading's: a
+kasbah read wider, a tower added to the Painted Ladies, a school's centre block read as a
+spire. Two more are the size bound's (the White House, the hangar). Some come from a correct
+change. A Quonset hut's barrels face the camera as in the photo, but it was read as two
+parts, 15 and 10 m wide with 4 m walls, under half-round arches. That makes it twice the
+photo's height, with its doors low on a tall front: 0.511 to 0.349.
+
+Not fixed (they need the reader, the segmentation or the camera):
+
+- Most renders look up at the building: MapAnything puts the camera below its middle (64 of 82
+  photos, a median 8 degrees below level). The renderer has no perspective, so it shows the ground floor's
+  underside as a dark band under the build. The camera's height was tuned against the photos'
+  outlines in round 4, so it stays.
+- Gambrel and hipped-gable (hanok) roofs read as gables; the brutalist's floors stepping out and
+  the fachwerk house's jettied floors were not read (both were asked); the Painted Ladies row
+  was read as one house; the Copenhagen opera house's canopy roof was not read; the Thai temple
+  was read as an octagonal pagoda.
+- The mall's cut-out is still its entrance block only (the segmentation), so its outline is
+  measured against that part of the photo.
+- A half-round barrel (a Quonset hut's) springs from the ground; the reader gives it storey-high
+  walls. There is one such photo, so no rule was made from it.
 
 ## Status (2026-10-22)
 
