@@ -21,9 +21,6 @@ BUILDING = (0, 1, 25, 48, 79, 84,                  # wall, building, house, skys
 OCCLUDER = (4, 17, 72, 66, 125,                    # tree, plant, palm, flower, pot
             20, 80, 83, 102, 76, 103, 127, 116, 90,   # car, bus, truck, van, boat, ship, bicycle, minibike, airplane
             12, 126, 32, 87, 93, 136, 43, 123, 149, 132, 138, 69, 104, 88, 114)
-            # person, animal, fence, streetlight, pole, traffic light, signboard, trade name, flag,
-            # sculpture, ashcan, bench, fountain, booth, tent
-SKY = (2,)
 MIN_SHARE = 0.01            # a building smaller than this share of the photo is a failed cut-out
 
 
@@ -192,7 +189,7 @@ def zone_colours(rgb: np.ndarray, mask: np.ndarray, frame, skip=None) -> dict:
     return out
 
 
-# colour words compose's tables know (`assemble.pick`), at rough L*a*b*
+# colour words compose's tables know (`materials.pick`), at rough L*a*b*
 COLOUR_WORDS = {"white": (95, 0, 2), "cream": (88, 1, 14), "beige": (78, 3, 15), "yellow": (85, 0, 50),
                 "light grey": (78, 0, 1), "grey": (60, 0, 0), "dark": (30, 0, 0), "black": (12, 0, 0),
                 "brown": (40, 12, 22),

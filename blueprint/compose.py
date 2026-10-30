@@ -27,7 +27,7 @@ from __future__ import annotations
 import copy
 import math
 
-from .assemble import BASES, DOORS, ROOFS, TRIMS, WALLS, _int, pick
+from .materials import BASES, DOORS, ROOFS, TRIMS, WALLS, pick
 from .spec import PITCHES, material_index, shape_ok
 from .styles import KINDS, STYLES
 
@@ -102,6 +102,12 @@ ROOF_TRUST = ("front_top", "pitch", "tower_top")
 TOWER_TOPS = {"spire": "spire", "cone": "cone", "pyramid": "pyramid", "dome": "dome", "flat": "flat",
               "battlements": "flat", "lantern": "flat", "onion": "dome"}
 
+
+def _int(v, default=0, lo=0, hi=99) -> int:
+    try:
+        return max(lo, min(hi, int(v)))
+    except (TypeError, ValueError):
+        return default
 
 def kind_of(kind) -> str:
     k = str(kind or "other").lower().replace(" ", "_")

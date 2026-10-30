@@ -2,15 +2,14 @@
 where the main building is and which of its sides the photo shows (`locate`), its windows'
 and doors' boxes (`openings`), and, for the evaluator, what is wrong with a build against the
 photo (`critique`: the whole, and each part's size, level, roof and garage doors), the photo's
-own answers about each of the build's parts for the code to compare (`check`), and which of
-two builds is closer to it (`compare`). Boxes come in the model's 0-1000 coordinates. Every
+own answers about each of the build's parts for the code to compare (`check`). Boxes come in
+the model's 0-1000 coordinates. Every
 answer is parsed into fixed choices; the critique offers only the roofs, features, styles and
 kinds the builder has (`edits`), and anything else goes in its "other" answer, which the
 evaluator logs as a capability gap.
 """
 from __future__ import annotations
 
-import random
 import re
 
 from .describe import ask, parse_json
@@ -175,8 +174,8 @@ def check(vlm, photo, parts: list, twice: bool = True) -> dict:
 # Asked "which way does the ridge run", both models were right on about 6 of 10 main roofs; asked
 # what tops the front wall (a triangle or a level eave), the 27B was right on 20 of 24: questions
 # about what is seen, not about what it means, and one at a time.
-# (round 5: "a pediment is decoration, not the roof" read a temple-fronted church's gable as an
-# eave; this wording took the main blocks' front tops from 35 to 38 of the 48 graded photos)
+# ("a pediment is decoration, not the roof" read a temple-fronted church's gable as an eave;
+# this wording got the main blocks' front tops right on 38 of 48 graded photos, against 35)
 PEDIMENT = ("A triangular pediment over columns or over an entrance porch is the roof's own gable only where the main "
             "roof's ridge runs back from its peak, away from the camera; where the roof behind it is flat or runs "
             "along the front, the pediment is decoration: look at the roof itself.")
@@ -346,22 +345,3 @@ def critique(vlm, photo, render, state_text: str) -> dict:
     except (TypeError, ValueError):
         js["resemblance"] = None
     return js
-
-
-def compare(vlm, photo, a, b, rng=None, order: str | None = None) -> dict:
-    """Which of builds `a` and `b` (renders) is closer to the photo: {"closer": "a" | "b" |
-    None (not sure), "order"}; the two are shown in a random order (the model may lean to one
-    place), or in `order` ("ab": `a` first, "ba")."""
-    rng = rng or random.Random()
-    flip = (rng.random() < 0.5) if order is None else order == "ba"
-    first, second = (b, a) if flip else (a, b)
-    text = ask(*vlm, [_small(photo), _small(first), _small(second)], COMPARE, 60)
-    js = parse_json(text) or {}
-    try:
-        pick = int(js.get("closer"))
-    except (TypeError, ValueError):
-        pick = None
-    closer = None
-    if pick in (2, 3) and js.get("sure", True) is not False:
-        closer = ("a" if pick == 2 else "b") if not flip else ("b" if pick == 2 else "a")
-    return {"closer": closer, "order": "ba" if flip else "ab", "text": text}

@@ -1,6 +1,5 @@
-"""Blueprint -> blocks: mcvox-v3 (shape, material) grids (X, Y, Z), the human builds'
-representation, so a built blueprint is written by `photofirst.schem.write_schem` (which
-derives stair corners, door halves and fence / pane arms) and scored like any other build.
+"""Blueprint -> blocks: (shape, material) grids (X, Y, Z) in the block vocabulary
+(`minecraft.vocab`), written to a `.schem` by `minecraft.schem.write_schem`.
 
 Parts are drawn in a fixed order: the site's ground, every mass's walls and floors, the wall
 decor, the roofs from the lowest eave up, the openings, the features, then the site's boxes
@@ -13,7 +12,7 @@ import math
 
 import numpy as np
 
-from mcvoxel import vocab as V
+from .minecraft import vocab as V
 
 from .spec import load, mass_bounds, material_index, resolve_materials, shape_ok, wall_rows
 
@@ -121,16 +120,6 @@ def perimeter(cells: set) -> dict:
         if sides:
             out[(x, z)] = sides
     return out
-
-
-def _ring(x0, x1, z0, z1):
-    """Perimeter columns (x, z, sides they face) of a box."""
-    for x in range(x0, x1 + 1):
-        for z in range(z0, z1 + 1):
-            sides = tuple(s for s, on in (("west", x == x0), ("east", x == x1), ("north", z == z0),
-                                          ("south", z == z1)) if on)
-            if sides:
-                yield x, z, sides
 
 
 def _along(m: dict, side: str, t: int, j=None):

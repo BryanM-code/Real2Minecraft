@@ -1,59 +1,36 @@
-"""The evaluator: a build is checked against its photo and corrected, one change at a time,
-until it is close enough or nothing more helps.
+"""The check-and-correct loop: a build is compared with its photo and corrected, one change at
+a time, until it is close enough or nothing more helps.
 
-Every build the loop measures has the photo's windows, doors and garage doors where the photo
-has them (`facade.place_openings_3d`, from MapAnything's placing of the vision model's boxes),
-and lists what its form asked that it could not build ("conflicts").
-
-Two evaluations, combined (`combined`, 0-1):
+Each build has the photo's windows, doors and garage doors where the photo has them
+(`facade.place_openings_3d`) and lists what its form asked that it could not build
+("conflicts"). It is judged two ways, combined into one score (`combined`, 0-1):
 - the computer measures (`score`): outline, proportions, roof line, each part's roof line,
-  windows, doors and garage doors placed on the building, colours. Repeatable, but only as
-  good as the segmentation and the camera angle;
-- the vision model (`vision`): it looks at a render of the build beside the photo, says what
-  is wrong in the builder's own terms (style, kind, proportions, each part's size, level, roof
-  and garage doors, missing or extra features, mirrored, windows, colours) and how alike they
-  are (0-10).
+  windows and doors, colours. Repeatable, but only as good as the segmentation and the camera
+  angle;
+- the vision model (`vision.critique`): it looks at a render of the build beside the photo,
+  says what is wrong in the builder's own terms and rates how alike they are (0-10).
 
-Before the loop, `prepare` asks each part's roof its concrete questions (`roof_pass`; `roofs`
-adds them to older readings). The loop changes no pitch: on real photos neither the measures nor
-the critique told a right pitch from a wrong one.
+First the photo-only check (`check_round`): the vision model answers questions about the photo
+alone for each of the build's parts (its roof, level, storeys, garage doors...), twice with the
+choices reversed, and the code compares the answers with the build. Then, each round, the
+corrections the critique asks for, the measures point to, or the build's conflicts need
+(`edits`) are built and measured; a correction is kept only when it helps, and undone when a
+later critique contradicts it. The loop stops at the target score, after `rounds` rounds, or
+when nothing helps, and returns the best build.
 
-First, the photo-only check (`check_round`): the vision model answers about the photo alone,
-for each of the build's parts (whether the building has it, its roof's ends and ridge, its
-floor against the main block's, its storeys, its garage doors, its base band, which part is
-tallest), twice with the choices reversed, and the code compares the answers both give with
-the build; each correction they ask for is kept unless the measures find it much worse. (Shown
-the photo and a render together, the model described the render: on a house built with ten
-deliberate mistakes, the 9B and 27B models rated 8 of them 9 of 10, like the right build, and
-named 3 and 4. The measures tell right from wrong on renders standing in for photos, but on
-real photos hardly: see CHECK_GAIN.)
+Corrections exist only in the builder's terms. What the model asked for beyond them ("gaps"),
+corrections that hit a limit ("limits") and ones that changed no block ("no_effect") are logged
+per photo; `summary` counts them over a run.
 
-Then each round every correction the critique asks for, every one the measures point to and
-every one that would let the build do what its form asked (its conflicts: a part too narrow
-for its windows) (`edits`) is built and measured (a build and its renders take about a
-second). Three are tried in turn, the model's own first; a conflict's is kept unless the
-measures find it worse. A change of proportions the measures found is kept on
-the measures; any other is checked by critiquing the candidate build on its own (`_verify`):
-kept when the model's complaint is gone, nothing in the new critique asks to undo it and its
-rating does not drop. (Asked instead which of two builds is closer, the 9B model picked the
-image shown last 59 times in 70, so `compare` decides nothing here.) A correction the next
-critique contradicts is undone. The loop stops at the target score, after `rounds` rounds,
-or when no correction helps, and returns the best build it rated.
+Steps, from the repository's root (`measure` runs in between, in r2m_measure):
 
-Corrections only exist in the builder's terms, so the loop cannot ask for what the builder
-cannot draw. What it could not do is logged per photo: what the model asked for outside the
-list ("gaps"), corrections that hit a limit (no roof steeper than 72 degrees: "limits") and
-corrections that changed no block ("no_effect"); `summary` counts them over a run, which
-says what to build next.
+    r2m_vlm\Scripts\python -m blueprint.refine prepare PHOTOS --out DIR [--model qwen3.8-27b]   read, find the building
+    r2m_vlm\Scripts\python -m blueprint.refine roofs PHOTOS --out DIR                          ask the roof questions again
+    r2m_vlm\Scripts\python -m blueprint.refine run PHOTOS --out DIR [--rounds 4] [--model qwen3.8-27b]
+    r2m_vlm\Scripts\python -m blueprint.refine judge PHOTOS --out DIR                          first build against final
+    r2m_vlm\Scripts\python -m blueprint.refine summary --out DIR
 
-Stages, from this repository's root, MapAnything (r2m_train) measuring in between:
-
-    r2m_vlm\\Scripts\\python -m blueprint.refine prepare photos... --out DIR [--model qwen3.8-27b]
-    r2m_vlm\\Scripts\\python -m blueprint.refine roofs photos... --out DIR   (the roof pass on older readings)
-    r2m_train\\Scripts\\python -m blueprint.measure photos... --out DIR
-    r2m_vlm\\Scripts\\python -m blueprint.refine run photos... --out DIR [--rounds 4] [--model qwen3.8-27b]
-    r2m_vlm\\Scripts\\python -m blueprint.refine judge photos... --out DIR
-    r2m_vlm\\Scripts\\python -m blueprint.refine summary --out DIR
+PHOTOS are photo files or folders of <id>/photo.jpg.
 """
 from __future__ import annotations
 
@@ -89,10 +66,9 @@ WORSE = -0.03           # a correction the measures find this much worse is not 
 # a correction the photo-only check asks for (`vision.check`, asked twice, its answers kept where
 # both agree) is kept unless the measures find it this much worse. On builds rendered as their
 # own photos (`calibrate synthetic`, 50 buildings of 21 kinds) the measures told right corrections
-# from wrong ones well; on the 50 real photos, measured one by one from round 3's builds, hardly
-# (losing at most 0.005 they kept 10 of 16 right corrections and 69 of 117 wrong ones; at most
-# 0.05, 14 and 96): a stricter rule would only drop right corrections, the answers' own accuracy
-# decides. A drastic one (a part removed, the build mirrored) must not lose more than STRICT_GAIN
+# from wrong ones well; on the 50 real photos hardly (losing at most 0.005 they kept 10 of 16
+# right corrections and 69 of 117 wrong ones; at most 0.05, 14 and 96): a stricter rule would
+# only drop right corrections, the answers' own accuracy decides. A drastic one (a part removed, the build mirrored) must not lose more than STRICT_GAIN
 CHECK_GAIN = -0.05
 STRICT_GAIN = -0.005
 # ... and a part's level the photo's answer and its doors agree on (`facade.levels`: two signals
@@ -696,7 +672,7 @@ def refine_one(stem: str, out: Path, vlm, rounds: int = 4, log=print, check: str
     best_round, cur, kept = max(scored, key=lambda t: (combined(t[1]) or -1.0, t[1]["measured"] or -1.0))
     d = out / stem
     d.mkdir(parents=True, exist_ok=True)
-    from photofirst.schem import write_schem
+    from .minecraft.schem import write_schem
     for tag, res in (("first", first), ("final", cur)):
         view(res).save(d / f"{tag}.png")
         (d / f"{tag}.blueprint.json").write_text(json.dumps(res["bp"], indent=1), encoding="utf-8")

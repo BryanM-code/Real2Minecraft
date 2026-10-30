@@ -1,10 +1,10 @@
-"""The blueprint format (`blueprint-0`): a building described by its parts, the description
-a photo model fills in and `blueprint.build` turns into blocks.
+"""The blueprint format (`blueprint-1`): a building described by its parts, the description
+the photo chain fills in and `blueprint.build` turns into blocks.
 
 Frame: x east (to the right seen from the front), y up, z south (towards the viewer); the
 front is the south side. Units are blocks. A blueprint is plain JSON:
 
-    {"format": "blueprint-0",
+    {"format": "blueprint-1",
      "materials": {"wall": "birch_planks", "roof": "stone_bricks", ...},   # role -> block
      "masses": [{"id": "main", "x": 0, "z": 0, "w": 17, "d": 20, "y": 0,
                  "storeys": 2, "storey_h": 5, "plinth": 1,
@@ -39,10 +39,10 @@ import copy
 import json
 from pathlib import Path
 
-from mcvoxel import vocab as V
+from .minecraft import vocab as V
 
 FORMAT = "blueprint-1"
-FORMATS = ("blueprint-0", "blueprint-1")          # blueprint-1 adds shapes, roofs, parts, decor
+FORMATS = ("blueprint-0", "blueprint-1")          # blueprint-0: an earlier subset that still loads
 SIDES = ("south", "north", "east", "west")
 ROOF_TYPES = ("gable", "hip", "shed", "flat", "pyramid", "cross_gable", "mansard", "gambrel", "sawtooth",
               "spire", "cone", "dome", "pagoda", "barrel", "butterfly")

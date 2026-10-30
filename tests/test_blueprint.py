@@ -9,8 +9,8 @@ from pathlib import Path
 import numpy as np
 
 from blueprint import BlueprintError, build, load
-from mcvoxel import vocab as V
-from photofirst.schem import palette_grid, write_schem
+from blueprint.minecraft import vocab as V
+from blueprint.minecraft.schem import palette_grid, write_schem
 
 EXAMPLE = Path(__file__).resolve().parents[1] / "blueprint" / "examples" / "cottage.json"
 
@@ -178,44 +178,6 @@ class Describe(unittest.TestCase):
         self.assertEqual(parse_json('{"a": [1, 2,],}'), {"a": [1, 2]})
         self.assertEqual(parse_json('{"parts": [{"part": "main"}]}, "porch": "front"}'),
                          {"parts": [{"part": "main"}], "porch": "front"})
-
-    def test_check_names_the_problem_or_none(self):
-        from blueprint.describe import check
-        self.assertIsNone(check(load(EXAMPLE)))
-        self.assertIn("off the 5-block wall", check({"masses": [{"x": 0, "z": 0, "w": 5, "d": 5}], "openings": [
-            {"mass": "m0", "side": "south", "kind": "window", "u": 4, "y": 1, "w": 3, "h": 2}]}))
-        self.assertEqual(check([1, 2]), "the answer is not a JSON object")
-
-
-class Assemble(unittest.TestCase):
-    """A filled-in form -> a valid blueprint, whatever the model left out."""
-    HOUSE = {"wings": [
-        {"position": "left", "storeys": 2, "windows_across": 2, "roof": "gable", "ridge": "parallel",
-         "front": {"ground_windows": 1, "door": True}, "chimney": True},
-        {"position": "right", "storeys": 1, "level": "half_below", "front_offset": "forward", "windows_across": 1,
-         "front": {"wide_window": True}, "side_garage_doors": 2, "skylights": 2}],
-        "wall": {"material": "wood_siding", "colour": "cream"}, "base": {"material": "brick"},
-        "trim_colour": "dark brown", "roof_colour": "grey"}
-
-    def test_house_form(self):
-        from blueprint.assemble import assemble
-        bp = assemble(self.HOUSE)
-        load(bp)
-        left, right = bp["masses"]
-        self.assertEqual(right["x"], left["x"] + left["w"])                       # wings side by side
-        self.assertEqual(right["z"] + right["d"], left["z"] + left["d"] + 4)      # the right wing stands forward
-        self.assertEqual(right["y"], -4)                                          # split level
-        kinds = sorted((o["mass"], o["side"], o["kind"]) for o in bp["openings"])
-        self.assertIn(("w1", "east", "garage"), kinds)
-        self.assertEqual(sum(k == ("w0", "south", "window") for k in kinds), 3)  # 2 upstairs + 1 beside the door
-        self.assertEqual(bp["materials"]["wall"], "smooth_sandstone")
-        self.assertEqual([f["kind"] for f in bp["features"]], ["chimney", "skylight", "skylight"])
-        self.assertEqual(build(bp)["warnings"], [])
-
-    def test_sparse_and_odd_forms_still_build(self):
-        from blueprint.assemble import assemble
-        for form in ({}, {"wings": [{"storeys": "three", "roof": "dome"}]}, {"wings": [{"storeys": 40}]}):
-            build(assemble(form))
 
 
 class Parts(unittest.TestCase):

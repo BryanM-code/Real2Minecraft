@@ -9,8 +9,6 @@ not show keep theirs. What cannot be placed (no wall there, a clash) is reported
 that do not fit a side wall make it longer rather than being dropped.
 
 `fractions` gives a build's openings in the same terms, for the scores (`score.match3d`).
-(Mapping the boxes through an orthographic render of the build instead failed on close
-photos: their perspective put the boxes on the roofs.)
 """
 from __future__ import annotations
 

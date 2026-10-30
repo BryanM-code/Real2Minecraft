@@ -20,7 +20,6 @@ from .spec import wall_rows
 from .styles import KINDS, STYLES
 
 PITCH_STEPS = (0.25, 0.5, 0.75, 1.0, 2.0, 3.0)
-PITCHED = ("gable", "cross_gable", "hip", "shed", "mansard", "gambrel", "pyramid", "pagoda")   # roofs a pitch changes
 PITCH_NAMES = {0.25: "very low (14 degrees)", 0.5: "low (27 degrees)", 0.75: "medium (37 degrees)",
                1.0: "steep (45 degrees)", 2.0: "very steep (63 degrees)", 3.0: "very steep (72 degrees)"}
 SCALE_RANGE = (0.4, 2.5)
@@ -648,7 +647,7 @@ def from_measures(diag: dict, state: dict, bp: dict) -> list:
     ratio = float(diag.get("aspect_ratio") or 1.0)
     if diag.get("shape") in ("taller", "wider"):
         # the footprint as a whole, not the width alone: widening alone fitted the outline and
-        # left a house shallow (round 3: width x 1.47, depth unchanged)
+        # left a house shallow (width x 1.47, depth unchanged)
         f = min(2.0, max(1.15, (ratio if ratio > 1 else 1 / ratio) ** 0.6))
         tall = diag["shape"] == "taller"
         edits += [{"op": "height", "factor": 0.85 if tall else 1.18}, {"op": "footprint", "factor": 1.15 if tall else 0.87}]

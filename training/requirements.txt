@@ -1,9 +1,0 @@
-# The Phase 5 training environment `r2m_train` (Python 3.10), separate from the app's
-# r2m_app and from TRELLIS's bundle. From the repository root:
-#
-#   py -3.10 -m venv r2m_train
-#   r2m_train\Scripts\python -m pip install torch==2.11.0 --index-url https://download.pytorch.org/whl/cu128
-#   r2m_train\Scripts\python -m pip install -r training/requirements.txt
-#
-# Built and tested with torch 2.11.0+cu128, numpy 2.2.6, scipy 1.15.3 (RTX 4060 Ti 16 GB).
--e .

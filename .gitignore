@@ -1,49 +1,31 @@
+# Python
 __pycache__/
 *.py[cod]
-*.pyc
-.pytest_cache/
-.mypy_cache/
-.ruff_cache/
-.venv/
-venv/
-env/
-outputs/
-.smoke/
-.tmp/
-*.egg-info/
-r2m_app/
-r2m_train/
-r2m_da3/
-r2m_vlm/
-r2m_llama/
-# model weights are tracked separately
-models/
 
-# ── Data never goes in this repo (licences: see docs). Code and docs only. ──
-# Minecraft builds and worlds
+# The environments (README, Setup)
+r2m_vlm/
+r2m_measure/
+r2m_llama/
+.venv/
+
+# Photos, readings, builds and renders stay local
+outputs/
+
+# This repository holds code and docs only: no builds, worlds, meshes or model weights
 *.schem
 *.schematic
 *.litematic
 *.nbt
-*.mcstructure
 *.mcworld
-# Meshes, voxel arrays and training pairs
 *.glb
 *.gltf
 *.obj
-*.mtl
 *.ply
 *.npz
 *.npy
-# Model weights
+*.gguf
 *.pt
 *.pth
 *.ckpt
 *.safetensors
 *.onnx
-# Local data folders
-data/
-datasets/
-pairs/
-checkpoints/
-runs/

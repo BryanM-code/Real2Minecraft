@@ -1,10 +1,10 @@
-"""Build a blueprint into a schematic, from this repository's root:
+"""Build a blueprint (a JSON description of a building) into a schematic, from the
+repository's root:
 
-    r2m_app\\Scripts\\python -m blueprint house.json --out outputs\\blueprint\\house
-    ..\\BuildDataCollector\\.venv\\Scripts\\python -m blueprint house.json --out outputs\\blueprint\\house --render
+    r2m_measure\\Scripts\\python -m blueprint house.json --out outputs\\blueprint\\house [--render]
 
-Writes <out>/build.schem (Sponge v2, 1.21.11), blocks.npz (shape, material, origin) and, with
---render (BuildDataCollector's environment), preview renders from four sides.
+Writes <out>/build.schem (Sponge v2, Minecraft 1.21.11) and blocks.npz (shape, material,
+origin); with --render also preview renders from four sides.
 """
 from __future__ import annotations
 
@@ -20,11 +20,11 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("blueprint", type=Path)
     ap.add_argument("--out", type=Path, required=True)
-    ap.add_argument("--render", action="store_true", help="preview renders (BuildDataCollector's environment)")
+    ap.add_argument("--render", action="store_true", help="also save preview renders")
     ap.add_argument("--size", type=int, default=900)
     args = ap.parse_args(argv)
-    from photofirst.schem import write_schem
     from .build import build
+    from .minecraft.schem import write_schem
     from .spec import BlueprintError
     try:
         b = build(args.blueprint)

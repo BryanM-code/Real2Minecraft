@@ -1,12 +1,9 @@
 """Architectural styles and building kinds: the lists the vision model chooses from, the
-structures each is known for (which questions the form asks, and what the assembler draws
-when the model says nothing), typical proportions, and a block palette per style.
+structures each is known for (which questions the form asks, and what the builder adds when
+the model says nothing), typical proportions, and a block palette per style.
 
-The styles and kinds cover BuildDataCollector's real-schems-v2 (its 58 building categories
-and the styles its build names mention: modern 196, farmhouse/rustic 48, suburban 38,
-industrial 37, Mediterranean 37, Victorian 28, colonial 22, Soviet 18, medieval 14,
-craftsman 11, Japanese 10, neoclassical 10, gothic 9, art deco 7, Tudor 7, Dutch 6, alpine 5,
-...) plus the common ones it misses.
+They cover the kinds of buildings people build in Minecraft (houses, churches, castles,
+towers, shops, factories, stations...) and the common architectural styles.
 """
 from __future__ import annotations
 

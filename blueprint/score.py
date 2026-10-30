@@ -38,8 +38,8 @@ N = 96                   # the square the outlines are fitted into
 # weight a split-level house built level (taller, so closer in aspect) tied with the right one
 WEIGHTS = {"outline": 2.0, "proportions": 0.5, "roof_line": 0.5, "sections": 1.0, "windows": 1.0, "doors": 0.5,
            "garages": 1.0, "colour": 0.5, "plan": 0.5}
-# the renderer darkens the walls it draws (side faces x 0.635 on average, BuildDataCollector's
-# thumbs.SHADE_SIDE_BASE): undone before a build's colours are compared with a photo's
+# the renderer darkens the walls it draws (side faces x 0.635 on average, render.SHADE_SIDE_BASE):
+# undone before a build's colours are compared with a photo's
 RENDER_GAIN = 1 / 0.65
 MATCH = 0.15             # farther apart than this (fraction of the frame), two openings do not match
 OPENING_KINDS = ("window", "door", "garage")
